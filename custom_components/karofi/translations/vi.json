@@ -1,0 +1,118 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Kết nối máy lọc nước Karofi",
+        "description": "Chọn máy lọc nước từ danh sách Bluetooth hoặc nhập địa chỉ MAC thủ công.",
+        "data": {
+          "mac_address": "Thiết bị Bluetooth hoặc địa chỉ MAC",
+          "name": "Tên hiển thị"
+        }
+      },
+      "manual": {
+        "title": "Nhập địa chỉ MAC thủ công",
+        "description": "Nhập địa chỉ MAC Bluetooth của máy lọc nước Karofi (ví dụ: AA:BB:CC:11:22:33).",
+        "data": {
+          "mac_address": "Địa chỉ MAC Bluetooth",
+          "name": "Tên hiển thị"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Tìm thấy máy lọc nước Karofi",
+        "description": "Bạn có muốn thêm {name} vào Home Assistant không?"
+      }
+    },
+    "error": {
+      "invalid_mac": "Địa chỉ MAC Bluetooth không hợp lệ. Vui lòng kiểm tra lại.",
+      "already_configured": "Thiết bị này đã được cấu hình trong Home Assistant."
+    },
+    "abort": {
+      "already_configured": "Thiết bị này đã được cấu hình trong Home Assistant."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connectivity": {
+        "name": "Kết nối"
+      }
+    },
+    "sensor": {
+      "tds": {
+        "name": "Chỉ số TDS nước tinh khiết"
+      },
+      "water_quality": {
+        "name": "Chất lượng nước",
+        "state": {
+          "good": "Tốt",
+          "fair": "Khá",
+          "poor": "Kém",
+          "unknown": "Không xác định"
+        }
+      },
+      "filter_1_percent": {
+        "name": "Tuổi thọ lõi 1 (PP 5 micron)"
+      },
+      "filter_1_days": {
+        "name": "Số ngày còn lại lõi 1 (PP 5 micron)"
+      },
+      "filter_2_percent": {
+        "name": "Tuổi thọ lõi 2 (OCB-GAC)"
+      },
+      "filter_2_days": {
+        "name": "Số ngày còn lại lõi 2 (OCB-GAC)"
+      },
+      "filter_3_percent": {
+        "name": "Tuổi thọ lõi 3 (PP 1 micron)"
+      },
+      "filter_3_days": {
+        "name": "Số ngày còn lại lõi 3 (PP 1 micron)"
+      },
+      "filter_ro_percent": {
+        "name": "Tuổi thọ màng RO Purifim"
+      },
+      "filter_ro_days": {
+        "name": "Số ngày còn lại màng RO Purifim"
+      },
+      "filter_mineral_percent": {
+        "name": "Tuổi thọ lõi khoáng / hydrogen"
+      },
+      "filter_mineral_days": {
+        "name": "Số ngày còn lại lõi khoáng / hydrogen"
+      }
+    },
+    "button": {
+      "reset_filter_1": {
+        "name": "Đặt lại lõi 1 (PP 5 micron)"
+      },
+      "reset_filter_2": {
+        "name": "Đặt lại lõi 2 (OCB-GAC)"
+      },
+      "reset_filter_3": {
+        "name": "Đặt lại lõi 3 (PP 1 micron)"
+      },
+      "reset_filter_ro": {
+        "name": "Đặt lại màng RO Purifim"
+      },
+      "reset_filter_mineral": {
+        "name": "Đặt lại lõi khoáng / hydrogen"
+      }
+    },
+    "number": {
+      "filter_1_remaining_days": {
+        "name": "Số ngày còn lại lõi 1 (PP 5 micron)"
+      },
+      "filter_2_remaining_days": {
+        "name": "Số ngày còn lại lõi 2 (OCB-GAC)"
+      },
+      "filter_3_remaining_days": {
+        "name": "Số ngày còn lại lõi 3 (PP 1 micron)"
+      },
+      "filter_ro_remaining_days": {
+        "name": "Số ngày còn lại màng RO Purifim"
+      },
+      "filter_mineral_remaining_days": {
+        "name": "Số ngày còn lại lõi khoáng / hydrogen"
+      }
+    }
+  }
+}

@@ -1,0 +1,118 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Karofi water purifier",
+        "description": "Select a discovered Karofi water purifier or choose to enter its MAC address manually.",
+        "data": {
+          "mac_address": "Bluetooth device or MAC address",
+          "name": "Display name"
+        }
+      },
+      "manual": {
+        "title": "Enter MAC address manually",
+        "description": "Enter the Bluetooth MAC address of the Karofi water purifier (e.g., AA:BB:CC:11:22:33).",
+        "data": {
+          "mac_address": "Bluetooth MAC address",
+          "name": "Display name"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Discovered Karofi water purifier",
+        "description": "Do you want to add {name} to Home Assistant?"
+      }
+    },
+    "error": {
+      "invalid_mac": "Invalid Bluetooth MAC address. Please check and try again.",
+      "already_configured": "This device is already configured in Home Assistant."
+    },
+    "abort": {
+      "already_configured": "This device is already configured in Home Assistant."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connectivity": {
+        "name": "Connectivity"
+      }
+    },
+    "sensor": {
+      "tds": {
+        "name": "Pure water TDS"
+      },
+      "water_quality": {
+        "name": "Water quality",
+        "state": {
+          "good": "Good",
+          "fair": "Fair",
+          "poor": "Poor",
+          "unknown": "Unknown"
+        }
+      },
+      "filter_1_percent": {
+        "name": "Filter 1 (PP 5 micron) life"
+      },
+      "filter_1_days": {
+        "name": "Filter 1 (PP 5 micron) days remaining"
+      },
+      "filter_2_percent": {
+        "name": "Filter 2 (OCB-GAC) life"
+      },
+      "filter_2_days": {
+        "name": "Filter 2 (OCB-GAC) days remaining"
+      },
+      "filter_3_percent": {
+        "name": "Filter 3 (PP 1 micron) life"
+      },
+      "filter_3_days": {
+        "name": "Filter 3 (PP 1 micron) days remaining"
+      },
+      "filter_ro_percent": {
+        "name": "RO Purifim membrane life"
+      },
+      "filter_ro_days": {
+        "name": "RO Purifim membrane days remaining"
+      },
+      "filter_mineral_percent": {
+        "name": "Mineral / hydrogen filter life"
+      },
+      "filter_mineral_days": {
+        "name": "Mineral / hydrogen filter days remaining"
+      }
+    },
+    "button": {
+      "reset_filter_1": {
+        "name": "Reset filter 1 (PP 5 micron)"
+      },
+      "reset_filter_2": {
+        "name": "Reset filter 2 (OCB-GAC)"
+      },
+      "reset_filter_3": {
+        "name": "Reset filter 3 (PP 1 micron)"
+      },
+      "reset_filter_ro": {
+        "name": "Reset RO Purifim membrane"
+      },
+      "reset_filter_mineral": {
+        "name": "Reset mineral / hydrogen filter"
+      }
+    },
+    "number": {
+      "filter_1_remaining_days": {
+        "name": "Filter 1 (PP 5 micron) remaining days"
+      },
+      "filter_2_remaining_days": {
+        "name": "Filter 2 (OCB-GAC) remaining days"
+      },
+      "filter_3_remaining_days": {
+        "name": "Filter 3 (PP 1 micron) remaining days"
+      },
+      "filter_ro_remaining_days": {
+        "name": "RO Purifim membrane remaining days"
+      },
+      "filter_mineral_remaining_days": {
+        "name": "Mineral / hydrogen filter remaining days"
+      }
+    }
+  }
+}

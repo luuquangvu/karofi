@@ -1,0 +1,19 @@
+{
+  "domain": "karofi",
+  "name": "Karofi Water Purifier",
+  "bluetooth": [
+    {
+      "service_uuid": "000012ac-0000-1000-8000-00805f9b34fb"
+    },
+    {
+      "local_name": "TCM-*"
+    }
+  ],
+  "codeowners": ["@luuquangvu"],
+  "config_flow": true,
+  "dependencies": ["bluetooth"],
+  "documentation": "https://github.com/luuquangvu/karofi",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/luuquangvu/karofi/issues",
+  "version": "0.0.1"
+}
