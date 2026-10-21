@@ -21,6 +21,8 @@ from custom_components.karofi.const import (
     DEFAULT_NAME,
     FILTER_LIFETIME_DAYS,
     NOTIFY_UUID_PREFIX,
+    STORAGE_KEY_PREFIX,
+    STORAGE_VERSION,
     GattProperty,
     KarofiCharacteristic,
     KarofiShortUUID,
@@ -66,68 +68,86 @@ def _mock_characteristic(uuid: str, properties: list[str] | None = None) -> Magi
     return char
 
 
-async def test_coordinator_setup_loads_stored_dates(coordinator: KarofiDataCoordinator) -> None:
+async def test_coordinator_setup_loads_stored_dates(
+    coordinator: KarofiDataCoordinator,
+    hass_storage: dict[str, Any],
+) -> None:
     """Test coordinator setup loading existing dates from storage.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
+        hass_storage: Fixture providing mock storage from test harness.
     """
-    stored_dates = {
-        "filter_1": "2026-01-01T00:00:00",
-        "filter_2": "2026-02-01T00:00:00",
+    key = f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}"
+    hass_storage[key] = {
+        "version": STORAGE_VERSION,
+        "data": {
+            "filter_1": "2026-01-01T00:00:00",
+            "filter_2": "2026-02-01T00:00:00",
+        },
     }
-    with (
-        patch.object(coordinator._store, "async_load", AsyncMock(return_value=stored_dates)),
-        patch.object(coordinator._store, "async_save", AsyncMock()) as mock_save,
-    ):
-        await coordinator.async_setup()
-        assert coordinator.data.filter_reset_dates["filter_1"] == "2026-01-01T00:00:00"
-        assert coordinator.data.filter_reset_dates["filter_2"] == "2026-02-01T00:00:00"
-        assert "filter_ro" in coordinator.data.filter_reset_dates
-        mock_save.assert_awaited_once()
+    await coordinator.async_setup()
+    assert coordinator.data.filter_reset_dates["filter_1"] == "2026-01-01T00:00:00"
+    assert coordinator.data.filter_reset_dates["filter_2"] == "2026-02-01T00:00:00"
+    assert "filter_ro" in coordinator.data.filter_reset_dates
+    assert "filter_ro" in hass_storage[key]["data"]
 
 
-async def test_coordinator_setup_handles_empty_store(coordinator: KarofiDataCoordinator) -> None:
+async def test_coordinator_setup_handles_empty_store(
+    coordinator: KarofiDataCoordinator,
+    hass_storage: dict[str, Any],
+) -> None:
     """Test coordinator setup handling None or corrupt storage.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
+        hass_storage: Fixture providing mock storage from test harness.
     """
-    with (
-        patch.object(coordinator._store, "async_load", AsyncMock(return_value=None)),
-        patch.object(coordinator._store, "async_save", AsyncMock()) as mock_save,
-    ):
-        await coordinator.async_setup()
-        assert "filter_1" in coordinator.data.filter_reset_dates
-        mock_save.assert_awaited_once()
+    key = f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}"
+    await coordinator.async_setup()
+    assert "filter_1" in coordinator.data.filter_reset_dates
+    assert "filter_1" in hass_storage[key]["data"]
 
 
-async def test_coordinator_setup_no_save_when_valid(coordinator: KarofiDataCoordinator) -> None:
+async def test_coordinator_setup_no_save_when_valid(
+    coordinator: KarofiDataCoordinator,
+    hass_storage: dict[str, Any],
+) -> None:
     """Test coordinator setup does not save when storage already contains all valid dates.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
+        hass_storage: Fixture providing mock storage from test harness.
     """
+    key = f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}"
     valid_dates = {k.value: "2026-01-01T00:00:00+00:00" for k in FILTER_LIFETIME_DAYS}
-    with (
-        patch.object(coordinator._store, "async_load", AsyncMock(return_value=valid_dates)),
-        patch.object(coordinator._store, "async_save", AsyncMock()) as mock_save,
-    ):
+    hass_storage[key] = {
+        "version": STORAGE_VERSION,
+        "data": valid_dates,
+    }
+    with patch.object(coordinator._store, "async_save") as mock_save:
         await coordinator.async_setup()
         mock_save.assert_not_called()
 
 
-async def test_coordinator_reset_filter(coordinator: KarofiDataCoordinator) -> None:
+async def test_coordinator_reset_filter(
+    coordinator: KarofiDataCoordinator,
+    hass_storage: dict[str, Any],
+) -> None:
     """Test resetting filter date updates store and notification.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
+        hass_storage: Fixture providing mock storage from test harness.
     """
+    key = f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}"
     coordinator.data.filter_reset_dates["filter_1"] = "2020-01-01T00:00:00"
-    with patch.object(coordinator._store, "async_save", AsyncMock()) as mock_save:
+    frozen_now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    with patch("homeassistant.util.dt.utcnow", return_value=frozen_now):
         await coordinator.async_reset_filter("filter_1")
-        assert coordinator.data.filter_reset_dates["filter_1"] != "2020-01-01T00:00:00"
-        mock_save.assert_awaited_once()
+        assert coordinator.data.filter_reset_dates["filter_1"] == frozen_now.isoformat()
+        assert hass_storage[key]["data"]["filter_1"] == frozen_now.isoformat()
+        assert coordinator.get_filter_remaining_days("filter_1") == 180
 
 
 async def test_coordinator_update_data_device_not_found(
@@ -314,66 +334,80 @@ async def test_coordinator_update_data_connection_errors(
         assert data.connected is False
 
 
-async def test_coordinator_calibration_date_and_days(coordinator: KarofiDataCoordinator) -> None:
+async def test_coordinator_calibration_date_and_days(
+    coordinator: KarofiDataCoordinator,
+    hass_storage: dict[str, Any],
+) -> None:
     """Test async_set_filter_date and async_set_filter_used_days methods.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
+        hass_storage: Fixture providing mock storage from test harness.
     """
-    with patch.object(coordinator._store, "async_save", AsyncMock()) as mock_save:
-        # 1. ISO string
-        await coordinator.async_set_filter_date("filter_1", "2026-01-10T12:00:00+00:00")
-        assert "2026-01-10" in coordinator.data.filter_reset_dates["filter_1"]
-        mock_save.assert_awaited()
+    key = f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}"
+    # 1. ISO string
+    await coordinator.async_set_filter_date("filter_1", "2026-01-10T12:00:00+00:00")
+    assert coordinator.data.filter_reset_dates["filter_1"] == "2026-01-10T12:00:00+00:00"
+    assert hass_storage[key]["data"]["filter_1"] == "2026-01-10T12:00:00+00:00"
 
-        # 2. Date string YYYY-MM-DD
-        mock_save.reset_mock()
-        await coordinator.async_set_filter_date("filter_1", "2026-02-15")
-        assert "2026-02-15" in coordinator.data.filter_reset_dates["filter_1"]
-        mock_save.assert_awaited_once()
+    # 2. Date string YYYY-MM-DD
+    await coordinator.async_set_filter_date("filter_1", "2026-02-15")
+    assert "2026-02-15" in coordinator.data.filter_reset_dates["filter_1"]
+    assert hass_storage[key]["data"]["filter_1"] == coordinator.data.filter_reset_dates["filter_1"]
 
-        # 3. Datetime object
-        mock_save.reset_mock()
-        dt_val = datetime(2026, 3, 20, 10, 0, 0, tzinfo=UTC)
-        await coordinator.async_set_filter_date("filter_1", dt_val)
-        assert "2026-03-20" in coordinator.data.filter_reset_dates["filter_1"]
-        mock_save.assert_awaited_once()
+    # 3. Datetime object
+    dt_val = datetime(2026, 3, 20, 10, 0, 0, tzinfo=UTC)
+    await coordinator.async_set_filter_date("filter_1", dt_val)
+    assert coordinator.data.filter_reset_dates["filter_1"] == dt_val.isoformat()
+    assert hass_storage[key]["data"]["filter_1"] == dt_val.isoformat()
 
-        # 4. Invalid date string raises ValueError
-        with pytest.raises(ValueError, match="Invalid date format"):
-            await coordinator.async_set_filter_date("filter_1", "invalid-date-string")
+    # 4. Invalid date string raises ValueError
+    with pytest.raises(ValueError, match="Invalid date format"):
+        await coordinator.async_set_filter_date("filter_1", "invalid-date-string")
 
-        # 5. Non-existent filter key is ignored
-        mock_save.reset_mock()
-        await coordinator.async_set_filter_date("unknown_filter", "2026-01-01")
-        mock_save.assert_not_called()
+    # 5. Non-existent filter key is ignored
+    prev_stored = dict(hass_storage[key]["data"])
+    await coordinator.async_set_filter_date("unknown_filter", "2026-01-01")
+    assert hass_storage[key]["data"] == prev_stored
 
+    frozen_now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    with patch("homeassistant.util.dt.utcnow", return_value=frozen_now):
         # 6. Used days calibration
         await coordinator.async_set_filter_used_days("filter_2", 60)
-        assert "filter_2" in coordinator.data.filter_reset_dates
+        expected_f2 = (frozen_now - timedelta(days=60)).isoformat()
+        assert coordinator.data.filter_reset_dates["filter_2"] == expected_f2
+        assert hass_storage[key]["data"]["filter_2"] == expected_f2
+        assert coordinator.get_filter_remaining_days("filter_2") == 210
 
         # 7. Non-existent filter for used days is ignored
-        mock_save.reset_mock()
+        prev_stored = dict(hass_storage[key]["data"])
         await coordinator.async_set_filter_used_days("unknown_filter", 10)
-        mock_save.assert_not_called()
+        assert hass_storage[key]["data"] == prev_stored
 
         # 8. Calibrate all filters
-        mock_save.reset_mock()
         await coordinator.async_calibrate_all_filters(
             {"filter_1": 15, "filter_3": 30, "unknown": 10}
         )
-        mock_save.assert_awaited_once()
+        expected_f1 = (frozen_now - timedelta(days=15)).isoformat()
+        expected_f3 = (frozen_now - timedelta(days=30)).isoformat()
+        assert coordinator.data.filter_reset_dates["filter_1"] == expected_f1
+        assert coordinator.data.filter_reset_dates["filter_3"] == expected_f3
+        assert hass_storage[key]["data"]["filter_1"] == expected_f1
+        assert hass_storage[key]["data"]["filter_3"] == expected_f3
+        assert coordinator.get_filter_remaining_days("filter_1") == 165
+        assert coordinator.get_filter_remaining_days("filter_3") == 240
 
         # 9. Remaining days calibration
-        mock_save.reset_mock()
         await coordinator.async_set_filter_remaining_days("filter_1", 100)
-        assert "filter_1" in coordinator.data.filter_reset_dates
-        mock_save.assert_awaited_once()
+        expected_f1_rem = (frozen_now - timedelta(days=80)).isoformat()
+        assert coordinator.data.filter_reset_dates["filter_1"] == expected_f1_rem
+        assert hass_storage[key]["data"]["filter_1"] == expected_f1_rem
+        assert coordinator.get_filter_remaining_days("filter_1") == 100
 
         # 10. Non-existent filter for remaining days is ignored
-        mock_save.reset_mock()
+        prev_stored = dict(hass_storage[key]["data"])
         await coordinator.async_set_filter_remaining_days("unknown_filter", 50)
-        mock_save.assert_not_called()
+        assert hass_storage[key]["data"] == prev_stored
 
 
 async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordinator) -> None:
