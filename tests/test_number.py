@@ -1,8 +1,9 @@
 """Tests for Karofi number platform."""
 
 from collections.abc import Iterable
-from datetime import timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 from homeassistant.components.number import NumberDeviceClass, NumberMode
@@ -15,6 +16,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.karofi.const import (
     DOMAIN,
     FILTER_LIFETIME_DAYS,
+    STORAGE_KEY_PREFIX,
     KarofiFilter,
 )
 from custom_components.karofi.coordinator import KarofiDataCoordinator
@@ -159,6 +161,7 @@ async def test_number_set_native_value(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_coordinator: KarofiDataCoordinator,
+    hass_storage: dict[str, Any],
 ) -> None:
     """Test async_set_native_value modifies remaining days and persists calibration.
 
@@ -166,26 +169,43 @@ async def test_number_set_native_value(
         hass: HomeAssistant test instance.
         mock_config_entry: Fixture providing mock config entry.
         mock_coordinator: Fixture providing KarofiDataCoordinator.
+        hass_storage: Fixture providing mock storage from test harness.
     """
+    key = f"{STORAGE_KEY_PREFIX}_{mock_config_entry.entry_id}"
     mock_coordinator.data.filter_reset_dates["filter_1"] = dt_util.utcnow().isoformat()
     entity = KarofiFilterRemainingDaysNumber(
         mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1
     )
     _init_test_number(entity, "number.karofi_filter_1_remaining_days", hass)
 
-    with patch.object(mock_coordinator._store, "async_save", AsyncMock()) as mock_save:
+    frozen_now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    with patch("homeassistant.util.dt.utcnow", return_value=frozen_now):
         # Set remaining days to 60 days
         await entity.async_set_native_value(60.0)
         assert entity.native_value == 60.0
-        mock_save.assert_awaited_once()
+        expected_60 = (frozen_now - timedelta(days=120)).isoformat()
+        assert mock_coordinator.data.filter_reset_dates["filter_1"] == expected_60
+        assert hass_storage[key]["data"]["filter_1"] == expected_60
+        assert mock_coordinator.get_filter_remaining_days("filter_1") == 60
+        assert entity._calculate_remaining_days() == 60.0
 
         # Set remaining days clamped to max lifetime (lifetime 180)
         await entity.async_set_native_value(999.0)
         assert entity.native_value == 180.0
+        expected_max = frozen_now.isoformat()
+        assert mock_coordinator.data.filter_reset_dates["filter_1"] == expected_max
+        assert hass_storage[key]["data"]["filter_1"] == expected_max
+        assert mock_coordinator.get_filter_remaining_days("filter_1") == 180
+        assert entity._calculate_remaining_days() == 180.0
 
         # Set negative remaining days clamped to 0
         await entity.async_set_native_value(-10.0)
         assert entity.native_value == 0.0
+        expected_zero = (frozen_now - timedelta(days=180)).isoformat()
+        assert mock_coordinator.data.filter_reset_dates["filter_1"] == expected_zero
+        assert hass_storage[key]["data"]["filter_1"] == expected_zero
+        assert mock_coordinator.get_filter_remaining_days("filter_1") == 0
+        assert entity._calculate_remaining_days() == 0.0
 
 
 async def test_number_handle_coordinator_update(

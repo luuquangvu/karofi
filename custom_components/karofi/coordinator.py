@@ -192,6 +192,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         if needs_save:
             await self._store.async_save(self.data.filter_reset_dates)
 
+        self.async_update_listeners()
+
     async def async_reset_filter(self, filter_key: str) -> None:
         """Reset the installation date of a filter to now.
 
