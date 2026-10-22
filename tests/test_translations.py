@@ -5,7 +5,7 @@ from pathlib import Path
 import orjson
 import pytest
 
-from custom_components.karofi.const import DOMAIN
+from custom_components.karofi.const import DEVICE_ERROR_MESSAGES, DOMAIN
 
 BASE_DIR = Path(__file__).parent.parent
 STRINGS_JSON = BASE_DIR / "custom_components" / "karofi" / "strings.json"
@@ -66,6 +66,17 @@ def test_translation_key_order(translation_file):
         translation = orjson.loads(f.read())
 
     check_dict_order(translation, reference)
+
+
+def test_device_error_messages_match_strings():
+    """Ensure English fallback messages match entity translations."""
+    data = orjson.loads(STRINGS_JSON.read_text(encoding="utf-8"))
+    translated_messages = data["entity"]["binary_sensor"]["problem"]["state_attributes"][
+        "error_messages"
+    ]["state"]
+    expected_messages = {str(code): message for code, message in DEVICE_ERROR_MESSAGES.items()}
+    assert {key: translated_messages[key] for key in expected_messages} == expected_messages
+    assert translated_messages["unknown"] == "Unknown device error code"
 
 
 def test_no_translation_key_collisions():

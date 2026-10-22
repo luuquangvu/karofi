@@ -24,6 +24,7 @@ from custom_components.karofi.const import (
     DEFAULT_NAME,
     NOTIFY_UUID_PREFIX,
     PENDING_RESET_STORAGE_SUFFIX,
+    REQUEST_READ_DATA_COMMAND,
     STORAGE_KEY_PREFIX,
     STORAGE_VERSION,
     GattProperty,
@@ -32,7 +33,8 @@ from custom_components.karofi.const import (
     WaterQuality,
     build_reset_filter_command,
 )
-from custom_components.karofi.coordinator import KarofiDataCoordinator
+from custom_components.karofi.coordinator import RESET_CONFIRMATION_POLLS, KarofiDataCoordinator
+from custom_components.karofi.models import PendingFilterReset, ResolvedGattTargets
 
 
 @pytest.fixture
@@ -70,6 +72,37 @@ def _mock_characteristic(uuid: str, properties: list[str] | None = None) -> Magi
     if properties is not None:
         char.properties = properties
     return char
+
+
+def _resolved_gatt_targets(
+    read_target: BleakGATTCharacteristic,
+    notify_target: BleakGATTCharacteristic,
+    *,
+    command_target: BleakGATTCharacteristic | None = None,
+    read_characteristic: BleakGATTCharacteristic | None = None,
+    can_read: bool = True,
+) -> ResolvedGattTargets:
+    """Build resolved GATT targets with explicit, named fields.
+
+    Args:
+        read_target: Characteristic used for direct reads.
+        notify_target: Characteristic used for notifications.
+        command_target: Optional command characteristic; defaults to notify target.
+        read_characteristic: Optional resolved read characteristic; defaults to read target.
+        can_read: Whether direct reads are supported.
+
+    Returns:
+        ResolvedGattTargets for coordinator tests.
+    """
+    return ResolvedGattTargets(
+        read_target=read_target,
+        notify_target=notify_target,
+        command_target=command_target if command_target is not None else notify_target,
+        read_characteristic=(
+            read_characteristic if read_characteristic is not None else read_target
+        ),
+        can_read=can_read,
+    )
 
 
 async def test_coordinator_setup_loads_stored_dates(
@@ -157,13 +190,20 @@ async def test_coordinator_setup_restores_pending_reset(
     with patch("homeassistant.util.dt.utcnow", return_value=frozen_now):
         await coordinator.async_setup()
 
-        assert coordinator._pending_filter_resets["filter_1"] == (0, 0, None, 4320)
+        assert coordinator._pending_filter_resets["filter_1"] == PendingFilterReset(
+            generation=0, lifetime_hours=4320
+        )
         assert coordinator.get_filter_remaining_days("filter_1") == 180
         assert coordinator.data.filters["filter_1"].remaining_hours == 4320
         assert coordinator.data.filters["filter_1"].remaining_days == 180
         assert coordinator.data.filters["filter_1"].percent == 100
-        coordinator._update_single_filter_stage(0, 2400, 8760, None, telemetry_generation=1)
-        assert coordinator._pending_filter_resets["filter_1"] == (0, 1, 1, 4320)
+        coordinator._update_single_filter_stage(0, 2400, 4320, telemetry_generation=1)
+        assert coordinator._pending_filter_resets["filter_1"] == PendingFilterReset(
+            generation=0,
+            mismatch_count=1,
+            last_counted_generation=1,
+            lifetime_hours=4320,
+        )
         assert coordinator.data.filters["filter_1"].lifetime_hours == 4320
         assert coordinator.data.filters["filter_1"].lifetime_days == 180
         assert coordinator.get_filter_remaining_days("filter_1") == 180
@@ -225,7 +265,7 @@ async def test_coordinator_reset_filter(
     """
     key = f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}"
     coordinator.data.filter_reset_dates["filter_1"] = "2020-01-01T00:00:00"
-    coordinator._update_single_filter_stage(0, 3600, 4320, None)
+    coordinator._update_single_filter_stage(0, 3600, 4320)
     frozen_now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
     with (
         patch("homeassistant.util.dt.utcnow", return_value=frozen_now),
@@ -243,20 +283,21 @@ async def test_coordinator_reset_filter(
 
         for generation in (1, 2):
             coordinator._process_tds_payload(
-                b'{"iro_rtr":[3600],"iro_lTime":[4320]}\n{"iro_rtr":[3600],"iro_lTime":[4320]}',
+                b'{"iro_lTime":[3600],"iro_hsd":[4320]}\n{"iro_lTime":[3600],"iro_hsd":[4320]}',
                 telemetry_generation=generation,
             )
             assert "filter_1" in coordinator._pending_filter_resets
-            assert coordinator._pending_filter_resets["filter_1"] == (
-                coordinator._telemetry_generation,
-                generation,
-                generation,
-                4320,
+            assert coordinator._pending_filter_resets["filter_1"] == PendingFilterReset(
+                generation=coordinator._telemetry_generation,
+                mismatch_count=generation,
+                last_counted_generation=generation,
+                lifetime_hours=4320,
+                baseline_hours=3600,
             )
             assert coordinator.data.filters["filter_1"].remaining_days == 180
             assert coordinator.get_filter_remaining_days("filter_1") == 180
 
-        coordinator._update_single_filter_stage(0, 4320, 4320, None, telemetry_generation=3)
+        coordinator._update_single_filter_stage(0, 4320, 4320, telemetry_generation=3)
         assert "filter_1" not in coordinator._pending_filter_resets
         assert coordinator.data.filters["filter_1"].telemetry_synced is True
         await coordinator._pending_reset_store._async_handle_write_data()
@@ -1018,29 +1059,68 @@ async def test_coordinator_write_command_with_fallback() -> None:
     )
     assert res is True
 
-    # 2. Prefer no response when write-without-response is only option
+    # 2. Send the full command in one write when chunking is disabled.
+    long_command = b"\x01" + b"x" * 40 + b"\x04"
+    mock_char_both = MagicMock(spec=BleakGATTCharacteristic)
+    mock_char_both.properties = ["write", "write-without-response"]
+    mock_client.write_gatt_char.reset_mock()
+    res_unchunked = await KarofiDataCoordinator._write_command_with_fallback(
+        mock_client,
+        mock_char_both,
+        long_command,
+        prefer_with_response=True,
+        chunked=False,
+    )
+    assert res_unchunked is True
+    mock_client.write_gatt_char.assert_awaited_once_with(
+        mock_char_both,
+        long_command,
+        response=True,
+    )
+
+    # 3. Prefer no response when write-without-response is only option
     mock_char_no_resp = MagicMock(spec=BleakGATTCharacteristic)
     mock_char_no_resp.properties = ["write-without-response"]
     res_no_resp = await KarofiDataCoordinator._write_command_with_fallback(
         mock_client, mock_char_no_resp, b"\x01test\x04"
     )
     assert res_no_resp is True
+    mock_client.write_gatt_char.assert_awaited_with(
+        mock_char_no_resp,
+        b"\x01test\x04",
+        response=False,
+    )
 
-    # 3. Fallback on BleakError to opposite response mode
+    # Characteristic properties take precedence over the preferred mode.
+    mock_client.write_gatt_char.reset_mock()
+    res_with_resp = await KarofiDataCoordinator._write_command_with_fallback(
+        mock_client,
+        mock_char_no_resp,
+        b"\x01test\x04",
+        prefer_with_response=True,
+    )
+    assert res_with_resp is True
+    mock_client.write_gatt_char.assert_awaited_once_with(
+        mock_char_no_resp,
+        b"\x01test\x04",
+        response=False,
+    )
+
+    # 4. Fallback on BleakError to opposite response mode
     mock_client.write_gatt_char.side_effect = [BleakError("Write failed"), None]
     res_fallback = await KarofiDataCoordinator._write_command_with_fallback(
         mock_client, mock_char, b"\x01test\x04"
     )
     assert res_fallback is True
 
-    # 4. Both attempts fail
+    # 5. Both attempts fail
     mock_client.write_gatt_char.side_effect = BleakError("All write attempts failed")
     res_fail = await KarofiDataCoordinator._write_command_with_fallback(
         mock_client, mock_char, b"\x01test\x04"
     )
     assert res_fail is False
 
-    # 5. Direct OSError failure
+    # 6. Direct OSError failure
     mock_client.write_gatt_char.side_effect = OSError("Connection aborted")
     res_os_fail = await KarofiDataCoordinator._write_command_with_fallback(
         mock_client, mock_char, b"\x01test\x04"
@@ -1263,9 +1343,9 @@ async def test_coordinator_scan_data_characteristics_success(
         if "ac03" in target_uuid:
             return b'{"pc":"iro_tds","d":42}'
         if "ac04" in target_uuid:
-            return b'{"pc":"iro_lTime","d":[4320,8640]}'
+            return b'{"pc":"iro_lTime","d":[2160,4320]}'
         if "ac05" in target_uuid:
-            return b'{"pc":"iro_rtr","d":[2160,4320]}'
+            return b'{"pc":"iro_hsd","d":[4320,8640]}'
         return b""
 
     mock_client.read_gatt_char.side_effect = _mock_read
@@ -1303,7 +1383,7 @@ async def test_coordinator_direct_tds_read_still_collects_filter_telemetry(
         patch.object(
             coordinator,
             "_resolve_io_targets",
-            return_value=(read_char, notify_char, notify_char, read_char, True),
+            return_value=_resolved_gatt_targets(read_char, notify_char),
         ),
         patch.object(
             coordinator,
@@ -1345,7 +1425,7 @@ async def test_coordinator_supplemental_scan_preserves_direct_tds_uuid(
         patch.object(
             coordinator,
             "_resolve_io_targets",
-            return_value=(read_char, read_char, read_char, read_char, True),
+            return_value=_resolved_gatt_targets(read_char, read_char),
         ),
         patch.object(
             coordinator,
@@ -1383,7 +1463,7 @@ async def test_coordinator_direct_tds_survives_supplemental_poll_timeout(
         patch.object(
             coordinator,
             "_resolve_io_targets",
-            return_value=(read_char, notify_char, notify_char, read_char, True),
+            return_value=_resolved_gatt_targets(read_char, notify_char),
         ),
         patch.object(
             coordinator,
@@ -1423,7 +1503,7 @@ async def test_coordinator_skips_supplemental_poll_near_ble_deadline(
         patch.object(
             coordinator,
             "_resolve_io_targets",
-            return_value=(read_char, notify_char, notify_char, read_char, True),
+            return_value=_resolved_gatt_targets(read_char, notify_char),
         ),
         patch.object(
             coordinator,
@@ -1498,7 +1578,7 @@ async def test_coordinator_filter_telemetry_uses_follow_up_tds(
         patch.object(
             coordinator,
             "_resolve_io_targets",
-            return_value=(read_char, notify_char, notify_char, read_char, True),
+            return_value=_resolved_gatt_targets(read_char, notify_char),
         ),
         patch.object(
             coordinator,
@@ -1542,7 +1622,7 @@ async def test_coordinator_active_polling_tds_precedes_candidate_tds(
         patch.object(
             coordinator,
             "_resolve_io_targets",
-            return_value=(read_char, notify_char, notify_char, read_char, True),
+            return_value=_resolved_gatt_targets(read_char, notify_char),
         ),
         patch.object(coordinator, "_try_direct_read", AsyncMock(return_value=(None, bytearray()))),
         patch.object(
@@ -1817,6 +1897,8 @@ def test_coordinator_process_tds_payload_dynamic_filters_and_names(
         b'\x01{"et":"NP","iro_tds":18,'
         b'"iro_rtr":[1200,2400,3600,4800,6000,7200,8400],'
         b'"iro_lTime":[4320,8640,8640,17280,8640,8640,8640],'
+        b'"iro_hsd":[8640,8640,8640,25920,8640,8640,8640],'
+        b'"iro_rtt":[1200,2400,3600,4800,6000,7200,8400],'
         b'"iro_names":['
         b'"Sediment","OCB-GAC","PP 1M","RO Membrane","Mineral","Hydrogen","Nano Silver"]}'
         b"\x04"
@@ -1839,8 +1921,8 @@ def test_coordinator_process_tds_payload_dynamic_filters_and_names(
     assert coordinator.get_filter_name("filter_2") == "OCB-GAC"
     assert coordinator.get_filter_name("filter_4") == "RO Membrane"
     assert coordinator.get_filter_name("filter_7") == "Nano Silver"
-    assert coordinator.get_filter_remaining_days("filter_2") == 100  # 2400 hours // 24 = 100 days
-    assert coordinator.get_filter_lifetime_days("filter_2") == 360  # 8640 hours // 24 = 360 days
+    assert coordinator.get_filter_remaining_days("filter_2") == 360  # 8640 hours / 24
+    assert coordinator.get_filter_lifetime_days("filter_2") == 360  # 8640 hours / 24
 
 
 def test_coordinator_process_payloads_preserves_first_tds_reading(
@@ -1852,7 +1934,7 @@ def test_coordinator_process_payloads_preserves_first_tds_reading(
         coordinator: Fixture providing KarofiDataCoordinator.
     """
     coordinator._process_tds_payload(
-        b'{"d":12}\n{"pc":"iro_tds","d":9}\n{"pc":"iro_tds","d":99}\n{"pc":"iro_rtr","d":[1200]}'
+        b'{"d":12}\n{"pc":"iro_tds","d":9}\n{"pc":"iro_tds","d":99}\n{"pc":"iro_lTime","d":[1200]}'
     )
 
     assert coordinator.data.tds == 9
@@ -1861,7 +1943,7 @@ def test_coordinator_process_payloads_preserves_first_tds_reading(
 
 @pytest.mark.parametrize(
     ("filter_index", "expected_data"),
-    [(0, 1), (11, 12), (12, 13)],
+    [(0, 0), (11, 11), (12, 12)],
     ids=["first-stage", "last-named-stage", "first-dynamic-stage"],
 )
 async def test_coordinator_async_send_reset_command_ble(
@@ -1870,13 +1952,13 @@ async def test_coordinator_async_send_reset_command_ble(
     filter_index: int,
     expected_data: int,
 ) -> None:
-    """Test _async_send_reset_command sends command via BLE write characteristic.
+    """Test _async_send_reset_command writes one full command to notify characteristic.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
         mock_ble_device: Fixture providing mock BLEDevice.
         filter_index: 0-based index to encode in the reset command.
-        expected_data: 1-based filter number expected in the payload.
+        expected_data: 0-based filter index expected in the payload.
     """
     mock_client = AsyncMock()
     mock_client.disconnect = AsyncMock()
@@ -1884,7 +1966,16 @@ async def test_coordinator_async_send_reset_command_ble(
 
     write_char = _mock_characteristic(
         KarofiCharacteristic.COMMAND,
-        properties=[GattProperty.WRITE, GattProperty.WRITE_WITHOUT_RESPONSE],
+        properties=[GattProperty.WRITE_WITHOUT_RESPONSE, GattProperty.NOTIFY],
+    )
+    notify_char = _mock_characteristic(
+        KarofiCharacteristic.NOTIFY,
+        properties=[
+            GattProperty.READ,
+            GattProperty.WRITE_WITHOUT_RESPONSE,
+            GattProperty.WRITE,
+            GattProperty.NOTIFY,
+        ],
     )
     mock_services = MagicMock(spec=BleakGATTServiceCollection)
 
@@ -1905,13 +1996,28 @@ async def test_coordinator_async_send_reset_command_ble(
             return_value=mock_client,
         ),
     ):
-        await coordinator._async_send_reset_command(filter_index)
+        with patch.object(
+            coordinator,
+            "_resolve_io_targets",
+            return_value=ResolvedGattTargets(
+                read_target=write_char,
+                notify_target=notify_char,
+                command_target=write_char,
+                read_characteristic=None,
+                can_read=False,
+            ),
+        ):
+            await coordinator._async_send_reset_command(filter_index)
 
-        expected_command = f'\x01{{"et":"CP","pc":"iro_rsft","d":{expected_data}}}\x04'.encode()
+        expected_command = build_reset_filter_command(expected_data)
         mock_client.write_gatt_char.assert_awaited_once_with(
-            write_char,
+            notify_char,
             expected_command,
             response=True,
+        )
+        mock_client.start_notify.assert_awaited_once_with(
+            notify_char,
+            coordinator._log_reset_notification,
         )
 
 
@@ -1923,16 +2029,21 @@ def test_build_reset_filter_command_rejects_negative_index() -> None:
 
 @pytest.mark.parametrize(
     ("filter_index", "expected_data"),
-    [(0, 1), (5, 6)],
+    [(0, 0), (5, 5)],
 )
-def test_build_reset_filter_command_converts_index_to_one_based_payload(
+def test_build_reset_filter_command_preserves_zero_based_index(
     filter_index: int,
     expected_data: int,
 ) -> None:
-    """Encode zero-based filter indices as one-based device stages."""
+    """Encode zero-based filter indices directly as the device stage value."""
     assert build_reset_filter_command(filter_index) == (
-        f'\x01{{"et":"CP","pc":"iro_rsft","d":{expected_data}}}\x04'.encode()
+        b"\x01" + f'{{"et":"CP","pc":"iro_rsft","d":{expected_data}}}'.encode() + b"\x04"
     )
+
+
+def test_request_read_data_command_is_unframed_json() -> None:
+    """Encode poll commands as raw JSON, matching the official app's BLE writes."""
+    assert REQUEST_READ_DATA_COMMAND == b'{"et":"NP"}'
 
 
 async def test_coordinator_reset_filter_rejects_invalid_key(
@@ -2036,41 +2147,99 @@ async def test_coordinator_reset_filter_command_failure(
         assert "filter_1" not in coordinator.data.filter_reset_dates
 
 
-async def test_coordinator_reset_filter_unconfirmed_uses_device_telemetry(
+async def test_coordinator_reset_filter_unconfirmed_reverts_to_device_telemetry(
     coordinator: KarofiDataCoordinator,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Revert a reset that the device does not confirm after three telemetry polls.
+    """Revert to device telemetry when it does not confirm after three polls.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
         caplog: Fixture capturing log messages.
     """
-    coordinator._update_single_filter_stage(0, 1200, 4320, None)
+    coordinator._update_single_filter_stage(0, 1200, 4320)
     with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
         await coordinator.async_reset_filter("filter_1")
 
     assert coordinator.get_filter_remaining_days("filter_1") == 180
     for generation in range(1, 4):
-        coordinator._update_single_filter_stage(
-            0, 1200, 4320, None, telemetry_generation=generation
-        )
+        coordinator._update_single_filter_stage(0, 1200, 4320, telemetry_generation=generation)
+        if generation < RESET_CONFIRMATION_POLLS:
+            assert "filter_1" in coordinator._pending_filter_resets
+            assert coordinator.get_filter_remaining_days("filter_1") == 180
+
+    coordinator._update_single_filter_stage(0, 1200, 4320, telemetry_generation=4)
 
     assert "filter_1" not in coordinator._pending_filter_resets
+    assert coordinator.data.filters["filter_1"].remaining_hours == 1200
     assert coordinator.data.filters["filter_1"].remaining_days == 50
+    assert coordinator.data.filters["filter_1"].telemetry_synced is True
     assert coordinator.get_filter_remaining_days("filter_1") == 50
     assert "Device did not confirm reset for filter_1 after 3 telemetry polls" in caplog.text
+    assert "reverting to device telemetry" in caplog.text
+    assert caplog.text.count("Filter reset telemetry for filter_1") == 3
+    assert "confirmation poll=4/3" not in caplog.text
+
+
+async def test_coordinator_reset_confirms_against_rated_lifetime_hours(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Confirm a reset when iro_lTime reaches the iro_hsd rated lifetime."""
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[8635],"iro_hsd":[8640]}',
+        telemetry_generation=1,
+    )
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.lifetime_hours == 8640
+    assert fdata.lifetime_days == 360
+    assert fdata.remaining_days == 360
+    assert fdata.percent == 100
+
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[8640],"iro_hsd":[8640]}',
+        telemetry_generation=2,
+    )
+
+    assert "filter_1" not in coordinator._pending_filter_resets
+    assert fdata.telemetry_synced is True
+    assert fdata.remaining_days == 360
+
+
+async def test_coordinator_reset_not_confirmed_when_near_full_telemetry_unchanged(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Do not confirm a reset when near-full telemetry did not increase.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    coordinator._update_single_filter_stage(0, 8623, 8640)
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    for generation in range(1, RESET_CONFIRMATION_POLLS + 1):
+        coordinator._update_single_filter_stage(0, 8623, 8640, telemetry_generation=generation)
+
+    assert "filter_1" not in coordinator._pending_filter_resets
+    assert coordinator.data.filters["filter_1"].remaining_hours == 8623
+    assert "Device confirmed reset for filter_1" not in caplog.text
+    assert "Device did not confirm reset for filter_1" in caplog.text
 
 
 @pytest.mark.parametrize(
-    ("lifetime_hours", "rtr_hours", "reported_lifetime_hours"),
+    ("lifetime_hours", "remaining_hours", "reported_lifetime_hours"),
     [(0, 0, 0), (10, 0, 10), (4320, 0, 0)],
     ids=["unknown-lifetime", "small-lifetime-not-near-full", "invalid-reported-lifetime"],
 )
 async def test_coordinator_reset_requires_valid_near_full_lifetime(
     coordinator: KarofiDataCoordinator,
     lifetime_hours: int,
-    rtr_hours: int,
+    remaining_hours: int,
     reported_lifetime_hours: int,
 ) -> None:
     """Keep reset pending when lifetime telemetry is invalid or not near full.
@@ -2078,18 +2247,18 @@ async def test_coordinator_reset_requires_valid_near_full_lifetime(
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
         lifetime_hours: Rated lifetime reported before reset.
-        rtr_hours: Remaining time reported after reset.
+        remaining_hours: Remaining time reported after reset.
         reported_lifetime_hours: Rated lifetime reported after reset.
     """
-    coordinator._update_single_filter_stage(0, lifetime_hours, lifetime_hours, None)
+    coordinator._update_single_filter_stage(0, lifetime_hours, lifetime_hours)
     with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
         await coordinator.async_reset_filter("filter_1")
 
     coordinator._update_single_filter_stage(
-        0, rtr_hours, reported_lifetime_hours, None, telemetry_generation=1
+        0, remaining_hours, reported_lifetime_hours, telemetry_generation=1
     )
 
-    assert coordinator._pending_filter_resets["filter_1"][1] == 1
+    assert coordinator._pending_filter_resets["filter_1"].mismatch_count == 1
 
 
 def test_coordinator_coerce_int_list_preserves_none(coordinator: KarofiDataCoordinator) -> None:
@@ -2103,17 +2272,29 @@ def test_coordinator_coerce_int_list_preserves_none(coordinator: KarofiDataCoord
     assert coordinator._coerce_int_list(raw, preserve_none=False) == [1200, 3600, 4800]
 
 
-def test_coordinator_update_single_filter_stage_leaves_date_unset_without_rtr(
+def test_coordinator_update_single_filter_stage_leaves_date_unset_without_remaining(
     coordinator: KarofiDataCoordinator,
 ) -> None:
-    """Test _update_single_filter_stage does not fabricate a reset date when rtr_h is None.
+    """Test _update_single_filter_stage does not fabricate a reset date without remaining hours.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
     """
-    coordinator._update_single_filter_stage(0, None, 4320, None, "Sediment")
+    coordinator._update_single_filter_stage(0, None, 4320, "Sediment")
     assert "filter_1" not in coordinator.data.filter_reset_dates
     assert coordinator.data.filters["filter_1"].remaining_days is None
+
+
+def test_coordinator_process_errors_stores_codes(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test _process_errors_from_payload stores reported error codes.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    assert coordinator._process_errors_from_payload({"iro_errs": [1, 4, 100]}) is True
+    assert coordinator.data.errors == [1, 4, 100]
 
 
 def test_coordinator_process_errors_empty_list_clears_errors(
@@ -2154,7 +2335,7 @@ def test_coordinator_telemetry_synced_tracking(
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
     """
-    coordinator._update_single_filter_stage(0, 2400, 4320, None, "Sediment")
+    coordinator._update_single_filter_stage(0, 2400, 4320, "Sediment")
     fdata = coordinator.data.filters["filter_1"]
     assert fdata.telemetry_synced is True
     assert fdata.remaining_days == 100
@@ -2165,23 +2346,51 @@ def test_coordinator_telemetry_synced_tracking(
         dt_util.utcnow() - timedelta(days=20)
     ).isoformat()
     coordinator._process_tds_payload(
-        b'{"iro_rtr":[1200],"iro_lTime":[8760],"names":["Sediment"]}',
+        b'{"iro_lTime":[1200],"iro_hsd":[2400],"names":["Sediment"]}',
         telemetry_generation=1,
     )
     assert fdata.telemetry_synced is True
     assert fdata.remaining_days == 50
-    assert fdata.lifetime_hours == 8760
-    assert fdata.lifetime_days == 365
-    assert fdata.percent == round((50 / 365) * 100)
+    assert fdata.lifetime_hours == 2400
+    assert fdata.lifetime_days == 100
+    assert fdata.percent == 50
     assert coordinator.get_filter_remaining_days("filter_1") == 50
 
     # Subsequent device changes are reflected directly.
     coordinator._process_tds_payload(
-        b'{"iro_rtr":[3840],"iro_lTime":[8760],"names":["Sediment"]}',
+        b'{"iro_lTime":[1920],"iro_hsd":[2400],"names":["Sediment"]}',
         telemetry_generation=2,
     )
-    assert fdata.remaining_days == 160
-    assert coordinator.get_filter_remaining_days("filter_1") == 160
+    assert fdata.remaining_days == 80
+    assert coordinator.get_filter_remaining_days("filter_1") == 80
+
+
+def test_coordinator_filter_days_follow_remaining_and_rated_hours(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Use iro_lTime/iro_hsd rather than iro_rtt/iro_rtr for filter days.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"d":[8624,8624,8624,25904,8624],"lid":"1","pc":"iro_lTime"}\n'
+        b'{"d":[8640,8640,8640,25920,8640],"lid":"1","pc":"iro_hsd"}\n'
+        b'{"d":[1200,1200,1200,3600,1200],"lid":"1","pc":"iro_rtt"}\n'
+        b'{"d":[1200,1200,1200,3600,1200],"lid":"1","pc":"iro_rtr"}',
+        telemetry_generation=1,
+    )
+
+    assert coordinator.data.filters["filter_1"].remaining_hours == 8624
+    assert coordinator.data.filters["filter_1"].lifetime_hours == 8640
+    assert coordinator.get_filter_remaining_days("filter_1") == 359
+    assert coordinator.get_filter_lifetime_days("filter_1") == 360
+    assert coordinator.data.filters["filter_1"].percent == 100
+
+    assert coordinator.data.filters["filter_4"].remaining_hours == 25904
+    assert coordinator.data.filters["filter_4"].lifetime_hours == 25920
+    assert coordinator.get_filter_remaining_days("filter_4") == 1079
+    assert coordinator.get_filter_lifetime_days("filter_4") == 1080
 
 
 async def test_coordinator_try_active_polling_accepts_filter_only_telemetry(

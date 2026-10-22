@@ -32,6 +32,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    BLE_COMMAND_CHUNK_SIZE,
     BLE_CONNECT_ATTEMPTS,
     BLE_TIMEOUT_SECONDS,
     DEFAULT_FILTER_LIFETIME_DAYS,
@@ -59,7 +60,13 @@ from .const import (
     WaterQuality,
     build_reset_filter_command,
 )
-from .models import KarofiData, KarofiFilterData
+from .models import (
+    KarofiData,
+    KarofiFilterData,
+    PendingFilterReset,
+    PendingResetOutcome,
+    ResolvedGattTargets,
+)
 from .util import (
     filter_index_to_key,
     filter_key_to_index,
@@ -71,6 +78,7 @@ from .util import (
 
 _LOGGER = logging.getLogger(__name__)
 RESET_CONFIRMATION_POLLS = 3
+RESET_COMMAND_SETTLE_SECONDS = 1.0
 
 
 class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
@@ -123,7 +131,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             STORAGE_VERSION,
             f"{STORAGE_KEY_PREFIX}_{entry.entry_id}_{PENDING_RESET_STORAGE_SUFFIX}",
         )
-        self._pending_filter_resets: dict[str, tuple[int, int, int | None, int | None]] = {}
+        self._pending_filter_resets: dict[str, PendingFilterReset] = {}
         self._mac_candidates: tuple[str, str] = (
             normalize_mac(mac_address, uppercase=True),
             normalize_mac(mac_address, uppercase=False),
@@ -287,11 +295,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     fdata.remaining_hours = lifetime_hours
                     fdata.remaining_days = fdata.lifetime_days
                     fdata.percent = 100
-                self._pending_filter_resets[key] = (
-                    self._telemetry_generation,
-                    0,
-                    None,
-                    lifetime_hours,
+                self._pending_filter_resets[key] = PendingFilterReset(
+                    generation=self._telemetry_generation,
+                    lifetime_hours=lifetime_hours,
                 )
                 valid_pending_resets[key] = lifetime_hours
 
@@ -320,7 +326,10 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
     def _get_pending_reset_storage(self) -> dict[str, int | None]:
         """Return pending reset metadata for persistent storage."""
-        return {key: pending_reset[3] for key, pending_reset in self._pending_filter_resets.items()}
+        return {
+            key: pending_reset.lifetime_hours
+            for key, pending_reset in self._pending_filter_resets.items()
+        }
 
     async def _async_save_filter_tracking(self) -> None:
         """Persist filter installation dates."""
@@ -457,9 +466,80 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     max_attempts=BLE_CONNECT_ATTEMPTS,
                 )
                 try:
-                    _, notify_target, cmd_target, _, _ = self._resolve_io_targets(client)
-                    actual_cmd_target = cmd_target or notify_target
-                    return await self._write_command_with_fallback(client, actual_cmd_target, cmd)
+                    targets = self._resolve_io_targets(client)
+                    notify_target = targets.notify_target
+                    cmd_target = targets.command_target
+                    # The vendor application writes commands to its notify/write
+                    # characteristic (ac02), not the separate WiFi command
+                    # characteristic (ab02).
+                    reset_target = (
+                        notify_target
+                        if isinstance(notify_target, BleakGATTCharacteristic)
+                        and (
+                            GattProperty.WRITE in notify_target.properties
+                            or GattProperty.WRITE_WITHOUT_RESPONSE in notify_target.properties
+                        )
+                        else cmd_target or notify_target
+                    )
+                    reset_notify_target = (
+                        reset_target
+                        if isinstance(reset_target, BleakGATTCharacteristic)
+                        and GattProperty.NOTIFY in reset_target.properties
+                        else notify_target
+                    )
+                    if (
+                        isinstance(reset_notify_target, BleakGATTCharacteristic)
+                        and GattProperty.NOTIFY in reset_notify_target.properties
+                    ):
+                        try:
+                            await client.start_notify(
+                                reset_notify_target,
+                                self._log_reset_notification,
+                            )
+                        except (BleakError, OSError) as err:
+                            _LOGGER.debug(
+                                "Could not enable reset notifications on %s for %s: %s",
+                                reset_notify_target.uuid,
+                                self.masked_mac,
+                                err,
+                            )
+                        else:
+                            _LOGGER.debug(
+                                "Enabled reset notifications on %s for %s",
+                                reset_notify_target.uuid,
+                                self.masked_mac,
+                            )
+
+                    # The vendor app subscribes to the notification characteristic
+                    # and waits briefly before issuing reset commands.
+                    await asyncio.sleep(RESET_COMMAND_SETTLE_SECONDS)
+                    _LOGGER.debug(
+                        "Sending reset command for filter_%d to %s via %s (hex=%s): %s",
+                        filter_index + 1,
+                        self.masked_mac,
+                        getattr(reset_target, "uuid", reset_target),
+                        cmd.hex(),
+                        cmd.decode("utf-8", errors="replace"),
+                    )
+                    write_succeeded = await self._write_command_with_fallback(
+                        client,
+                        reset_target,
+                        cmd,
+                        prefer_with_response=True,
+                        chunked=False,
+                    )
+                    if write_succeeded:
+                        # Keep the connection open briefly after the write so the
+                        # BLE stack can finish transmitting before disconnecting.
+                        await asyncio.sleep(RESET_COMMAND_SETTLE_SECONDS)
+                    _LOGGER.debug(
+                        "Reset command write for filter_%d to %s via %s completed (success=%s)",
+                        filter_index + 1,
+                        self.masked_mac,
+                        getattr(reset_target, "uuid", reset_target),
+                        write_succeeded,
+                    )
+                    return write_succeeded
                 finally:
                     await client.disconnect()
         except (BleakError, OSError) as err:
@@ -469,6 +549,21 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 err,
             )
             return False
+
+    def _log_reset_notification(
+        self,
+        characteristic: BleakGATTCharacteristic,
+        data: bytearray,
+    ) -> None:
+        """Log command-characteristic notifications received during a reset."""
+        _LOGGER.debug(
+            "Reset characteristic notification from %s via %s (%d bytes, hex=%s, text=%s)",
+            self.masked_mac,
+            characteristic.uuid,
+            len(data),
+            bytes(data).hex(),
+            data.decode("utf-8", errors="replace"),
+        )
 
     async def async_reset_filter(self, filter_key: str) -> None:
         """Reset the installation date and telemetry of a filter to now.
@@ -497,14 +592,18 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         lifetime_hours = (
             fdata.lifetime_hours
             if fdata is not None and fdata.lifetime_hours is not None and fdata.lifetime_hours > 0
-            else None
+            else self.get_filter_lifetime_days(filter_key) * 24
         )
+        existing_pending = self._pending_filter_resets.get(filter_key)
+        if existing_pending is not None:
+            baseline_hours = existing_pending.baseline_hours
+        else:
+            baseline_hours = fdata.remaining_hours if fdata is not None else None
         self._apply_filter_installation_date(filter_key, dt_util.utcnow())
-        self._pending_filter_resets[filter_key] = (
-            self._telemetry_generation,
-            0,
-            None,
-            lifetime_hours,
+        self._pending_filter_resets[filter_key] = PendingFilterReset(
+            generation=self._telemetry_generation,
+            lifetime_hours=lifetime_hours,
+            baseline_hours=baseline_hours,
         )
         await self._pending_reset_store.async_save(self._get_pending_reset_storage())
         await self._async_save_filter_tracking()
@@ -818,6 +917,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         client: BleakClientWithServiceCache,
         target: BleakGATTCharacteristic | str,
         command: bytes,
+        *,
+        prefer_with_response: bool = False,
+        chunked: bool = True,
     ) -> bool:
         """Write command bytes to target characteristic handling response properties.
 
@@ -825,26 +927,87 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             client: Connected Bleak client instance.
             target: Characteristic object or UUID string to write command to.
             command: Command payload bytes to transmit.
+            prefer_with_response: Prefer an acknowledged write when the characteristic
+                supports it. Characteristic properties always take precedence.
+            chunked: Split the command into BLE-sized writes. Disable this when the
+                peripheral expects the full frame in a single GATT write.
 
         Returns:
             True if write succeeded, False otherwise.
         """
         props = target.properties if isinstance(target, BleakGATTCharacteristic) else []
-        prefer_no_resp = (
-            GattProperty.WRITE_WITHOUT_RESPONSE in props and GattProperty.WRITE not in props
+        supports_write = GattProperty.WRITE in props
+        supports_write_without_response = GattProperty.WRITE_WITHOUT_RESPONSE in props
+        if supports_write or supports_write_without_response:
+            prefer_no_resp = supports_write_without_response and (
+                not supports_write or not prefer_with_response
+            )
+        else:
+            prefer_no_resp = not prefer_with_response
+        response_mode = not prefer_no_resp
+
+        chunks = (
+            [
+                command[offset : offset + BLE_COMMAND_CHUNK_SIZE]
+                for offset in range(0, len(command), BLE_COMMAND_CHUNK_SIZE)
+            ]
+            if chunked
+            else [command]
+        )
+        _LOGGER.debug(
+            "Writing %d bytes to %s in %d chunk(s) using response=%s (chunked=%s, properties=%s)",
+            len(command),
+            getattr(target, "uuid", target),
+            len(chunks),
+            response_mode,
+            chunked,
+            props,
         )
 
-        try:
-            await client.write_gatt_char(target, command, response=not prefer_no_resp)
-            return True
-        except BleakError, TypeError:
+        for chunk_index, chunk in enumerate(chunks, start=1):
             try:
-                await client.write_gatt_char(target, command, response=prefer_no_resp)
-                return True
-            except BleakError, OSError:
+                await client.write_gatt_char(target, chunk, response=response_mode)
+                _LOGGER.debug(
+                    "BLE write chunk %d/%d to %s completed with response=%s",
+                    chunk_index,
+                    len(chunks),
+                    getattr(target, "uuid", target),
+                    response_mode,
+                )
+            except (BleakError, TypeError) as err:
+                _LOGGER.debug(
+                    "BLE write chunk %d/%d to %s with response=%s failed: %s; "
+                    "trying the other mode",
+                    chunk_index,
+                    len(chunks),
+                    getattr(target, "uuid", target),
+                    response_mode,
+                    err,
+                )
+                try:
+                    await client.write_gatt_char(target, chunk, response=not response_mode)
+                    _LOGGER.debug(
+                        "BLE write chunk %d/%d to %s completed with response=%s",
+                        chunk_index,
+                        len(chunks),
+                        getattr(target, "uuid", target),
+                        not response_mode,
+                    )
+                except (BleakError, OSError) as fallback_err:
+                    _LOGGER.debug(
+                        "BLE write chunk %d/%d to %s with response=%s also failed: %s",
+                        chunk_index,
+                        len(chunks),
+                        getattr(target, "uuid", target),
+                        not response_mode,
+                        fallback_err,
+                    )
+                    return False
+                response_mode = not response_mode
+            except OSError:
                 return False
-        except OSError:
-            return False
+
+        return True
 
     @staticmethod
     async def _read_characteristic_safe(
@@ -1234,22 +1397,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         return bytearray()
 
-    def _resolve_io_targets(
-        self, client: BleakClientWithServiceCache
-    ) -> tuple[
-        BleakGATTCharacteristic | str,
-        BleakGATTCharacteristic | str,
-        BleakGATTCharacteristic | str,
-        BleakGATTCharacteristic | None,
-        bool,
-    ]:
+    def _resolve_io_targets(self, client: BleakClientWithServiceCache) -> ResolvedGattTargets:
         """Resolve READ, NOTIFY, and COMMAND characteristics from connected client.
 
         Args:
             client: Connected Bleak client instance.
 
         Returns:
-            Tuple of (read_target, notify_target, cmd_target, read_char, can_read).
+            Resolved GATT targets for reads, notifications, and commands.
         """
         read_char = self._resolve_tds_characteristic(client)
         notify_char = self._resolve_notify_characteristic(client)
@@ -1273,7 +1428,13 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             cmd_target = KarofiCharacteristic.NOTIFY
 
         can_read = read_char is None or GattProperty.READ in getattr(read_char, "properties", [])
-        return read_target, notify_target, cmd_target, read_char, can_read
+        return ResolvedGattTargets(
+            read_target=read_target,
+            notify_target=notify_target,
+            command_target=cmd_target,
+            read_characteristic=read_char,
+            can_read=can_read,
+        )
 
     async def _try_direct_read(
         self,
@@ -1484,13 +1645,12 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """
         self._log_discovered_services(client)
 
-        (
-            read_target,
-            notify_target,
-            cmd_target,
-            read_char,
-            can_read,
-        ) = self._resolve_io_targets(client)
+        targets = self._resolve_io_targets(client)
+        read_target = targets.read_target
+        notify_target = targets.notify_target
+        cmd_target = targets.command_target
+        read_char = targets.read_characteristic
+        can_read = targets.can_read
         _LOGGER.debug(
             "Resolved BLE characteristics for device %s: read=%s, notify=%s, cmd=%s",
             self.masked_mac,
@@ -1914,6 +2074,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             MakiposPropertyCode.IRO_RTR,
             MakiposPropertyCode.IRO_LTIME,
             MakiposPropertyCode.IRO_RTT,
+            MakiposPropertyCode.IRO_HSD,
             MakiposPropertyCode.IRO_ERRS,
         ):
             return True
@@ -1923,6 +2084,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 MakiposPayloadKey.IRO_RTR,
                 MakiposPayloadKey.IRO_LTIME,
                 MakiposPayloadKey.IRO_RTT,
+                MakiposPayloadKey.IRO_HSD,
                 MakiposPayloadKey.IRO_ERRS,
                 MakiposPayloadKey.IRO_NAMES,
                 MakiposPayloadKey.FILTER_NAMES,
@@ -1986,20 +2148,21 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
     def _update_single_filter_stage(
         self,
         idx: int,
-        rtr_h: int | None,
-        ltime_h: int | None,
-        rtt_h: int | None,
+        remaining_hours: int | None,
+        lifetime_hours: int | None,
         name: str | None = None,
         *,
         telemetry_generation: int | None = None,
     ) -> None:
         """Update telemetry, lifetime, and optional name for a single filter stage.
 
+        The device reports the remaining filter time via ``iro_lTime`` and the rated
+        lifetime via ``iro_hsd``. Both values are in hours.
+
         Args:
             idx: 0-based filter stage index.
-            rtr_h: Remaining hours or None.
-            ltime_h: Lifetime hours or None.
-            rtt_h: Total run hours or None.
+            remaining_hours: Remaining filter hours or None.
+            lifetime_hours: Rated filter lifetime in hours or None.
             name: Optional dynamic filter name from device payload.
             telemetry_generation: Poll generation associated with this telemetry.
         """
@@ -2009,93 +2172,239 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             fdata.name = name
 
         pending_reset = self._pending_filter_resets.get(key)
-        pending_reset_generation = pending_reset[0] if pending_reset is not None else None
-        last_counted_generation = pending_reset[2] if pending_reset is not None else None
-        is_stale_reset_response = (
-            pending_reset_generation is not None
-            and telemetry_generation is not None
-            and telemetry_generation <= pending_reset_generation
+        outcome = self._evaluate_pending_reset(
+            key=key,
+            fdata=fdata,
+            pending_reset=pending_reset,
+            remaining_hours=remaining_hours,
+            lifetime_hours=lifetime_hours,
+            telemetry_generation=telemetry_generation,
         )
-        use_pending_reset_value = is_stale_reset_response
-        reset_resolved = False
-        if rtr_h is not None and pending_reset is not None and not is_stale_reset_response:
-            lifetime_hours = (
-                ltime_h
-                if ltime_h is not None and ltime_h > 0
-                else pending_reset[3]
-                if pending_reset[3] is not None and pending_reset[3] > 0
-                else fdata.lifetime_hours
+        self._update_filter_lifetime(
+            key=key,
+            fdata=fdata,
+            lifetime_hours=lifetime_hours,
+            is_stale=outcome.is_stale,
+            allow_device_value=(pending_reset is None or outcome.resolved or outcome.abandoned),
+        )
+        if remaining_hours is not None and not outcome.use_pending_value:
+            self._update_filter_remaining(fdata, remaining_hours)
+        if not outcome.is_stale:
+            self._update_filter_percent(fdata)
+        self._ensure_filter_reset_date(key, fdata)
+
+    @staticmethod
+    def _is_stale_reset_response(
+        pending_reset: PendingFilterReset | None,
+        telemetry_generation: int | None,
+    ) -> bool:
+        """Return whether telemetry predates the pending reset command."""
+        return (
+            pending_reset is not None
+            and telemetry_generation is not None
+            and telemetry_generation <= pending_reset.generation
+        )
+
+    @staticmethod
+    def _resolve_rated_hours(
+        fdata: KarofiFilterData,
+        lifetime_hours: int | None,
+        pending_reset: PendingFilterReset | None,
+    ) -> int | None:
+        """Resolve the rated lifetime used to confirm a pending reset."""
+        if lifetime_hours is not None and lifetime_hours > 0:
+            return lifetime_hours
+        if (
+            pending_reset is not None
+            and pending_reset.lifetime_hours is not None
+            and pending_reset.lifetime_hours > 0
+        ):
+            return pending_reset.lifetime_hours
+        return fdata.lifetime_hours
+
+    @staticmethod
+    def _is_reset_confirmed(
+        remaining_hours: int,
+        rated_hours: int | None,
+        baseline_hours: int | None,
+    ) -> bool:
+        """Return whether telemetry confirms a pending reset."""
+        if rated_hours is None or rated_hours <= 0:
+            return False
+        confirmation_tolerance = min(24.0, rated_hours * 0.1)
+        near_rated_lifetime = (
+            0 <= remaining_hours <= rated_hours
+            and rated_hours - remaining_hours <= confirmation_tolerance
+        )
+        shows_meaningful_increase = (
+            remaining_hours >= rated_hours
+            if baseline_hours is None
+            else remaining_hours > baseline_hours
+        )
+        return near_rated_lifetime and shows_meaningful_increase
+
+    def _clear_pending_reset(self, key: str) -> None:
+        """Remove a pending reset and schedule persistence."""
+        self._pending_filter_resets.pop(key, None)
+        self._pending_reset_store.async_delay_save(self._get_pending_reset_storage, 1)
+
+    def _advance_pending_reset(
+        self,
+        *,
+        key: str,
+        pending_reset: PendingFilterReset,
+        remaining_hours: int,
+        rated_hours: int | None,
+        telemetry_generation: int | None,
+        outcome: PendingResetOutcome,
+    ) -> PendingResetOutcome:
+        """Advance mismatch tracking for a pending filter reset."""
+        mismatch_count = min(pending_reset.mismatch_count + 1, RESET_CONFIRMATION_POLLS)
+        if pending_reset.mismatch_count < RESET_CONFIRMATION_POLLS:
+            _LOGGER.debug(
+                "Filter reset telemetry for %s: remaining=%d h, rated lifetime=%s h, "
+                "confirmation poll=%d/%d",
+                key,
+                remaining_hours,
+                rated_hours,
+                mismatch_count,
+                RESET_CONFIRMATION_POLLS,
             )
-            confirmation_tolerance = (
-                min(24.0, lifetime_hours * 0.1)
-                if lifetime_hours is not None and lifetime_hours > 0
-                else None
+        if mismatch_count == RESET_CONFIRMATION_POLLS:
+            self._clear_pending_reset(key)
+            outcome.abandoned = True
+            outcome.use_pending_value = False
+            _LOGGER.warning(
+                "Device did not confirm reset for %s after %d telemetry polls "
+                "(remaining=%d h, rated lifetime=%s h); abandoning the local reset "
+                "and reverting to device telemetry",
+                key,
+                mismatch_count,
+                remaining_hours,
+                rated_hours,
             )
-            if (
-                lifetime_hours is not None
-                and lifetime_hours > 0
-                and confirmation_tolerance is not None
-                and 0 <= rtr_h <= lifetime_hours
-                and lifetime_hours - rtr_h <= confirmation_tolerance
-            ):
-                self._pending_filter_resets.pop(key, None)
-                self._pending_reset_store.async_delay_save(self._get_pending_reset_storage, 1)
-                reset_resolved = True
-            elif (
-                telemetry_generation is not None and telemetry_generation == last_counted_generation
-            ):
-                use_pending_reset_value = True
-            else:
-                mismatch_count = pending_reset[1] + 1
-                if mismatch_count >= RESET_CONFIRMATION_POLLS:
-                    self._pending_filter_resets.pop(key, None)
-                    self._pending_reset_store.async_delay_save(self._get_pending_reset_storage, 1)
-                    reset_resolved = True
-                    _LOGGER.warning(
-                        "Device did not confirm reset for %s after %d telemetry polls; "
-                        "using device-reported remaining time",
-                        key,
-                        mismatch_count,
-                    )
-                else:
-                    self._pending_filter_resets[key] = (
-                        pending_reset[0],
-                        mismatch_count,
-                        telemetry_generation,
-                        pending_reset[3],
-                    )
-                    use_pending_reset_value = True
+            return outcome
+
+        pending_reset.mismatch_count = mismatch_count
+        pending_reset.last_counted_generation = telemetry_generation
+        outcome.use_pending_value = True
+        return outcome
+
+    def _evaluate_pending_reset(
+        self,
+        *,
+        key: str,
+        fdata: KarofiFilterData,
+        pending_reset: PendingFilterReset | None,
+        remaining_hours: int | None,
+        lifetime_hours: int | None,
+        telemetry_generation: int | None,
+    ) -> PendingResetOutcome:
+        """Evaluate telemetry against a pending filter reset.
+
+        Args:
+            key: Filter stage key.
+            fdata: Filter telemetry record.
+            pending_reset: Pending reset state or None.
+            remaining_hours: Remaining filter hours from telemetry or None.
+            lifetime_hours: Rated filter lifetime from telemetry or None.
+            telemetry_generation: Poll generation associated with this telemetry.
+
+        Returns:
+            Pending reset outcome controlling downstream telemetry updates.
+        """
+        is_stale = self._is_stale_reset_response(pending_reset, telemetry_generation)
+        outcome = PendingResetOutcome(is_stale=is_stale, use_pending_value=is_stale)
+        if remaining_hours is None or pending_reset is None or is_stale:
+            return outcome
+
+        rated_hours = self._resolve_rated_hours(fdata, lifetime_hours, pending_reset)
+        if self._is_reset_confirmed(
+            remaining_hours,
+            rated_hours,
+            pending_reset.baseline_hours,
+        ):
+            self._clear_pending_reset(key)
+            outcome.resolved = True
+            _LOGGER.debug(
+                "Device confirmed reset for %s: remaining=%d h of %d h rated lifetime",
+                key,
+                remaining_hours,
+                rated_hours,
+            )
+            return outcome
 
         if (
-            ltime_h is not None
-            and ltime_h > 0
-            and not is_stale_reset_response
-            and (pending_reset is None or reset_resolved)
+            telemetry_generation is not None
+            and telemetry_generation == pending_reset.last_counted_generation
         ):
-            fdata.lifetime_hours = ltime_h
-            fdata.lifetime_days = max(1, round(ltime_h / 24.0))
+            outcome.use_pending_value = True
+            return outcome
+
+        return self._advance_pending_reset(
+            key=key,
+            pending_reset=pending_reset,
+            remaining_hours=remaining_hours,
+            rated_hours=rated_hours,
+            telemetry_generation=telemetry_generation,
+            outcome=outcome,
+        )
+
+    def _update_filter_lifetime(
+        self,
+        *,
+        key: str,
+        fdata: KarofiFilterData,
+        lifetime_hours: int | None,
+        is_stale: bool,
+        allow_device_value: bool,
+    ) -> None:
+        """Update rated lifetime from telemetry when the reset state allows it."""
+        if (
+            lifetime_hours is not None
+            and lifetime_hours > 0
+            and not is_stale
+            and allow_device_value
+        ):
+            fdata.lifetime_hours = lifetime_hours
+            fdata.lifetime_days = max(1, round(lifetime_hours / 24.0))
+            fdata.total_hours = lifetime_hours
         elif fdata.lifetime_days is None:
             fdata.lifetime_days = self.get_filter_lifetime_days(key)
 
-        if rtr_h is not None and not use_pending_reset_value:
-            fdata.remaining_hours = rtr_h
-            fdata.remaining_days = max(0, round(rtr_h / 24.0))
-            fdata.telemetry_synced = True
+    @staticmethod
+    def _update_filter_remaining(fdata: KarofiFilterData, remaining_hours: int) -> None:
+        """Apply device remaining hours to a filter stage."""
+        fdata.remaining_hours = remaining_hours
+        fdata.remaining_days = max(0, round(remaining_hours / 24.0))
+        fdata.telemetry_synced = True
 
-        if not is_stale_reset_response and fdata.remaining_days is not None and fdata.lifetime_days:
-            fdata.percent = max(
-                0, min(100, round((fdata.remaining_days / fdata.lifetime_days) * 100))
-            )
+    @staticmethod
+    def _update_filter_percent(fdata: KarofiFilterData) -> None:
+        """Recalculate the remaining percentage from current filter values."""
+        if (
+            fdata.remaining_hours is None
+            or fdata.lifetime_hours is None
+            or fdata.lifetime_hours <= 0
+        ):
+            return
+        fdata.percent = max(
+            0,
+            min(
+                100,
+                round((fdata.remaining_hours / fdata.lifetime_hours) * 100),
+            ),
+        )
 
-        if key not in self.data.filter_reset_dates and fdata.remaining_days is not None:
-            life = fdata.lifetime_days or DEFAULT_FILTER_LIFETIME_DAYS.get(key, 365)
-            used_days = max(0, life - fdata.remaining_days)
-            self.data.filter_reset_dates[key] = (
-                dt_util.utcnow() - timedelta(days=used_days)
-            ).isoformat()
-
-        if rtt_h is not None:
-            fdata.total_hours = rtt_h
+    def _ensure_filter_reset_date(self, key: str, fdata: KarofiFilterData) -> None:
+        """Infer a missing reset date from remaining filter life."""
+        if key in self.data.filter_reset_dates or fdata.remaining_days is None:
+            return
+        lifetime_days = fdata.lifetime_days or DEFAULT_FILTER_LIFETIME_DAYS.get(key, 365)
+        used_days = max(0, lifetime_days - fdata.remaining_days)
+        self.data.filter_reset_dates[key] = (
+            dt_util.utcnow() - timedelta(days=used_days)
+        ).isoformat()
 
     @staticmethod
     def _extract_names_list(payload: dict[str, object]) -> list[str] | None:
@@ -2137,7 +2446,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         payload: dict[str, object],
         telemetry_generation: int | None = None,
     ) -> bool:
-        """Process filter telemetry (rtr, lTime, rtt) and names from payload dictionary.
+        """Process filter telemetry (lTime, hsd) and names from payload dictionary.
 
         Args:
             payload: Parsed JSON payload dictionary.
@@ -2146,40 +2455,33 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Returns:
             True if filter telemetry was found and processed, False otherwise.
         """
-        rtr_list = self._coerce_int_list(
-            self._get_payload_property_val(
-                payload, MakiposPropertyCode.IRO_RTR, MakiposPayloadKey.IRO_RTR
-            ),
-            preserve_none=True,
-        )
         ltime_list = self._coerce_int_list(
             self._get_payload_property_val(
                 payload, MakiposPropertyCode.IRO_LTIME, MakiposPayloadKey.IRO_LTIME
             ),
             preserve_none=True,
         )
-        rtt_list = self._coerce_int_list(
+        hsd_list = self._coerce_int_list(
             self._get_payload_property_val(
-                payload, MakiposPropertyCode.IRO_RTT, MakiposPayloadKey.IRO_RTT
+                payload, MakiposPropertyCode.IRO_HSD, MakiposPayloadKey.IRO_HSD
             ),
             preserve_none=True,
         )
         names_list = self._extract_names_list(payload)
 
-        if rtr_list is None and ltime_list is None and names_list is None:
+        if ltime_list is None and hsd_list is None and names_list is None:
             return False
 
         filter_count = max(
-            len(rtr_list) if rtr_list else 0,
             len(ltime_list) if ltime_list else 0,
+            len(hsd_list) if hsd_list else 0,
             len(names_list) if names_list else 0,
         )
         for idx in range(filter_count):
             self._update_single_filter_stage(
                 idx,
-                self._get_list_element(rtr_list, idx),
                 self._get_list_element(ltime_list, idx),
-                self._get_list_element(rtt_list, idx),
+                self._get_list_element(hsd_list, idx),
                 self._get_list_element(names_list, idx),
                 telemetry_generation=telemetry_generation,
             )

@@ -34,6 +34,21 @@
     "binary_sensor": {
       "connectivity": {
         "name": "Kết nối"
+      },
+      "problem": {
+        "name": "Sự cố",
+        "state_attributes": {
+          "error_messages": {
+            "state": {
+              "1": "Bơm hoạt động liên tục quá 5 tiếng",
+              "2": "Nước cấp đầu vào yếu",
+              "4": "Không có nước đầu vào",
+              "5": "Máy bị rò rỉ nước",
+              "100": "TDS cao",
+              "unknown": "Mã lỗi thiết bị không xác định"
+            }
+          }
+        }
       }
     },
     "sensor": {

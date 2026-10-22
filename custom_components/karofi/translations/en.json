@@ -34,6 +34,21 @@
     "binary_sensor": {
       "connectivity": {
         "name": "Connectivity"
+      },
+      "problem": {
+        "name": "Problem",
+        "state_attributes": {
+          "error_messages": {
+            "state": {
+              "1": "Pump works continuously for more than 5 hours",
+              "2": "Weak inlet water",
+              "4": "No inlet water",
+              "5": "The water is leaking",
+              "100": "TDS high",
+              "unknown": "Unknown device error code"
+            }
+          }
+        }
       }
     },
     "sensor": {
