@@ -59,14 +59,16 @@ Tiện ích này tương thích với các dòng máy lọc nước thông minh 
 
 ## Danh sách thực thể (Entities)
 
-| Nền tảng (Platform) | Mã thực thể (Entity ID)             | Đơn vị / Kiểu  | Mô tả                                                                    |
-| :------------------ | :---------------------------------- | :------------- | :----------------------------------------------------------------------- |
-| **Sensor**          | `sensor.<mac>_tds`                  | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                          |
-| **Sensor**          | `sensor.<mac>_quality`              | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).            |
-| **Sensor**          | `sensor.<mac>_filter_<n>_percent`   | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).                |
-| **Sensor**          | `<mac>_filter_<n>_days` (unique ID) | `ngày`         | Số ngày còn lại đến hạn thay Lõi `<n>`; `_days` là hậu tố của unique ID. |
-| **Binary Sensor**   | `binary_sensor.<mac>_connectivity`  | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước.                           |
-| **Button**          | `button.<mac>_btn_reset_filter_<n>` | `restore`      | Gửi lệnh đặt lại cho cấp lõi lọc tương ứng.                              |
+| Nền tảng (Platform) | Mã định danh                                        | Đơn vị / Kiểu  | Mô tả                                                                    |
+| :------------------ | :-------------------------------------------------- | :------------- | :----------------------------------------------------------------------- |
+| **Sensor**          | `sensor.<mac>_tds` (mẫu Entity ID)                  | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                          |
+| **Sensor**          | `sensor.<mac>_quality` (mẫu Entity ID)              | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).            |
+| **Sensor**          | `sensor.<mac>_filter_<n>_percent` (mẫu Entity ID)   | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).                |
+| **Sensor**          | `<mac>_filter_<n>_days` (Unique ID)                 | `ngày`         | Số ngày còn lại đến hạn thay Lõi `<n>`; `_days` là hậu tố của unique ID. |
+| **Binary Sensor**   | `binary_sensor.<mac>_connectivity` (mẫu Entity ID)  | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước.                           |
+| **Button**          | `button.<mac>_btn_reset_filter_<n>` (mẫu Entity ID) | `restore`      | Gửi lệnh đặt lại cho cấp lõi lọc tương ứng.                              |
+
+Home Assistant cấp Entity ID; các mẫu Entity ID ở trên chỉ mang tính minh họa và có thể khác với Entity ID thực tế của bạn.
 
 ---
 
@@ -113,7 +115,7 @@ $$\text{Tỷ lệ phần trăm còn lại} = \max\left(0, \min\left(100, \text{l
 
 1. Truy cập trang thiết bị Karofi tại **Cài đặt** > **Thiết bị & Dịch vụ** > **Karofi**.
 2. Trong khu vực các nút bấm, chọn **Nhấn** tại nút đặt lại tương ứng (ví dụ: `Đặt lại lõi 1`).
-3. Tiện ích gửi lệnh đặt lại đến máy. Cảm biến số ngày còn lại sẽ cập nhật theo dữ liệu thiết bị báo.
+3. Tiện ích gửi lệnh đặt lại đến máy. Sau khi `async_reset_filter` thành công, giá trị đặt lại đang chờ xác nhận có thể được giữ trong khi dữ liệu thiết bị còn cũ hoặc chưa xác nhận việc đặt lại. Cảm biến số ngày còn lại chấp nhận giá trị do thiết bị báo sau khi có xác nhận hoặc khi đạt giới hạn số lần dữ liệu không khớp.
 
 ### Khi đồng bộ lõi lọc đang sử dụng
 

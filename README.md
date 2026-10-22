@@ -59,14 +59,16 @@ This integration is designed for Karofi smart water purifiers equipped with Maki
 
 ## Entities Provided
 
-| Platform          | Entity ID                           | Device Class / Unit | Description                                                                     |
-| :---------------- | :---------------------------------- | :------------------ | :------------------------------------------------------------------------------ |
-| **Sensor**        | `sensor.<mac>_tds`                  | `ppm`               | Real-time pure water TDS concentration.                                         |
-| **Sensor**        | `sensor.<mac>_quality`              | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).                       |
-| **Sensor**        | `sensor.<mac>_filter_<n>_percent`   | `%`                 | Filter `<n>` remaining life percentage (dynamically added).                     |
-| **Sensor**        | `<mac>_filter_<n>_days` (unique ID) | `days`              | Filter `<n>` remaining days until replacement; `_days` is the unique-ID suffix. |
-| **Binary Sensor** | `binary_sensor.<mac>_connectivity`  | `connectivity`      | Bluetooth connection status with the purifier.                                  |
-| **Button**        | `button.<mac>_btn_reset_filter_<n>` | `restore`           | Send a reset command for the specified filter stage.                            |
+| Platform          | Identifier                                              | Device Class / Unit | Description                                                                     |
+| :---------------- | :------------------------------------------------------ | :------------------ | :------------------------------------------------------------------------------ |
+| **Sensor**        | `sensor.<mac>_tds` (Entity ID pattern)                  | `ppm`               | Real-time pure water TDS concentration.                                         |
+| **Sensor**        | `sensor.<mac>_quality` (Entity ID pattern)              | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).                       |
+| **Sensor**        | `sensor.<mac>_filter_<n>_percent` (Entity ID pattern)   | `%`                 | Filter `<n>` remaining life percentage (dynamically added).                     |
+| **Sensor**        | `<mac>_filter_<n>_days` (Unique ID)                     | `days`              | Filter `<n>` remaining days until replacement; `_days` is the unique-ID suffix. |
+| **Binary Sensor** | `binary_sensor.<mac>_connectivity` (Entity ID pattern)  | `connectivity`      | Bluetooth connection status with the purifier.                                  |
+| **Button**        | `button.<mac>_btn_reset_filter_<n>` (Entity ID pattern) | `restore`           | Send a reset command for the specified filter stage.                            |
+
+Home Assistant assigns entity IDs; the Entity ID patterns above are illustrative and may differ from your actual entity IDs.
 
 ---
 
@@ -113,7 +115,7 @@ $$\text{Remaining Percent} = \max\left(0, \min\left(100, \text{round}\left(\frac
 
 1. Navigate to the Karofi device page in **Settings** > **Devices & Services** > **Karofi**.
 2. Under the **Buttons** section, press the corresponding reset button (e.g., `Reset filter 1`).
-3. The integration sends the reset command to the purifier. The remaining-time sensor follows the device's reported value as telemetry updates.
+3. The integration sends the reset command to the purifier. After `async_reset_filter` succeeds, the pending reset value may remain while telemetry is stale or has not confirmed the reset. The remaining-time sensor accepts the device-reported value after confirmation or when the mismatch limit is reached.
 
 ### When Synchronizing Existing Filters
 
