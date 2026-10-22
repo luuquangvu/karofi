@@ -15,11 +15,11 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi.const import (
     DOMAIN,
-    FILTER_LIFETIME_DAYS,
     STORAGE_KEY_PREFIX,
     KarofiFilter,
 )
 from custom_components.karofi.coordinator import KarofiDataCoordinator
+from custom_components.karofi.models import KarofiFilterData
 from custom_components.karofi.number import (
     KarofiFilterRemainingDaysNumber,
     async_setup_entry,
@@ -76,7 +76,7 @@ async def test_number_async_setup_entry(
     mock_config_entry: MockConfigEntry,
     mock_coordinator: KarofiDataCoordinator,
 ) -> None:
-    """Test number platform setup registers number entities for all filters.
+    """Test number platform setup registers number entities dynamically.
 
     Args:
         hass: HomeAssistant test instance.
@@ -94,9 +94,16 @@ async def test_number_async_setup_entry(
         """
         added_entities.extend(new_entities)
 
+    # Initial setup without known filters: 0 number entities added
     await async_setup_entry(hass, mock_config_entry, mock_add_entities)
-    assert len(added_entities) == len(FILTER_LIFETIME_DAYS)
+    assert not added_entities
 
+    # Simulate discovery of filters via coordinator data
+    mock_coordinator.data.filter_reset_dates["filter_1"] = "2026-01-01T00:00:00"
+    mock_coordinator.data.filter_reset_dates["filter_2"] = "2026-01-01T00:00:00"
+    mock_coordinator.async_update_listeners()
+
+    assert len(added_entities) == 2
     first_entity = added_entities[0]
     assert isinstance(first_entity, KarofiFilterRemainingDaysNumber)
     assert first_entity.mode == NumberMode.BOX
@@ -136,18 +143,18 @@ async def test_number_native_value_calculations(
     assert entity2.native_value == 240.0
 
     # Filter expired (installed 800 days ago, lifetime 730)
-    mock_coordinator.data.filter_reset_dates["filter_ro"] = (now - timedelta(days=800)).isoformat()
-    entity_ro = KarofiFilterRemainingDaysNumber(
-        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_RO
+    mock_coordinator.data.filter_reset_dates["filter_4"] = (now - timedelta(days=800)).isoformat()
+    entity_4 = KarofiFilterRemainingDaysNumber(
+        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_4
     )
-    assert entity_ro.native_value == 0.0
+    assert entity_4.native_value == 0.0
 
     # Corrupt or missing date
-    mock_coordinator.data.filter_reset_dates["filter_mineral"] = "invalid-date"
-    entity_mineral = KarofiFilterRemainingDaysNumber(
-        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_MINERAL
+    mock_coordinator.data.filter_reset_dates["filter_5"] = "invalid-date"
+    entity_5 = KarofiFilterRemainingDaysNumber(
+        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_5
     )
-    assert entity_mineral.native_value == 365.0
+    assert entity_5.native_value == 365.0
 
     # Naive ISO date string without timezone offset
     mock_coordinator.data.filter_reset_dates["filter_3"] = "2026-01-01T00:00:00"
@@ -155,6 +162,46 @@ async def test_number_native_value_calculations(
         mock_coordinator, mock_config_entry, KarofiFilter.FILTER_3
     )
     assert isinstance(entity3.native_value, float)
+
+
+async def test_number_dynamic_name(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test number uses dynamic name and updates name on coordinator update.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    mock_coordinator.data.filters["filter_1"] = KarofiFilterData(
+        index=0, key="filter_1", name="Pre-Carbon"
+    )
+    entity = KarofiFilterRemainingDaysNumber(
+        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1
+    )
+    _init_test_number(entity, "number.karofi_filter_1_remaining_days", hass)
+    assert entity.name == "Pre-Carbon remaining days"
+    assert entity.translation_key is None
+
+    # Simulate name change and coordinator update
+    mock_coordinator.data.filters["filter_1"].name = "Post-Carbon"
+    entity._handle_coordinator_update()
+    assert entity.name == "Post-Carbon remaining days"
+    assert entity.translation_key is None
+
+    # Entity initialized with default translation key updates name when custom name arrives
+    n2 = KarofiFilterRemainingDaysNumber(mock_coordinator, mock_config_entry, KarofiFilter.FILTER_2)
+    _init_test_number(n2, "number.karofi_filter_2_remaining_days", hass)
+    assert n2.translation_key == "filter_2_remaining_days"
+    mock_coordinator.data.filters["filter_2"] = KarofiFilterData(
+        index=1, key="filter_2", name="Mineral"
+    )
+    n2._handle_coordinator_update()
+    assert n2.name == "Mineral remaining days"
+    assert n2.translation_key is None
 
 
 async def test_number_set_native_value(
@@ -234,3 +281,29 @@ async def test_number_handle_coordinator_update(
 
     assert entity.native_value == 130.0
     assert entity.available is True
+
+
+async def test_number_11_12_and_dynamic_fallback(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test number entity for stages 11, 12, and dynamic fallback beyond 12 stages.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    n11 = KarofiFilterRemainingDaysNumber(mock_coordinator, mock_config_entry, "filter_11")
+    _init_test_number(n11, "number.karofi_filter_11_remaining_days", hass)
+    assert n11.translation_key == "filter_11_remaining_days"
+
+    n12 = KarofiFilterRemainingDaysNumber(mock_coordinator, mock_config_entry, "filter_12")
+    _init_test_number(n12, "number.karofi_filter_12_remaining_days", hass)
+    assert n12.translation_key == "filter_12_remaining_days"
+
+    n13 = KarofiFilterRemainingDaysNumber(mock_coordinator, mock_config_entry, "filter_13")
+    _init_test_number(n13, "number.karofi_filter_13_remaining_days", hass)
+    assert n13.name == "Filter 13 remaining days"
+    assert n13.translation_key is None

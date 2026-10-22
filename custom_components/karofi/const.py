@@ -25,6 +25,14 @@ class MakiposPayloadKey(StrEnum):
     DATA = "d"
     ID = "id"
     IRO_TDS = "iro_tds"
+    IRO_RTR = "iro_rtr"
+    IRO_LTIME = "iro_lTime"
+    IRO_RTT = "iro_rtt"
+    IRO_HSD = "iro_hsd"
+    IRO_ERRS = "iro_errs"
+    IRO_NAMES = "iro_names"
+    FILTER_NAMES = "filter_names"
+    NAMES = "names"
     TDS = "tds"
     PURE_INDEX = "pure_index"
     PI = "pi"
@@ -41,6 +49,12 @@ class MakiposPropertyCode(StrEnum):
     """Makipos protocol property codes."""
 
     IRO_TDS = "iro_tds"
+    IRO_RTR = "iro_rtr"
+    IRO_LTIME = "iro_lTime"
+    IRO_RTT = "iro_rtt"
+    IRO_HSD = "iro_hsd"
+    IRO_ERRS = "iro_errs"
+    IRO_RSFT = "iro_rsft"
 
 
 TDS_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
@@ -50,8 +64,44 @@ TDS_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
     MakiposPayloadKey.PI,
 )
 
+TELEMETRY_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
+    *TDS_PAYLOAD_KEYS,
+    MakiposPayloadKey.PROPERTY_CODE,
+    MakiposPayloadKey.IRO_RTR,
+    MakiposPayloadKey.IRO_LTIME,
+    MakiposPayloadKey.IRO_RTT,
+    MakiposPayloadKey.IRO_HSD,
+    MakiposPayloadKey.IRO_ERRS,
+    MakiposPayloadKey.IRO_NAMES,
+    MakiposPayloadKey.FILTER_NAMES,
+    MakiposPayloadKey.NAMES,
+)
+
+TELEMETRY_FILTER_MARKERS: Final[tuple[bytes, ...]] = (
+    MakiposPayloadKey.IRO_RTR.encode(),
+    MakiposPayloadKey.IRO_LTIME.encode(),
+)
+
 # Polling and command frames (Makipos / Karofi protocol)
-REQUEST_READ_DATA_COMMAND: Final = b'\x01{"et":"NP"}\x04'
+REQUEST_READ_DATA_COMMAND: Final = (
+    f'\x01{{"{MakiposPayloadKey.EVENT_TYPE}":"{MakiposEventType.NP}"}}\x04'.encode()
+)
+
+
+def build_reset_filter_command(filter_index: int) -> bytes:
+    """Construct the Makipos BLE command to reset a filter stage.
+
+    Args:
+        filter_index: 0-based integer index of the filter to reset.
+
+    Returns:
+        Framed SOH/EOT command bytes.
+    """
+    return (
+        f'\x01{{"{MakiposPayloadKey.EVENT_TYPE}":"{MakiposEventType.CP}",'
+        f'"{MakiposPayloadKey.PROPERTY_CODE}":"{MakiposPropertyCode.IRO_RSFT}",'
+        f'"{MakiposPayloadKey.DATA}":{filter_index}}}\x04'.encode()
+    )
 
 
 # GATT Service & Characteristic UUIDs (Makipos / Karofi firmware)
@@ -140,6 +190,9 @@ BLE_TIMEOUT_SECONDS: Final = 25
 MANUAL_MAC_CHOICE: Final = "manual"
 MANUAL_MAC_LABEL: Final = "Enter MAC address manually..."
 
+# Filter stage prefix and identifiers
+FILTER_PREFIX: Final = "filter_"
+
 
 class KarofiFilter(StrEnum):
     """Karofi water purifier filter stage identifiers."""
@@ -147,15 +200,29 @@ class KarofiFilter(StrEnum):
     FILTER_1 = "filter_1"
     FILTER_2 = "filter_2"
     FILTER_3 = "filter_3"
-    FILTER_RO = "filter_ro"
-    FILTER_MINERAL = "filter_mineral"
+    FILTER_4 = "filter_4"
+    FILTER_5 = "filter_5"
+    FILTER_6 = "filter_6"
+    FILTER_7 = "filter_7"
+    FILTER_8 = "filter_8"
+    FILTER_9 = "filter_9"
+    FILTER_10 = "filter_10"
+    FILTER_11 = "filter_11"
+    FILTER_12 = "filter_12"
 
 
-# Filter lifetime configurations (in days)
-FILTER_LIFETIME_DAYS: Final[dict[KarofiFilter, int]] = {
+# Default filter lifetime configurations (in days) when not provided by telemetry
+DEFAULT_FILTER_LIFETIME_DAYS: Final[dict[str, int]] = {
     KarofiFilter.FILTER_1: 180,
     KarofiFilter.FILTER_2: 270,
     KarofiFilter.FILTER_3: 270,
-    KarofiFilter.FILTER_RO: 730,
-    KarofiFilter.FILTER_MINERAL: 365,
+    KarofiFilter.FILTER_4: 730,
+    KarofiFilter.FILTER_5: 365,
+    KarofiFilter.FILTER_6: 365,
+    KarofiFilter.FILTER_7: 365,
+    KarofiFilter.FILTER_8: 365,
+    KarofiFilter.FILTER_9: 365,
+    KarofiFilter.FILTER_10: 365,
+    KarofiFilter.FILTER_11: 365,
+    KarofiFilter.FILTER_12: 365,
 }

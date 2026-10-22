@@ -2,7 +2,7 @@
 
 **[🇺🇸 English](README.md) | 🇻🇳 Tiếng Việt**
 
-**Karofi Water Purifier** là tiện ích tích hợp cục bộ qua Bluetooth Low Energy (BLE) dành cho các dòng máy lọc nước thông minh Karofi trong Home Assistant. Tiện ích cho phép theo dõi chỉ số chất rắn hòa tan (TDS) trong nước tinh khiết theo thời gian thực, đánh giá chất lượng nước uống, theo dõi hạn sử dụng của hệ thống 5 lõi lọc theo tỷ lệ phần trăm và số ngày còn lại, đồng thời cho phép đặt lại hoặc điều chỉnh chu kỳ thay lõi trực tiếp trên giao diện Home Assistant mà không cần kết nối đám mây hay máy chủ bên ngoài.
+**Karofi Water Purifier** là tiện ích tích hợp cục bộ qua Bluetooth Low Energy (BLE) dành cho các dòng máy lọc nước thông minh Karofi trong Home Assistant. Tiện ích cho phép theo dõi chỉ số chất rắn hòa tan (TDS) trong nước tinh khiết theo thời gian thực, đánh giá chất lượng nước uống, theo dõi hạn sử dụng của hệ thống đa lõi lọc (5 đến 12+ lõi) theo tỷ lệ phần trăm và số ngày còn lại, đồng thời cho phép đặt lại hoặc điều chỉnh chu kỳ thay lõi trực tiếp trên giao diện Home Assistant mà không cần kết nối đám mây hay máy chủ bên ngoài.
 
 ---
 
@@ -34,12 +34,9 @@
   - **Khá** (50-150 ppm): Nước ở mức an toàn; nên theo dõi sự thay đổi theo thời gian.
   - **Kém** (> 150 ppm): Nước có nguy cơ suy giảm độ tinh khiết; nên kiểm tra màng RO hoặc thay lõi lọc.
   - **Không xác định**: Đang chờ dữ liệu đo hoặc cảm biến tạm thời chưa khả dụng.
-- **Theo dõi chi tiết hệ thống 5 lõi lọc**:
-  - **Lõi 1 (PP 5 micron)**: Thời gian sử dụng định mức 180 ngày (6 tháng).
-  - **Lõi 2 (OCB-GAC)**: Thời gian sử dụng định mức 270 ngày (9 tháng).
-  - **Lõi 3 (PP 1 micron)**: Thời gian sử dụng định mức 270 ngày (9 tháng).
-  - **Màng RO (RO Purifim)**: Thời gian sử dụng định mức 730 ngày (24 tháng).
-  - **Lõi khoáng (Khoáng đá / Hydrogen)**: Thời gian sử dụng định mức 365 ngày (12 tháng).
+- **Theo dõi linh hoạt hệ thống nhiều lõi lọc (5, 7, 8, 9, 10, 11, 12+ lõi)**:
+  - Tự động nhận diện và theo dõi số lượng lõi lọc thực tế từ dữ liệu BLE của thiết bị.
+  - Tên gọi đơn giản, nhất quán (`Lõi 1`, `Lõi 2`, `Lõi 3`, ...) phù hợp cho mọi dòng máy mà không bị gán cứng sai loại lõi.
 - **Cơ chế hiển thị kép cho từng lõi**: Mỗi cấp lõi lọc cung cấp song song cảm biến tỷ lệ phần trăm còn lại (0% đến 100%) và cảm biến số ngày còn lại, giúp theo dõi trực quan trên thẻ giao diện và thiết lập tự động hóa.
 - **Thao tác bảo trì linh hoạt**:
   - **Nút đặt lại một chạm**: Nhấn nút đặt lại trên Home Assistant khi thay lõi thực tế để cập nhật ngày bắt đầu sử dụng về ngày hiện tại.
@@ -63,23 +60,15 @@ Tiện ích này tương thích với các dòng máy lọc nước thông minh 
 
 ## Danh sách thực thể (Entities)
 
-| Nền tảng (Platform) | Mã thực thể (Entity ID)                    | Đơn vị / Kiểu  | Mô tả                                                          |
-| :------------------ | :----------------------------------------- | :------------- | :------------------------------------------------------------- |
-| **Sensor**          | `sensor.<mac>_tds`                         | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                |
-| **Sensor**          | `sensor.<mac>_quality`                     | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).  |
-| **Sensor**          | `sensor.<mac>_filter_1_percent`            | `%`            | Phần trăm thời gian sử dụng còn lại của Lõi 1 (PP 5 micron).   |
-| **Sensor**          | `sensor.<mac>_filter_1_days`               | `ngày`         | Số ngày còn lại đến hạn thay Lõi 1.                            |
-| **Sensor**          | `sensor.<mac>_filter_2_percent`            | `%`            | Phần trăm thời gian sử dụng còn lại của Lõi 2 (OCB-GAC).       |
-| **Sensor**          | `sensor.<mac>_filter_2_days`               | `ngày`         | Số ngày còn lại đến hạn thay Lõi 2.                            |
-| **Sensor**          | `sensor.<mac>_filter_3_percent`            | `%`            | Phần trăm thời gian sử dụng còn lại của Lõi 3 (PP 1 micron).   |
-| **Sensor**          | `sensor.<mac>_filter_3_days`               | `ngày`         | Số ngày còn lại đến hạn thay Lõi 3.                            |
-| **Sensor**          | `sensor.<mac>_filter_ro_percent`           | `%`            | Phần trăm thời gian sử dụng còn lại của Màng RO Purifim.       |
-| **Sensor**          | `sensor.<mac>_filter_ro_days`              | `ngày`         | Số ngày còn lại đến hạn thay Màng RO.                          |
-| **Sensor**          | `sensor.<mac>_filter_mineral_percent`      | `%`            | Phần trăm thời gian sử dụng còn lại của Lõi khoáng / hydrogen. |
-| **Sensor**          | `sensor.<mac>_filter_mineral_days`         | `ngày`         | Số ngày còn lại đến hạn thay Lõi khoáng.                       |
-| **Binary Sensor**   | `binary_sensor.<mac>_connectivity`         | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước.                 |
-| **Number**          | `number.<mac>_num_<filter>_remaining_days` | `ngày`         | Thanh trượt điều chỉnh số ngày sử dụng còn lại của lõi lọc.    |
-| **Button**          | `button.<mac>_btn_reset_<filter>`          | `restore`      | Nút đặt lại ngày bắt đầu sử dụng cho cấp lõi lọc tương ứng.    |
+| Nền tảng (Platform) | Mã thực thể (Entity ID)                      | Đơn vị / Kiểu  | Mô tả                                                                    |
+| :------------------ | :------------------------------------------- | :------------- | :----------------------------------------------------------------------- |
+| **Sensor**          | `sensor.<mac>_tds`                           | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                          |
+| **Sensor**          | `sensor.<mac>_quality`                       | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).            |
+| **Sensor**          | `sensor.<mac>_filter_<n>_percent`            | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).                |
+| **Sensor**          | `<mac>_filter_<n>_days` (unique ID)          | `ngày`         | Số ngày còn lại đến hạn thay Lõi `<n>`; `_days` là hậu tố của unique ID. |
+| **Binary Sensor**   | `binary_sensor.<mac>_connectivity`           | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước.                           |
+| **Number**          | `number.<mac>_num_filter_<n>_remaining_days` | `ngày`         | Thanh trượt điều chỉnh số ngày sử dụng còn lại của lõi lọc.              |
+| **Button**          | `button.<mac>_btn_reset_filter_<n>`          | `restore`      | Nút đặt lại ngày bắt đầu sử dụng cho cấp lõi lọc tương ứng.              |
 
 ---
 
@@ -124,7 +113,7 @@ $$\text{Tỷ lệ phần trăm còn lại} = \max\left(0, \min\left(100, \text{l
 ### Khi thay lõi lọc mới
 
 1. Truy cập trang thiết bị Karofi tại **Cài đặt** > **Thiết bị & Dịch vụ** > **Karofi**.
-2. Trong khu vực các nút bấm, chọn **Nhấn** tại nút đặt lại tương ứng (ví dụ: `Đặt lại lõi 1 (PP 5 micron)`).
+2. Trong khu vực các nút bấm, chọn **Nhấn** tại nút đặt lại tương ứng (ví dụ: `Đặt lại lõi 1`).
 3. Ngày kích hoạt sẽ được đặt lại về thời điểm hiện tại, đưa số ngày còn lại và tỷ lệ phần trăm về mức 100%.
 
 ### Khi đồng bộ lõi lọc đang sử dụng
@@ -135,26 +124,44 @@ Nếu bạn đã thay lõi lọc trước khi cài đặt tiện ích này, hãy
 
 ## Ví dụ Tự động hóa (Automations)
 
-Gửi thông báo đến điện thoại khi chất lượng nước TDS ở mức kém, hoặc khi có bất kỳ lõi lọc nào còn dưới 15 ngày sử dụng:
+Gửi thông báo đến điện thoại khi chất lượng nước TDS ở mức kém, hoặc tự động theo dõi toàn bộ các lõi lọc được phát hiện và gửi cảnh báo khi có bất kỳ lõi nào còn dưới 15 ngày sử dụng:
 
 ```yaml
 automation:
   - id: karofi_filter_replacement_alert
-    alias: "Karofi: Canh bao can thay loi loc"
+    alias: "Karofi: Cảnh báo cần thay lõi lọc"
+    # Chạy hàng ngày để kiểm tra nếu có bất kỳ cấp lõi lọc nào (5 đến 12+) còn dưới 15 ngày sử dụng
     trigger:
-      - platform: numeric_state
-        entity_id:
-          - sensor.karofi_water_purifier_filter_1_days_remaining
-          - sensor.karofi_water_purifier_filter_2_days_remaining
-          - sensor.karofi_water_purifier_filter_3_days_remaining
-          - sensor.karofi_water_purifier_ro_purifim_membrane_days_remaining
-          - sensor.karofi_water_purifier_mineral_hydrogen_filter_days_remaining
-        below: 15
+      - platform: time
+        at: "09:00:00"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ integration_entities('karofi')
+            | select('match', '^sensor\.')
+            | expand
+            | selectattr('attributes.unit_of_measurement', 'eq', 'd')
+            | selectattr('state', 'is_number')
+            | map(attribute='state')
+            | map('int')
+            | select('lt', 15)
+            | list | count > 0 }}
     action:
       - action: notify.notify
         data:
           title: "Nhắc nhở thay lõi lọc nước Karofi"
-          message: "{{ state_attr(trigger.entity_id, 'friendly_name') }} chỉ còn {{ trigger.to_state.state }} ngày sử dụng. Vui lòng chuẩn bị sẵn lõi lọc thay thế."
+          message: >-
+            Các lõi lọc sau đây sắp hết hạn sử dụng (dưới 15 ngày):
+            {% for item in integration_entities('karofi')
+               | select('match', '^sensor\.')
+               | expand
+               | selectattr('attributes.unit_of_measurement', 'eq', 'd')
+               | selectattr('state', 'is_number') %}
+              {% if item.state | int < 15 %}
+              - {{ item.name }}: chỉ còn {{ item.state }} ngày
+              {% endif %}
+            {% endfor %}
+            Vui lòng chuẩn bị sẵn lõi lọc thay thế.
 
   - id: karofi_high_tds_alert
     alias: "Karofi: Cảnh báo TDS nước cao"

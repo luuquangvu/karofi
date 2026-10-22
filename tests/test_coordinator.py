@@ -1,5 +1,6 @@
 """Tests for Karofi data coordinator."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,8 +19,8 @@ from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi.const import (
+    DEFAULT_FILTER_LIFETIME_DAYS,
     DEFAULT_NAME,
-    FILTER_LIFETIME_DAYS,
     NOTIFY_UUID_PREFIX,
     STORAGE_KEY_PREFIX,
     STORAGE_VERSION,
@@ -29,6 +30,7 @@ from custom_components.karofi.const import (
     WaterQuality,
 )
 from custom_components.karofi.coordinator import KarofiDataCoordinator
+from custom_components.karofi.models import KarofiFilterData
 
 
 @pytest.fixture
@@ -89,8 +91,8 @@ async def test_coordinator_setup_loads_stored_dates(
     await coordinator.async_setup()
     assert coordinator.data.filter_reset_dates["filter_1"] == "2026-01-01T00:00:00"
     assert coordinator.data.filter_reset_dates["filter_2"] == "2026-02-01T00:00:00"
-    assert "filter_ro" in coordinator.data.filter_reset_dates
-    assert "filter_ro" in hass_storage[key]["data"]
+    assert len(coordinator.data.filter_reset_dates) == 2
+    assert coordinator.get_known_filter_keys() == ["filter_1", "filter_2"]
 
 
 async def test_coordinator_setup_handles_empty_store(
@@ -103,24 +105,23 @@ async def test_coordinator_setup_handles_empty_store(
         coordinator: Fixture providing KarofiDataCoordinator.
         hass_storage: Fixture providing mock storage from test harness.
     """
-    key = f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}"
     await coordinator.async_setup()
-    assert "filter_1" in coordinator.data.filter_reset_dates
-    assert "filter_1" in hass_storage[key]["data"]
+    assert coordinator.data.filter_reset_dates == {}
+    assert coordinator.get_known_filter_keys() == []
 
 
 async def test_coordinator_setup_no_save_when_valid(
     coordinator: KarofiDataCoordinator,
     hass_storage: dict[str, Any],
 ) -> None:
-    """Test coordinator setup does not save when storage already contains all valid dates.
+    """Test coordinator setup does not save when storage already contains valid dates.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
         hass_storage: Fixture providing mock storage from test harness.
     """
     key = f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}"
-    valid_dates = {k.value: "2026-01-01T00:00:00+00:00" for k in FILTER_LIFETIME_DAYS}
+    valid_dates = dict.fromkeys(DEFAULT_FILTER_LIFETIME_DAYS, "2026-01-01T00:00:00+00:00")
     hass_storage[key] = {
         "version": STORAGE_VERSION,
         "data": valid_dates,
@@ -1320,6 +1321,12 @@ def test_coordinator_filter_calculation_helpers(
     assert coordinator.get_filter_remaining_days("unknown_stage") == 365
     assert coordinator.get_filter_percent("unknown_stage") == 100
 
+    # Zero or negative max_days: guarded against ZeroDivisionError and returns 0
+    assert coordinator.get_filter_remaining_days("filter_1", max_days=0) == 0
+    assert coordinator.get_filter_percent("filter_1", max_days=0) == 0
+    assert coordinator.get_filter_remaining_days("filter_1", max_days=-5) == 0
+    assert coordinator.get_filter_percent("filter_1", max_days=-5) == 0
+
 
 async def test_coordinator_bleak_error_duplicate_uuid_handled(
     coordinator: KarofiDataCoordinator,
@@ -1430,3 +1437,348 @@ def test_coordinator_masked_mac(coordinator: KarofiDataCoordinator) -> None:
         coordinator: Fixture providing KarofiDataCoordinator.
     """
     assert coordinator.masked_mac == "**:**:**:**:22:33"
+
+
+def test_coordinator_process_tds_payload_dynamic_filters_and_names(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test _process_tds_payload dynamically creates filters and parses custom names.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    raw_payload = (
+        b'\x01{"et":"NP","iro_tds":18,'
+        b'"iro_rtr":[1200,2400,3600,4800,6000,7200,8400],'
+        b'"iro_lTime":[4320,8640,8640,17280,8640,8640,8640],'
+        b'"iro_names":['
+        b'"Sediment","OCB-GAC","PP 1M","RO Membrane","Mineral","Hydrogen","Nano Silver"]}'
+        b"\x04"
+    )
+    coordinator._process_tds_payload(raw_payload)
+
+    assert coordinator.data.tds == 18
+    assert coordinator.data.quality == WaterQuality.GOOD
+    assert len(coordinator.data.filters) == 7
+    assert coordinator.get_known_filter_keys() == [
+        "filter_1",
+        "filter_2",
+        "filter_3",
+        "filter_4",
+        "filter_5",
+        "filter_6",
+        "filter_7",
+    ]
+    assert coordinator.get_filter_name("filter_1") == "Sediment"
+    assert coordinator.get_filter_name("filter_2") == "OCB-GAC"
+    assert coordinator.get_filter_name("filter_4") == "RO Membrane"
+    assert coordinator.get_filter_name("filter_7") == "Nano Silver"
+    assert coordinator.get_filter_remaining_days("filter_2") == 100  # 2400 hours // 24 = 100 days
+    assert coordinator.get_filter_lifetime_days("filter_2") == 360  # 8640 hours // 24 = 360 days
+
+
+async def test_coordinator_async_send_reset_command_ble(
+    coordinator: KarofiDataCoordinator,
+    mock_ble_device: BLEDevice,
+) -> None:
+    """Test _async_send_reset_command sends command via BLE write characteristic.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        mock_ble_device: Fixture providing mock BLEDevice.
+    """
+    mock_client = AsyncMock()
+    mock_client.disconnect = AsyncMock()
+    mock_client.write_gatt_char = AsyncMock()
+
+    write_char = _mock_characteristic(
+        KarofiCharacteristic.COMMAND,
+        properties=[GattProperty.WRITE, GattProperty.WRITE_WITHOUT_RESPONSE],
+    )
+    mock_services = MagicMock(spec=BleakGATTServiceCollection)
+
+    def _get_char(uuid: str) -> BleakGATTCharacteristic | None:
+        """Return write characteristic if uuid matches COMMAND."""
+        return write_char if uuid == KarofiCharacteristic.COMMAND else None
+
+    mock_services.get_characteristic.side_effect = _get_char
+    mock_client.services = mock_services
+
+    with (
+        patch(
+            "custom_components.karofi.coordinator.async_ble_device_from_address",
+            return_value=mock_ble_device,
+        ),
+        patch(
+            "custom_components.karofi.coordinator.establish_connection",
+            return_value=mock_client,
+        ),
+    ):
+        await coordinator._async_send_reset_command(1)
+
+        expected_command = b'\x01{"et":"CP","pc":"iro_rsft","d":1}\x04'
+        mock_client.write_gatt_char.assert_awaited_once_with(
+            write_char,
+            expected_command,
+            response=True,
+        )
+
+
+def test_coordinator_find_tds_prefers_combined_packets(coordinator: KarofiDataCoordinator) -> None:
+    """Test _find_tds_in_packets prefers combined buffer when multiple packets arrive.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    # Single packet
+    p_single = bytearray(b'{"et":"NP","iro_tds":25}')
+    assert coordinator._find_tds_in_packets([p_single]) == p_single
+
+    # Incomplete packet with marker does not match
+    p1 = bytearray(b'\x01{"et":"NP","iro_rtr":[1200, 2400],')
+    assert coordinator._find_tds_in_packets([p1]) is None
+
+    # Multiple packets with telemetry split across frames match once combined
+    p2 = bytearray(b'"iro_lTime":[4320, 8640]}\x04')
+    combined = coordinator._find_tds_in_packets([p1, p2])
+    assert combined is not None
+    assert combined == p1 + p2
+
+
+def test_coordinator_resolve_initial_dates_legacy_keys_filtered(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test _resolve_initial_dates excludes legacy and non-standard keys.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    stored = {
+        "filter_ro": "2026-01-01T00:00:00",
+        "filter_1": "2026-01-01T00:00:00",
+        "filter_mineral": "2026-01-01T00:00:00",
+        "unsupported_key": "2026-01-01T00:00:00",
+    }
+    coordinator.hass.config_entries.async_update_entry(
+        coordinator.entry,
+        options={
+            "initial_filter_reset_dates": {
+                "filter_ro": "2026-01-01T00:00:00",
+                "filter_2": "2026-02-01T00:00:00",
+            }
+        },
+    )
+    resolved, needs_save = coordinator._resolve_initial_dates(stored)
+    assert resolved == {
+        "filter_1": "2026-01-01T00:00:00",
+        "filter_2": "2026-02-01T00:00:00",
+    }
+    assert "filter_ro" not in resolved
+    assert "filter_mineral" not in resolved
+    assert "unsupported_key" not in resolved
+    assert needs_save is True
+
+
+async def test_coordinator_set_filter_date_updates_existing_record(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test async_set_filter_date updates existing KarofiFilterData record fields.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator.data.filters["filter_1"] = KarofiFilterData(
+        index=0,
+        key="filter_1",
+        lifetime_days=180,
+        reset_date="2020-01-01T00:00:00+00:00",
+        remaining_days=0,
+        percent=0,
+        remaining_hours=0,
+    )
+    frozen_now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    with patch("homeassistant.util.dt.utcnow", return_value=frozen_now):
+        # Set to 30 days ago
+        inst_date = frozen_now - timedelta(days=30)
+        await coordinator.async_set_filter_date("filter_1", inst_date)
+        fdata = coordinator.data.filters["filter_1"]
+        assert fdata.reset_date == inst_date.isoformat()
+        assert fdata.remaining_days == 150
+        assert fdata.percent == round((150 / 180) * 100)
+        assert fdata.remaining_hours == 150 * 24
+
+
+def test_coordinator_process_tds_payload_delays_save(coordinator: KarofiDataCoordinator) -> None:
+    """Test _process_tds_payload calls async_delay_save on filter updates.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    with patch.object(coordinator._store, "async_delay_save") as mock_delay_save:
+        raw_payload = b'\x01{"et":"NP","iro_rtr":[1200],"iro_lTime":[4320]}\x04'
+        coordinator._process_tds_payload(raw_payload)
+        mock_delay_save.assert_called_once()
+        args, _ = mock_delay_save.call_args
+        assert callable(args[0])
+        assert args[1] == 10
+
+        # Subsequent payload with unchanged reset dates does not schedule another save
+        coordinator._process_tds_payload(raw_payload)
+        assert mock_delay_save.call_count == 1
+
+
+async def test_coordinator_reset_filter_command_warning(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test async_reset_filter logs warning on BLE command failure while maintaining local reset.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=False)):
+        await coordinator.async_reset_filter("filter_1")
+        assert "Hardware reset command failed for filter_1" in caplog.text
+        assert "filter_1" in coordinator.data.filter_reset_dates
+
+
+def test_coordinator_coerce_int_list_preserves_none(coordinator: KarofiDataCoordinator) -> None:
+    """Test _coerce_int_list preserves None for invalid entries when requested.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    raw = [1200, "corrupt", 3600, False, 4800]
+    assert coordinator._coerce_int_list(raw, preserve_none=True) == [1200, None, 3600, None, 4800]
+    assert coordinator._coerce_int_list(raw, preserve_none=False) == [1200, 3600, 4800]
+
+
+def test_coordinator_update_single_filter_stage_leaves_date_unset_without_rtr(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test _update_single_filter_stage does not fabricate a reset date when rtr_h is None.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._update_single_filter_stage(0, None, 4320, None, "Sediment")
+    assert "filter_1" not in coordinator.data.filter_reset_dates
+    assert coordinator.data.filters["filter_1"].remaining_days is None
+
+
+def test_coordinator_process_errors_empty_list_clears_errors(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test _process_errors_from_payload clears errors on empty list.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator.data.errors = [1, 2, 3]
+    assert coordinator._process_errors_from_payload({"iro_errs": []}) is True
+    assert not coordinator.data.errors
+
+
+def test_coordinator_is_handshake_payload_excludes_telemetry(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test _is_handshake_payload excludes frames containing telemetry fields.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    assert coordinator._is_handshake_payload(b'{"et":"NP"}') is True
+    assert coordinator._is_handshake_payload(b'{"et":"CP"}') is True
+
+    assert coordinator._is_handshake_payload(b'{"et":"NP","iro_rtt":[100]}') is False
+    assert coordinator._is_handshake_payload(b'{"et":"NP","iro_errs":[1]}') is False
+    assert coordinator._is_handshake_payload(b'{"et":"NP","names":["Sediment"]}') is False
+    assert coordinator._is_handshake_payload(b'{"et":"NP","tds":45}') is False
+
+
+def test_coordinator_telemetry_synced_tracking(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test telemetry_synced tracks whether filter status originated from telemetry or reset date.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    # 1. Update from telemetry sets telemetry_synced to True
+    coordinator._update_single_filter_stage(0, 2400, 4320, None, "Sediment")
+    assert coordinator.data.filters["filter_1"].telemetry_synced is True
+    assert coordinator.data.filters["filter_1"].remaining_days == 100
+    assert coordinator.get_filter_remaining_days("filter_1") == 100
+
+    # 2. Applying installation date clears telemetry_synced to False and calculates from date
+    past_date = dt_util.utcnow() - timedelta(days=20)
+    coordinator._apply_filter_installation_date("filter_1", past_date)
+    assert coordinator.data.filters["filter_1"].telemetry_synced is False
+    assert coordinator.get_filter_remaining_days("filter_1") == 160
+
+
+async def test_coordinator_try_active_polling_accepts_filter_only_telemetry(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test _try_active_polling accepts filter-only telemetry without requiring TDS reading.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    client = MagicMock()
+    filter_only_payload = bytearray(b'{"et":"NP","iro_rtr":[1200],"iro_lTime":[4320]}')
+    with patch.object(
+        coordinator,
+        "_subscribe_tds_notification",
+        AsyncMock(return_value=filter_only_payload),
+    ):
+        result, raw = await coordinator._try_active_polling(
+            client, "char_notify", "char_cmd", "char_read"
+        )
+        assert result == filter_only_payload
+        assert raw == filter_only_payload
+
+
+async def test_coordinator_handle_notify_packet_resolves_only_on_tds(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test _handle_notify_packet does not resolve future on filter-only telemetry but does on TDS.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    client = MagicMock()
+    loop = asyncio.get_running_loop()
+    notify_future: asyncio.Future[bytearray] = loop.create_future()
+    received_packets: list[bytearray] = []
+    bg_tasks: set[asyncio.Task[None]] = set()
+
+    # 1. Filter-only packet does not resolve future
+    filter_packet = bytearray(b'{"et":"NP","iro_rtr":[1200],"iro_lTime":[4320]}')
+    coordinator._handle_notify_packet(
+        client,
+        filter_packet,
+        "char_notify",
+        "char_read",
+        received_packets,
+        notify_future,
+        bg_tasks,
+    )
+    assert not notify_future.done()
+    assert len(received_packets) == 1
+
+    # 2. Packet with TDS resolves future early
+    tds_packet = bytearray(b'{"tds":45}')
+    coordinator._handle_notify_packet(
+        client,
+        tds_packet,
+        "char_notify",
+        "char_read",
+        received_packets,
+        notify_future,
+        bg_tasks,
+    )
+    assert notify_future.done()
+    assert notify_future.result() == filter_packet + tds_packet
+    assert len(received_packets) == 2
