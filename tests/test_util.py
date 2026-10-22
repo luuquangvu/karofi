@@ -1,13 +1,23 @@
 """Tests for Karofi utility and normalization functions."""
 
+import pytest
+
 from custom_components.karofi.const import (
+    DEFAULT_FILTER_LIFETIME_DAYS,
+    FILTER_PREFIX,
+    TELEMETRY_FILTER_MARKERS,
     GattProperty,
     KarofiDevicePrefix,
+    KarofiFilter,
     KarofiShortUUID,
 )
 from custom_components.karofi.util import (
+    FILTER_STAGE_KEYS,
+    filter_index_to_key,
+    filter_key_to_index,
     hide_mac,
     is_karofi_local_name,
+    is_valid_filter_key,
     is_valid_mac,
     local_names_match,
     mac_addresses_match,
@@ -155,3 +165,53 @@ def test_hide_mac() -> None:
     assert hide_mac("invalid_long") == "**:_LONG"
     assert hide_mac("abc") == "****"
     assert hide_mac("a:b:c:d:e:f") == "**:D:E:F"
+
+
+def test_filter_stage_keys_and_conversion() -> None:
+    """Test filter stage keys, index mapping, and dynamic fallback beyond 12 stages."""
+    assert FILTER_PREFIX == "filter_"
+    assert len(FILTER_STAGE_KEYS) == 12
+    assert FILTER_STAGE_KEYS[0] == "filter_1"
+    assert FILTER_STAGE_KEYS[10] == "filter_11"
+    assert FILTER_STAGE_KEYS[11] == "filter_12"
+    assert KarofiFilter.FILTER_11 == "filter_11"
+    assert KarofiFilter.FILTER_12 == "filter_12"
+    assert DEFAULT_FILTER_LIFETIME_DAYS["filter_11"] == 365
+    assert DEFAULT_FILTER_LIFETIME_DAYS["filter_12"] == 365
+
+    # Test index to key
+    for idx in range(12):
+        assert filter_index_to_key(idx) == f"filter_{idx + 1}"
+    assert filter_index_to_key(12) == "filter_13"
+    assert filter_index_to_key(14) == "filter_15"
+
+    # Test key to index
+    for idx in range(12):
+        assert filter_key_to_index(f"filter_{idx + 1}") == idx
+    assert filter_key_to_index("filter_13") == 12
+    assert filter_key_to_index("filter_20") == 19
+    with pytest.raises(ValueError, match="Invalid filter key"):
+        filter_key_to_index("invalid")
+    with pytest.raises(ValueError, match="Invalid filter key"):
+        filter_key_to_index("filter_ro")
+    with pytest.raises(ValueError, match="Invalid filter key"):
+        filter_key_to_index("filter_0")
+    with pytest.raises(ValueError, match="Invalid filter key"):
+        filter_key_to_index("filter_01")
+    with pytest.raises(ValueError, match="Invalid filter key"):
+        filter_key_to_index("filter_²")
+
+    # Test is_valid_filter_key
+    assert is_valid_filter_key("filter_1") is True
+    assert is_valid_filter_key("filter_12") is True
+    assert is_valid_filter_key("filter_13") is True
+    assert is_valid_filter_key("filter_ro") is False
+    assert is_valid_filter_key("filter_0") is False
+    assert is_valid_filter_key("filter_01") is False
+    assert is_valid_filter_key("filter_-1") is False
+    assert is_valid_filter_key("filter_") is False
+    assert is_valid_filter_key("filter_²") is False
+    assert is_valid_filter_key("invalid") is False
+
+    assert b"iro_rtr" in TELEMETRY_FILTER_MARKERS
+    assert b"iro_lTime" in TELEMETRY_FILTER_MARKERS

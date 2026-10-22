@@ -33,8 +33,8 @@ from homeassistant.util import dt as dt_util
 from .const import (
     BLE_CONNECT_ATTEMPTS,
     BLE_TIMEOUT_SECONDS,
+    DEFAULT_FILTER_LIFETIME_DAYS,
     DEFAULT_SCAN_INTERVAL,
-    FILTER_LIFETIME_DAYS,
     MAX_VALID_TDS,
     NOTIFY_UUID_PREFIX,
     REQUEST_READ_DATA_COMMAND,
@@ -44,6 +44,7 @@ from .const import (
     TDS_SENTINEL_ERROR,
     TDS_THRESHOLD_FAIR,
     TDS_THRESHOLD_GOOD,
+    TELEMETRY_PAYLOAD_KEYS,
     GattProperty,
     KarofiCharacteristic,
     KarofiFilter,
@@ -52,9 +53,17 @@ from .const import (
     MakiposPayloadKey,
     MakiposPropertyCode,
     WaterQuality,
+    build_reset_filter_command,
 )
-from .models import KarofiData
-from .util import hide_mac, mac_addresses_match, normalize_mac
+from .models import KarofiData, KarofiFilterData
+from .util import (
+    filter_index_to_key,
+    filter_key_to_index,
+    hide_mac,
+    is_valid_filter_key,
+    mac_addresses_match,
+    normalize_mac,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -98,9 +107,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             quality=WaterQuality.UNKNOWN,
             connected=False,
             last_seen=None,
-            filter_reset_dates={
-                k.value: dt_util.utcnow().isoformat() for k in FILTER_LIFETIME_DAYS
-            },
+            filter_reset_dates={},
+            filters={},
+            errors=[],
         )
         self._known_tds_char_uuid: str | None = None
         self._mac_candidates: tuple[str, str] = (
@@ -145,6 +154,28 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         return None
 
+    @staticmethod
+    def _parse_filter_dates_entry(
+        data: object,
+    ) -> list[tuple[str, str]]:
+        """Parse raw mapping into validated (filter_key, val) tuples.
+
+        Args:
+            data: Raw dictionary or mapping object.
+
+        Returns:
+            List of tuples (filter_key, date_string).
+        """
+        if not isinstance(data, dict):
+            return []
+        entries: list[tuple[str, str]] = []
+        for key, val in data.items():
+            if not isinstance(key, str) or not isinstance(val, str):
+                continue
+            if is_valid_filter_key(key) and dt_util.parse_datetime(val) is not None:
+                entries.append((key, val))
+        return entries
+
     def _resolve_initial_dates(self, stored: object) -> tuple[dict[str, str], bool]:
         """Resolve filter dates from storage or initial config options.
 
@@ -156,16 +187,19 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """
         stored_dict = stored if isinstance(stored, dict) else {}
         initial_dates = self.entry.options.get("initial_filter_reset_dates", {})
-        resolved: dict[str, str] = {}
-        needs_save = not isinstance(stored, dict)
+        needs_save = False
 
-        for filter_stage in FILTER_LIFETIME_DAYS:
-            key = filter_stage.value
-            val = stored_dict.get(key)
-            if isinstance(val, str) and dt_util.parse_datetime(val) is not None:
+        resolved: dict[str, str] = {}
+        for key, val in self._parse_filter_dates_entry(stored_dict):
+            if key not in resolved:
                 resolved[key] = val
-            else:
-                resolved[key] = initial_dates.get(key, dt_util.utcnow().isoformat())
+
+        if len(resolved) != len(stored_dict):
+            needs_save = True
+
+        for key, val in self._parse_filter_dates_entry(initial_dates):
+            if key not in resolved:
+                resolved[key] = val
                 needs_save = True
 
         return resolved, needs_save
@@ -189,88 +223,63 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         resolved_dates, needs_save = self._resolve_initial_dates(stored)
         self.data.filter_reset_dates.update(resolved_dates)
 
+        for key in resolved_dates:
+            if key not in self.data.filters:
+                self.data.filters[key] = KarofiFilterData(
+                    index=filter_key_to_index(key),
+                    key=key,
+                    lifetime_days=self.get_filter_lifetime_days(key),
+                    reset_date=resolved_dates[key],
+                )
+
         if needs_save:
             await self._store.async_save(self.data.filter_reset_dates)
 
         self.async_update_listeners()
 
-    async def async_reset_filter(self, filter_key: str) -> None:
-        """Reset the installation date of a filter to now.
+    def get_known_filter_keys(self) -> list[str]:
+        """Return list of known filter stage keys sorted by stage index.
+
+        Returns:
+            Sorted list of filter stage keys.
+        """
+
+        def _sort_key(k: str) -> int:
+            try:
+                return filter_key_to_index(k)
+            except ValueError:
+                return 999999
+
+        known_keys = set(self.data.filters.keys()) | set(self.data.filter_reset_dates.keys())
+        return sorted(known_keys, key=_sort_key)
+
+    def get_filter_name(self, filter_stage: KarofiFilter | str) -> str | None:
+        """Get dynamic filter name if provided by device telemetry.
 
         Args:
-            filter_key: The dictionary key of the filter to reset.
-        """
-        await self.async_set_filter_used_days(filter_key, 0)
+            filter_stage: Filter stage identifier or enum.
 
-    async def async_set_filter_date(self, filter_key: str, date: datetime | str) -> None:
-        """Set the installation/replacement date of a filter.
+        Returns:
+            Custom filter name string if provided, or None.
+        """
+        key = filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
+        return self.data.filters[key].name if key in self.data.filters else None
+
+    def get_filter_lifetime_days(self, filter_stage: KarofiFilter | str) -> int:
+        """Get rated lifetime in days for a filter stage.
 
         Args:
-            filter_key: The dictionary key of the filter to calibrate.
-            date: Datetime or ISO format string of the installation date.
+            filter_stage: Filter identifier or KarofiFilter enum.
 
-        Raises:
-            ValueError: If date string cannot be parsed.
+        Returns:
+            Lifetime in days from telemetry or default mapping.
         """
-        if filter_key not in self.data.filter_reset_dates:
-            return
-
-        if isinstance(date, str):
-            dt = dt_util.parse_datetime(date)
-            if dt is None:
-                parsed_date = dt_util.parse_date(date)
-                if parsed_date is not None:
-                    dt = dt_util.start_of_local_day(parsed_date)
-            if dt is None:
-                raise ValueError(f"Invalid date format: {date}")
-        else:
-            dt = date
-
-        iso_str = dt_util.as_utc(dt).isoformat()
-        self.data.filter_reset_dates[filter_key] = iso_str
-        await self._store.async_save(self.data.filter_reset_dates)
-        self.async_set_updated_data(self.data)
-
-    async def async_set_filter_used_days(self, filter_key: str, used_days: int) -> None:
-        """Set the filter installation date based on days already in use.
-
-        Args:
-            filter_key: The dictionary key of the filter to calibrate.
-            used_days: Number of days the filter has been in use.
-        """
-        if filter_key not in self.data.filter_reset_dates:
-            return
-        installation_date = dt_util.utcnow() - timedelta(days=max(0, used_days))
-        await self.async_set_filter_date(filter_key, installation_date)
-
-    async def async_set_filter_remaining_days(self, filter_key: str, remaining_days: int) -> None:
-        """Set filter installation date based on remaining lifetime days.
-
-        Args:
-            filter_key: The dictionary key of the filter to calibrate.
-            remaining_days: Remaining days before filter replacement.
-        """
-        if filter_key not in self.data.filter_reset_dates:
-            return
-        enum_key = KarofiFilter(filter_key)
-        lifetime = FILTER_LIFETIME_DAYS.get(enum_key, 365)
-        used_days = max(0, lifetime - remaining_days)
-        await self.async_set_filter_used_days(filter_key, used_days)
-
-    async def async_calibrate_all_filters(self, used_days_map: dict[str, int]) -> None:
-        """Calibrate multiple filters at once by specifying days in use.
-
-        Args:
-            used_days_map: Mapping of filter stage key to days in use.
-        """
-        now = dt_util.utcnow()
-        for key, used_days in used_days_map.items():
-            if key in self.data.filter_reset_dates:
-                inst_date = now - timedelta(days=max(0, used_days))
-                self.data.filter_reset_dates[key] = inst_date.isoformat()
-
-        await self._store.async_save(self.data.filter_reset_dates)
-        self.async_set_updated_data(self.data)
+        key = filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
+        if key in self.data.filters and self.data.filters[key].lifetime_days is not None:
+            lifetime = self.data.filters[key].lifetime_days
+            if lifetime is not None and lifetime > 0:
+                return lifetime
+        return DEFAULT_FILTER_LIFETIME_DAYS.get(key, 365)
 
     def get_filter_remaining_days(
         self,
@@ -287,17 +296,18 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             Remaining lifespan in days, clamped between 0 and max lifetime.
         """
         key = filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
-        try:
-            enum_stage: KarofiFilter | None = KarofiFilter(key)
-        except ValueError:
-            enum_stage = None
+        lifetime = max_days if max_days is not None else self.get_filter_lifetime_days(key)
+        if lifetime <= 0:
+            return 0
 
-        if max_days is not None:
-            lifetime = max_days
-        elif enum_stage is not None:
-            lifetime = FILTER_LIFETIME_DAYS.get(enum_stage, 365)
-        else:
-            lifetime = 365
+        if (
+            key in self.data.filters
+            and self.data.filters[key].telemetry_synced
+            and self.data.filters[key].remaining_days is not None
+        ):
+            rem_days = self.data.filters[key].remaining_days
+            if rem_days is not None:
+                return max(0, min(lifetime, rem_days))
 
         iso_date = self.data.filter_reset_dates.get(key)
         if not iso_date:
@@ -323,20 +333,199 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             Remaining life percentage (0-100).
         """
         key = filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
-        try:
-            enum_stage: KarofiFilter | None = KarofiFilter(key)
-        except ValueError:
-            enum_stage = None
+        if (
+            key in self.data.filters
+            and self.data.filters[key].telemetry_synced
+            and self.data.filters[key].percent is not None
+        ):
+            pct = self.data.filters[key].percent
+            if pct is not None:
+                return max(0, min(100, pct))
 
-        if max_days is not None:
-            lifetime = max_days
-        elif enum_stage is not None:
-            lifetime = FILTER_LIFETIME_DAYS.get(enum_stage, 365)
-        else:
-            lifetime = 365
-
-        remaining = self.get_filter_remaining_days(filter_stage, max_days=lifetime)
+        lifetime = max_days if max_days is not None else self.get_filter_lifetime_days(key)
+        if lifetime <= 0:
+            return 0
+        remaining = self.get_filter_remaining_days(key, max_days=lifetime)
         return max(0, min(100, round(remaining / lifetime * 100)))
+
+    async def _async_send_reset_command(self, filter_index: int) -> bool:
+        """Send the BLE hardware reset command to the device.
+
+        Args:
+            filter_index: 0-based integer index of the filter.
+
+        Returns:
+            True if command was successfully transmitted, False otherwise.
+        """
+        ble_device = self._get_ble_device()
+        if not ble_device:
+            _LOGGER.debug(
+                "Cannot send reset filter command to %s: device not reachable",
+                self.masked_mac,
+            )
+            return False
+
+        cmd = build_reset_filter_command(filter_index)
+        try:
+            async with asyncio.timeout(BLE_TIMEOUT_SECONDS):
+                client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    ble_device,
+                    self.name,
+                    max_attempts=BLE_CONNECT_ATTEMPTS,
+                )
+                try:
+                    _, notify_target, cmd_target, _, _ = self._resolve_io_targets(client)
+                    actual_cmd_target = cmd_target or notify_target
+                    return await self._write_command_with_fallback(client, actual_cmd_target, cmd)
+                finally:
+                    await client.disconnect()
+        except (BleakError, OSError) as err:
+            _LOGGER.debug(
+                "Failed to send reset filter command to %s: %s",
+                self.masked_mac,
+                err,
+            )
+            return False
+
+    async def async_reset_filter(self, filter_key: str) -> None:
+        """Reset the installation date and telemetry of a filter to now.
+
+        Args:
+            filter_key: The dictionary key of the filter to reset.
+        """
+        try:
+            filter_index = filter_key_to_index(filter_key)
+        except ValueError:
+            _LOGGER.warning("Cannot reset invalid filter key: %s", filter_key)
+            return
+
+        if not await self._async_send_reset_command(filter_index):
+            _LOGGER.warning(
+                "Hardware reset command failed for %s on device %s; updated local tracking only",
+                filter_key,
+                self.masked_mac,
+            )
+
+        if filter_key in self.data.filters:
+            fdata = self.data.filters[filter_key]
+            fdata.remaining_hours = fdata.lifetime_hours
+            fdata.remaining_days = fdata.lifetime_days
+            fdata.percent = 100
+
+        await self.async_set_filter_used_days(filter_key, 0)
+
+    def _apply_filter_installation_date(self, filter_key: str, dt: datetime) -> None:
+        """Apply installation date and update or create filter record.
+
+        Args:
+            filter_key: The dictionary key of the filter stage.
+            dt: Installation datetime.
+        """
+        iso_str = dt_util.as_utc(dt).isoformat()
+        self.data.filter_reset_dates[filter_key] = iso_str
+        lifetime = self.get_filter_lifetime_days(filter_key)
+        used_days = (dt_util.utcnow() - dt_util.as_utc(dt)).days
+        rem_days = max(0, min(lifetime, lifetime - max(0, used_days)))
+        pct = max(0, min(100, round((rem_days / lifetime) * 100)))
+        rem_hours = rem_days * 24
+
+        if filter_key not in self.data.filters:
+            self.data.filters[filter_key] = KarofiFilterData(
+                index=filter_key_to_index(filter_key),
+                key=filter_key,
+                lifetime_days=lifetime,
+                reset_date=iso_str,
+                remaining_days=rem_days,
+                percent=pct,
+                remaining_hours=rem_hours,
+                telemetry_synced=False,
+            )
+        else:
+            fdata = self.data.filters[filter_key]
+            fdata.reset_date = iso_str
+            fdata.remaining_days = rem_days
+            fdata.percent = pct
+            fdata.remaining_hours = rem_hours
+            fdata.telemetry_synced = False
+
+    async def async_set_filter_date(self, filter_key: str, date: datetime | str) -> None:
+        """Set the installation/replacement date of a filter.
+
+        Args:
+            filter_key: The dictionary key of the filter to calibrate.
+            date: Datetime or ISO format string of the installation date.
+
+        Raises:
+            ValueError: If date string cannot be parsed.
+        """
+        if (
+            filter_key not in self.data.filter_reset_dates
+            and filter_key not in self.data.filters
+            and not is_valid_filter_key(filter_key)
+        ):
+            return
+
+        if isinstance(date, str):
+            dt = dt_util.parse_datetime(date)
+            if dt is None:
+                parsed_date = dt_util.parse_date(date)
+                if parsed_date is not None:
+                    dt = dt_util.start_of_local_day(parsed_date)
+            if dt is None:
+                raise ValueError(f"Invalid date format: {date}")
+        else:
+            dt = date
+
+        self._apply_filter_installation_date(filter_key, dt)
+        await self._store.async_save(self.data.filter_reset_dates)
+        self.async_set_updated_data(self.data)
+
+    async def async_set_filter_used_days(self, filter_key: str, used_days: int) -> None:
+        """Set the filter installation date based on days already in use.
+
+        Args:
+            filter_key: The dictionary key of the filter to calibrate.
+            used_days: Number of days the filter has been in use.
+        """
+        installation_date = dt_util.utcnow() - timedelta(days=max(0, used_days))
+        await self.async_set_filter_date(filter_key, installation_date)
+
+    async def async_set_filter_remaining_days(self, filter_key: str, remaining_days: int) -> None:
+        """Set filter installation date based on remaining lifetime days.
+
+        Args:
+            filter_key: The dictionary key of the filter to calibrate.
+            remaining_days: Remaining days before filter replacement.
+        """
+        lifetime = self.get_filter_lifetime_days(filter_key)
+        used_days = max(0, lifetime - remaining_days)
+        if filter_key in self.data.filters:
+            fdata = self.data.filters[filter_key]
+            fdata.remaining_days = remaining_days
+            fdata.percent = max(0, min(100, round((remaining_days / lifetime) * 100)))
+            fdata.remaining_hours = remaining_days * 24
+        await self.async_set_filter_used_days(filter_key, used_days)
+
+    async def async_calibrate_all_filters(self, used_days_map: dict[str, int]) -> None:
+        """Calibrate multiple filters at once by specifying days in use.
+
+        Args:
+            used_days_map: Mapping of filter stage key to days in use.
+        """
+        now = dt_util.utcnow()
+        for key, used_days in used_days_map.items():
+            if (
+                key not in self.data.filter_reset_dates
+                and key not in self.data.filters
+                and not is_valid_filter_key(key)
+            ):
+                continue
+            inst_date = now - timedelta(days=max(0, used_days))
+            self._apply_filter_installation_date(key, inst_date)
+
+        await self._store.async_save(self.data.filter_reset_dates)
+        self.async_set_updated_data(self.data)
 
     def _log_discovered_services(self, client: BleakClientWithServiceCache) -> None:
         """Log discovered GATT services and characteristics for debugging.
@@ -661,19 +850,31 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 payload = json.loads(text[start_brace : end_brace + 1])
                 if isinstance(payload, dict):
                     et = payload.get(MakiposPayloadKey.EVENT_TYPE)
-                    if (
-                        et in (MakiposEventType.NP, MakiposEventType.CP)
-                        and MakiposPayloadKey.PROPERTY_CODE not in payload
-                        and MakiposPayloadKey.IRO_TDS not in payload
-                    ):
-                        return True
+                    return et in (MakiposEventType.NP, MakiposEventType.CP) and not any(
+                        k in payload for k in TELEMETRY_PAYLOAD_KEYS
+                    )
         except ValueError, TypeError:
             pass
 
         return False
 
+    def _has_telemetry_payload(self, buffer: bytearray | bytes) -> bool:
+        """Check if buffer contains valid TDS or filter telemetry payload.
+
+        Args:
+            buffer: Raw payload bytes to check.
+
+        Returns:
+            True if buffer contains parseable TDS or telemetry payload.
+        """
+        if self._parse_tds_reading(buffer) is not None:
+            return True
+        return any(
+            self._has_filter_or_telemetry_field(p) for p in self._extract_all_payload_dicts(buffer)
+        )
+
     def _find_tds_in_packets(self, packets: list[bytearray]) -> bytearray | None:
-        """Find valid TDS payload from single packet or concatenated packets.
+        """Find valid TDS or telemetry payload from single packet or concatenated packets.
 
         Args:
             packets: List of raw bytearray packets.
@@ -681,16 +882,36 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Returns:
             Matching bytearray or None.
         """
-        for pkt in reversed(packets):
-            if self._parse_tds_reading(pkt) is not None:
-                return pkt
+        if len(packets) > 1:
+            combined = bytearray()
+            for pkt in packets:
+                combined.extend(pkt)
+            if self._has_telemetry_payload(combined):
+                return combined
+        return next(
+            (pkt for pkt in reversed(packets) if self._has_telemetry_payload(pkt)),
+            None,
+        )
+
+    def _find_tds_reading_in_packets(self, packets: list[bytearray]) -> bytearray | None:
+        """Find packet or combined buffer containing a valid TDS reading.
+
+        Args:
+            packets: List of raw bytearray packets.
+
+        Returns:
+            Matching bytearray containing TDS reading or None.
+        """
         if len(packets) > 1:
             combined = bytearray()
             for pkt in packets:
                 combined.extend(pkt)
             if self._parse_tds_reading(combined) is not None:
                 return combined
-        return None
+        return next(
+            (pkt for pkt in reversed(packets) if self._parse_tds_reading(pkt) is not None),
+            None,
+        )
 
     @staticmethod
     def _resolve_notified_char(
@@ -842,7 +1063,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             data.hex(),
             data.decode("utf-8", errors="replace"),
         )
-        if match := self._find_tds_in_packets(received_packets):
+        if match := self._find_tds_reading_in_packets(received_packets):
             if not notify_future.done():
                 notify_future.set_result(match)
             return
@@ -1159,10 +1380,11 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         notify_bytes = await self._subscribe_tds_notification(
             client, notify_target, cmd_target=cmd_target, read_target=read_target
         )
-        if notify_bytes and self._parse_tds_reading(notify_bytes) is not None:
+        if notify_bytes and self._has_telemetry_payload(notify_bytes):
             _LOGGER.debug(
-                "Active polling returned valid TDS reading (%s ppm)",
-                self._parse_tds_reading(notify_bytes),
+                "Active polling returned valid telemetry payload (%d bytes, hex: %s)",
+                len(notify_bytes),
+                notify_bytes.hex(),
             )
             return notify_bytes, notify_bytes
         return None, notify_bytes
@@ -1429,13 +1651,390 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 return tds
         return None
 
+    @classmethod
+    def _parse_next_json_candidate(
+        cls, decoder: json.JSONDecoder, text: str, idx: int
+    ) -> tuple[list[dict[str, object]], int]:
+        """Parse next JSON dictionary candidate from text starting at idx.
+
+        Args:
+            decoder: JSONDecoder instance.
+            text: Raw decoded string.
+            idx: Starting character index.
+
+        Returns:
+            Tuple of extracted dictionary candidates and next index.
+        """
+        brace_pos = text.find("{", idx)
+        bracket_pos = text.find("[", idx)
+        starts = [p for p in (brace_pos, bracket_pos) if p != -1]
+        if not starts:
+            return [], len(text)
+        start = min(starts)
+        try:
+            obj, end_offset = decoder.raw_decode(text[start:])
+            return cls._extract_dict_candidates(obj), start + end_offset
+        except ValueError, TypeError:
+            return [], start + 1
+
+    @classmethod
+    def _extract_all_payload_dicts(cls, raw_bytes: bytearray | bytes) -> list[dict[str, object]]:
+        """Extract and parse all JSON dictionaries or array items from raw bytes.
+
+        Supports single frames, arrays, and concatenated multi-frame streams.
+
+        Args:
+            raw_bytes: Payload bytes to decode.
+
+        Returns:
+            List of decoded dictionaries found in raw bytes.
+        """
+        try:
+            text = raw_bytes.decode("utf-8", errors="ignore").strip()
+            if not text:
+                return []
+
+            decoder = json.JSONDecoder()
+            idx = 0
+            parsed_items: list[dict[str, object]] = []
+
+            while idx < len(text):
+                candidates, next_idx = cls._parse_next_json_candidate(decoder, text, idx)
+                parsed_items.extend(candidates)
+                idx = next_idx
+
+            return parsed_items
+        except ValueError, TypeError:
+            return []
+
+    @staticmethod
+    def _parse_int_item(item: object) -> int | None:
+        """Parse a single item into an integer, or None if invalid.
+
+        Args:
+            item: Raw item to parse.
+
+        Returns:
+            Parsed integer value or None if invalid.
+        """
+        if isinstance(item, (int, float, str)) and not isinstance(item, bool):
+            try:
+                return int(float(item))
+            except ValueError, TypeError, OverflowError:
+                pass
+        return None
+
+    @classmethod
+    def _coerce_int_list(
+        cls, val: object, *, preserve_none: bool = False
+    ) -> list[int | None] | None:
+        """Coerce list or comma-separated string to a list of integers.
+
+        Args:
+            val: Raw value candidate to parse as integer list.
+            preserve_none: If True, invalid entries retain their positions as None.
+
+        Returns:
+            Parsed list of integers or None if invalid.
+        """
+        raw_items: list[object]
+        if isinstance(val, list):
+            raw_items = val
+        elif isinstance(val, str) and "," in val:
+            raw_items = [part.strip() for part in val.split(",") if part.strip()]
+        else:
+            return None
+
+        items: list[int | None] = []
+        for item in raw_items:
+            parsed = cls._parse_int_item(item)
+            if parsed is not None:
+                items.append(parsed)
+            elif preserve_none:
+                items.append(None)
+
+        if not items or (preserve_none and all(x is None for x in items)):
+            return None
+        return items
+
+    @staticmethod
+    def _has_filter_or_telemetry_field(payload: dict[str, object]) -> bool:
+        """Check if payload dictionary contains filter telemetry or errors.
+
+        Args:
+            payload: Decoded JSON dictionary.
+
+        Returns:
+            True if dictionary targets filter telemetry, lifetime, or error data.
+        """
+        prop_code = payload.get(MakiposPayloadKey.PROPERTY_CODE)
+        if prop_code in (
+            MakiposPropertyCode.IRO_RTR,
+            MakiposPropertyCode.IRO_LTIME,
+            MakiposPropertyCode.IRO_RTT,
+            MakiposPropertyCode.IRO_ERRS,
+        ):
+            return True
+        return any(
+            k in payload
+            for k in (
+                MakiposPayloadKey.IRO_RTR,
+                MakiposPayloadKey.IRO_LTIME,
+                MakiposPayloadKey.IRO_RTT,
+                MakiposPayloadKey.IRO_ERRS,
+                MakiposPayloadKey.IRO_NAMES,
+                MakiposPayloadKey.FILTER_NAMES,
+                MakiposPayloadKey.NAMES,
+            )
+        )
+
+    def _process_tds_reading_from_payload(
+        self, payload: dict[str, object], raw_bytes: bytearray | bytes
+    ) -> bool:
+        """Process TDS measurement from a single dictionary payload.
+
+        Args:
+            payload: Parsed JSON payload dictionary.
+            raw_bytes: Raw bytes for debug logging.
+
+        Returns:
+            True if a TDS field was found in the payload, False otherwise.
+        """
+        if not self._has_tds_field(payload):
+            return False
+        tds = self._coerce_int(self._extract_raw_val(payload))
+        if not self._is_valid_tds(tds):
+            _LOGGER.warning(
+                "Received invalid TDS reading (%s ppm, raw: %s) from Karofi device %s",
+                tds,
+                raw_bytes.hex(),
+                self.masked_mac,
+            )
+            self.data.tds = None
+            self.data.quality = WaterQuality.UNKNOWN
+        else:
+            self.data.tds = tds
+            self.data.quality = self._classify_water_quality(tds)
+            _LOGGER.debug(
+                "Updated TDS reading for Karofi device %s: %d ppm (quality: %s)",
+                self.masked_mac,
+                self.data.tds,
+                self.data.quality,
+            )
+        return True
+
+    @staticmethod
+    def _get_payload_property_val(
+        payload: dict[str, object], prop_code: MakiposPropertyCode, key: MakiposPayloadKey
+    ) -> object:
+        """Extract property value from payload either via property code or direct key.
+
+        Args:
+            payload: Decoded JSON dictionary.
+            prop_code: Property code to match.
+            key: Fallback direct key in payload.
+
+        Returns:
+            Property value object or None.
+        """
+        if payload.get(MakiposPayloadKey.PROPERTY_CODE) == prop_code:
+            return payload.get(MakiposPayloadKey.DATA)
+        return payload.get(key)
+
+    def _update_single_filter_stage(
+        self,
+        idx: int,
+        rtr_h: int | None,
+        ltime_h: int | None,
+        rtt_h: int | None,
+        name: str | None = None,
+    ) -> None:
+        """Update telemetry, lifetime, and optional name for a single filter stage.
+
+        Args:
+            idx: 0-based filter stage index.
+            rtr_h: Remaining hours or None.
+            ltime_h: Lifetime hours or None.
+            rtt_h: Total run hours or None.
+            name: Optional dynamic filter name from device payload.
+        """
+        key = filter_index_to_key(idx)
+        fdata = self.data.filters.setdefault(key, KarofiFilterData(index=idx, key=key))
+        if name:
+            fdata.name = name
+
+        if rtr_h is not None:
+            fdata.remaining_hours = rtr_h
+            fdata.remaining_days = max(0, round(rtr_h / 24.0))
+            fdata.telemetry_synced = True
+
+        if ltime_h is not None:
+            fdata.lifetime_hours = ltime_h
+            fdata.lifetime_days = max(1, round(ltime_h / 24.0))
+        elif fdata.lifetime_days is None:
+            fdata.lifetime_days = self.get_filter_lifetime_days(key)
+
+        if fdata.remaining_days is not None and fdata.lifetime_days:
+            fdata.percent = max(
+                0, min(100, round((fdata.remaining_days / fdata.lifetime_days) * 100))
+            )
+
+        if key not in self.data.filter_reset_dates and fdata.remaining_days is not None:
+            life = fdata.lifetime_days or DEFAULT_FILTER_LIFETIME_DAYS.get(key, 365)
+            used_days = max(0, life - fdata.remaining_days)
+            self.data.filter_reset_dates[key] = (
+                dt_util.utcnow() - timedelta(days=used_days)
+            ).isoformat()
+
+        if rtt_h is not None:
+            fdata.total_hours = rtt_h
+
+    @staticmethod
+    def _extract_names_list(payload: dict[str, object]) -> list[str] | None:
+        """Extract list of filter names from payload dictionary if present.
+
+        Args:
+            payload: Parsed JSON payload dictionary.
+
+        Returns:
+            List of string names or None.
+        """
+        for key in (
+            MakiposPayloadKey.IRO_NAMES,
+            MakiposPayloadKey.FILTER_NAMES,
+            MakiposPayloadKey.NAMES,
+        ):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return [str(item) for item in val]
+        return None
+
+    @staticmethod
+    def _get_list_element[T](lst: list[T] | None, idx: int) -> T | None:
+        """Safely fetch element from list by index.
+
+        Args:
+            lst: Optional list of elements.
+            idx: 0-based integer index.
+
+        Returns:
+            Element at idx or None.
+        """
+        if lst and 0 <= idx < len(lst):
+            return lst[idx]
+        return None
+
+    def _process_filter_stages_from_payload(self, payload: dict[str, object]) -> bool:
+        """Process filter telemetry (rtr, lTime, rtt) and names from payload dictionary.
+
+        Args:
+            payload: Parsed JSON payload dictionary.
+
+        Returns:
+            True if filter telemetry was found and processed, False otherwise.
+        """
+        rtr_list = self._coerce_int_list(
+            self._get_payload_property_val(
+                payload, MakiposPropertyCode.IRO_RTR, MakiposPayloadKey.IRO_RTR
+            ),
+            preserve_none=True,
+        )
+        ltime_list = self._coerce_int_list(
+            self._get_payload_property_val(
+                payload, MakiposPropertyCode.IRO_LTIME, MakiposPayloadKey.IRO_LTIME
+            ),
+            preserve_none=True,
+        )
+        rtt_list = self._coerce_int_list(
+            self._get_payload_property_val(
+                payload, MakiposPropertyCode.IRO_RTT, MakiposPayloadKey.IRO_RTT
+            ),
+            preserve_none=True,
+        )
+        names_list = self._extract_names_list(payload)
+
+        if rtr_list is None and ltime_list is None and names_list is None:
+            return False
+
+        filter_count = max(
+            len(rtr_list) if rtr_list else 0,
+            len(ltime_list) if ltime_list else 0,
+            len(names_list) if names_list else 0,
+        )
+        for idx in range(filter_count):
+            self._update_single_filter_stage(
+                idx,
+                self._get_list_element(rtr_list, idx),
+                self._get_list_element(ltime_list, idx),
+                self._get_list_element(rtt_list, idx),
+                self._get_list_element(names_list, idx),
+            )
+
+        return True
+
+    def _process_errors_from_payload(self, payload: dict[str, object]) -> bool:
+        """Extract and store device error codes from payload dictionary.
+
+        Args:
+            payload: Parsed JSON payload dictionary.
+
+        Returns:
+            True if error codes were found and stored, False otherwise.
+        """
+        errs_val = self._get_payload_property_val(
+            payload, MakiposPropertyCode.IRO_ERRS, MakiposPayloadKey.IRO_ERRS
+        )
+        if isinstance(errs_val, list) and not errs_val:
+            self.data.errors = []
+            return True
+        if (errs_list := self._coerce_int_list(errs_val)) is not None:
+            self.data.errors = [e for e in errs_list if e is not None]
+            return True
+        return False
+
+    @staticmethod
+    def _is_valid_json_buffer(raw_bytes: bytearray | bytes) -> bool:
+        """Check if buffer is non-empty and contains JSON braces or brackets.
+
+        Args:
+            raw_bytes: Payload bytes to check.
+
+        Returns:
+            True if buffer appears to contain JSON.
+        """
+        return bool(raw_bytes and (b"{" in raw_bytes or b"[" in raw_bytes))
+
+    def _process_all_payload_dicts(
+        self, payload_dicts: list[dict[str, object]], raw_bytes: bytearray | bytes
+    ) -> tuple[bool, bool]:
+        """Process all decoded payload dictionaries.
+
+        Args:
+            payload_dicts: List of decoded dictionary frames.
+            raw_bytes: Raw bytes for debug logging.
+
+        Returns:
+            Tuple of (has_sensor_data, filters_updated).
+        """
+        has_sensor_data = False
+        filters_updated = False
+        for payload in payload_dicts:
+            if self._process_tds_reading_from_payload(payload, raw_bytes):
+                has_sensor_data = True
+            if self._process_filter_stages_from_payload(payload):
+                has_sensor_data = True
+                filters_updated = True
+            if self._process_errors_from_payload(payload):
+                has_sensor_data = True
+        return has_sensor_data, filters_updated
+
     def _process_tds_payload(self, raw_bytes: bytearray | bytes) -> None:
-        """Process raw bytes payload from the TDS sensor.
+        """Process raw bytes payload from the TDS sensor and purifier telemetry.
 
         Args:
             raw_bytes: Payload bytes read from the characteristic.
         """
-        if not raw_bytes or (b"{" not in raw_bytes and b"[" not in raw_bytes):
+        if not self._is_valid_json_buffer(raw_bytes):
             self.data.connected = False
             _LOGGER.warning(
                 "Received invalid non-JSON payload (%d bytes, raw: %s) from Karofi device %s",
@@ -1456,8 +2055,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             )
             return
 
-        payload = self._parse_json_payload(raw_bytes)
-        if payload is None:
+        payload_dicts = self._extract_all_payload_dicts(raw_bytes)
+        if not payload_dicts:
             _LOGGER.warning(
                 "Received malformed JSON payload (raw: %s) from Karofi device %s",
                 raw_bytes.hex(),
@@ -1465,35 +2064,19 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             )
             return
 
-        if not self._has_tds_field(payload):
+        reset_dates_snapshot = dict(self.data.filter_reset_dates)
+        has_sensor_data, filters_updated = self._process_all_payload_dicts(payload_dicts, raw_bytes)
+
+        if not has_sensor_data:
             _LOGGER.debug(
-                "Payload did not contain a TDS reading (raw: %s, parsed: %s) from Karofi device %s",
-                raw_bytes.hex(),
-                payload,
-                self.masked_mac,
-            )
-            return
-
-        tds = self._coerce_int(self._extract_raw_val(payload))
-        if not self._is_valid_tds(tds):
-            _LOGGER.warning(
-                "Received invalid TDS reading (%s ppm, raw: %s) from Karofi device %s",
-                tds,
+                "Payload did not contain sensor or filter data (raw: %s) from Karofi device %s",
                 raw_bytes.hex(),
                 self.masked_mac,
             )
-            self.data.tds = None
-            self.data.quality = WaterQuality.UNKNOWN
-            return
 
-        self.data.tds = tds
-        self.data.quality = self._classify_water_quality(tds)
-        _LOGGER.debug(
-            "Updated TDS reading for Karofi device %s: %d ppm (quality: %s)",
-            self.masked_mac,
-            self.data.tds,
-            self.data.quality,
-        )
+        if filters_updated and self.data.filter_reset_dates != reset_dates_snapshot:
+            with contextlib.suppress(RuntimeError, AttributeError):
+                self._store.async_delay_save(lambda: self.data.filter_reset_dates, 10)
 
     async def _async_update_data(self) -> KarofiData:
         """Query BLE data via ESPHome or local Bluetooth proxy.

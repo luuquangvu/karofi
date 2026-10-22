@@ -3,7 +3,7 @@
 import re
 from typing import Final
 
-from .const import KarofiDevicePrefix
+from .const import FILTER_PREFIX, KarofiDevicePrefix, KarofiFilter
 
 MAC_CLEAN_PATTERN: Final = re.compile(r"[^0-9A-Fa-f]")
 MAC_VALID_PATTERN: Final = re.compile(
@@ -137,3 +137,55 @@ def is_karofi_local_name(name: str | None) -> bool:
     if normalized := normalize_local_name(name, case_sensitive=False):
         return any(normalized.startswith(prefix) for prefix in SUPPORTED_LOCAL_NAME_PREFIXES)
     return False
+
+
+FILTER_STAGE_KEYS: Final[tuple[str, ...]] = tuple(stage.value for stage in KarofiFilter)
+
+
+def filter_index_to_key(index: int) -> str:
+    """Convert a 0-based filter index to a standardized stage key.
+
+    Args:
+        index: 0-based index of the filter.
+
+    Returns:
+        Standardized string key for the filter stage (e.g. 'filter_1', 'filter_4').
+    """
+    if 0 <= index < len(FILTER_STAGE_KEYS):
+        return FILTER_STAGE_KEYS[index]
+    return f"{FILTER_PREFIX}{index + 1}"
+
+
+def is_valid_filter_key(key: str) -> bool:
+    """Check if key is a canonical filter stage key (filter_<positive_ascii_int>).
+
+    Args:
+        key: Candidate filter key string.
+
+    Returns:
+        True if valid filter key without leading zeros, False otherwise.
+    """
+    if not key.startswith(FILTER_PREFIX):
+        return False
+    suffix = key.removeprefix(FILTER_PREFIX)
+    return suffix.isascii() and suffix.isdigit() and not suffix.startswith("0")
+
+
+def filter_key_to_index(key: str) -> int:
+    """Convert a stage key to its corresponding 0-based filter index.
+
+    Args:
+        key: Filter stage key (e.g. 'filter_1', 'filter_4').
+
+    Returns:
+        0-based integer index.
+
+    Raises:
+        ValueError: If key is not a recognized filter key or valid stage number.
+    """
+    if not is_valid_filter_key(key):
+        raise ValueError(f"Invalid filter key: {key}")
+    if key in FILTER_STAGE_KEYS:
+        return FILTER_STAGE_KEYS.index(key)
+    suffix = key.removeprefix(FILTER_PREFIX)
+    return int(suffix) - 1

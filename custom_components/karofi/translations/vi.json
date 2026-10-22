@@ -50,68 +50,152 @@
         }
       },
       "filter_1_percent": {
-        "name": "Tuổi thọ lõi 1 (PP 5 micron)"
+        "name": "Tuổi thọ lõi 1"
       },
       "filter_1_days": {
-        "name": "Số ngày còn lại lõi 1 (PP 5 micron)"
+        "name": "Số ngày còn lại lõi 1"
       },
       "filter_2_percent": {
-        "name": "Tuổi thọ lõi 2 (OCB-GAC)"
+        "name": "Tuổi thọ lõi 2"
       },
       "filter_2_days": {
-        "name": "Số ngày còn lại lõi 2 (OCB-GAC)"
+        "name": "Số ngày còn lại lõi 2"
       },
       "filter_3_percent": {
-        "name": "Tuổi thọ lõi 3 (PP 1 micron)"
+        "name": "Tuổi thọ lõi 3"
       },
       "filter_3_days": {
-        "name": "Số ngày còn lại lõi 3 (PP 1 micron)"
+        "name": "Số ngày còn lại lõi 3"
       },
-      "filter_ro_percent": {
-        "name": "Tuổi thọ màng RO Purifim"
+      "filter_4_percent": {
+        "name": "Tuổi thọ lõi 4"
       },
-      "filter_ro_days": {
-        "name": "Số ngày còn lại màng RO Purifim"
+      "filter_4_days": {
+        "name": "Số ngày còn lại lõi 4"
       },
-      "filter_mineral_percent": {
-        "name": "Tuổi thọ lõi khoáng / hydrogen"
+      "filter_5_percent": {
+        "name": "Tuổi thọ lõi 5"
       },
-      "filter_mineral_days": {
-        "name": "Số ngày còn lại lõi khoáng / hydrogen"
+      "filter_5_days": {
+        "name": "Số ngày còn lại lõi 5"
+      },
+      "filter_6_percent": {
+        "name": "Tuổi thọ lõi 6"
+      },
+      "filter_6_days": {
+        "name": "Số ngày còn lại lõi 6"
+      },
+      "filter_7_percent": {
+        "name": "Tuổi thọ lõi 7"
+      },
+      "filter_7_days": {
+        "name": "Số ngày còn lại lõi 7"
+      },
+      "filter_8_percent": {
+        "name": "Tuổi thọ lõi 8"
+      },
+      "filter_8_days": {
+        "name": "Số ngày còn lại lõi 8"
+      },
+      "filter_9_percent": {
+        "name": "Tuổi thọ lõi 9"
+      },
+      "filter_9_days": {
+        "name": "Số ngày còn lại lõi 9"
+      },
+      "filter_10_percent": {
+        "name": "Tuổi thọ lõi 10"
+      },
+      "filter_10_days": {
+        "name": "Số ngày còn lại lõi 10"
+      },
+      "filter_11_percent": {
+        "name": "Tuổi thọ lõi 11"
+      },
+      "filter_11_days": {
+        "name": "Số ngày còn lại lõi 11"
+      },
+      "filter_12_percent": {
+        "name": "Tuổi thọ lõi 12"
+      },
+      "filter_12_days": {
+        "name": "Số ngày còn lại lõi 12"
       }
     },
     "button": {
       "reset_filter_1": {
-        "name": "Đặt lại lõi 1 (PP 5 micron)"
+        "name": "Đặt lại lõi 1"
       },
       "reset_filter_2": {
-        "name": "Đặt lại lõi 2 (OCB-GAC)"
+        "name": "Đặt lại lõi 2"
       },
       "reset_filter_3": {
-        "name": "Đặt lại lõi 3 (PP 1 micron)"
+        "name": "Đặt lại lõi 3"
       },
-      "reset_filter_ro": {
-        "name": "Đặt lại màng RO Purifim"
+      "reset_filter_4": {
+        "name": "Đặt lại lõi 4"
       },
-      "reset_filter_mineral": {
-        "name": "Đặt lại lõi khoáng / hydrogen"
+      "reset_filter_5": {
+        "name": "Đặt lại lõi 5"
+      },
+      "reset_filter_6": {
+        "name": "Đặt lại lõi 6"
+      },
+      "reset_filter_7": {
+        "name": "Đặt lại lõi 7"
+      },
+      "reset_filter_8": {
+        "name": "Đặt lại lõi 8"
+      },
+      "reset_filter_9": {
+        "name": "Đặt lại lõi 9"
+      },
+      "reset_filter_10": {
+        "name": "Đặt lại lõi 10"
+      },
+      "reset_filter_11": {
+        "name": "Đặt lại lõi 11"
+      },
+      "reset_filter_12": {
+        "name": "Đặt lại lõi 12"
       }
     },
     "number": {
       "filter_1_remaining_days": {
-        "name": "Số ngày còn lại lõi 1 (PP 5 micron)"
+        "name": "Số ngày còn lại lõi 1"
       },
       "filter_2_remaining_days": {
-        "name": "Số ngày còn lại lõi 2 (OCB-GAC)"
+        "name": "Số ngày còn lại lõi 2"
       },
       "filter_3_remaining_days": {
-        "name": "Số ngày còn lại lõi 3 (PP 1 micron)"
+        "name": "Số ngày còn lại lõi 3"
       },
-      "filter_ro_remaining_days": {
-        "name": "Số ngày còn lại màng RO Purifim"
+      "filter_4_remaining_days": {
+        "name": "Số ngày còn lại lõi 4"
       },
-      "filter_mineral_remaining_days": {
-        "name": "Số ngày còn lại lõi khoáng / hydrogen"
+      "filter_5_remaining_days": {
+        "name": "Số ngày còn lại lõi 5"
+      },
+      "filter_6_remaining_days": {
+        "name": "Số ngày còn lại lõi 6"
+      },
+      "filter_7_remaining_days": {
+        "name": "Số ngày còn lại lõi 7"
+      },
+      "filter_8_remaining_days": {
+        "name": "Số ngày còn lại lõi 8"
+      },
+      "filter_9_remaining_days": {
+        "name": "Số ngày còn lại lõi 9"
+      },
+      "filter_10_remaining_days": {
+        "name": "Số ngày còn lại lõi 10"
+      },
+      "filter_11_remaining_days": {
+        "name": "Số ngày còn lại lõi 11"
+      },
+      "filter_12_remaining_days": {
+        "name": "Số ngày còn lại lõi 12"
       }
     }
   }

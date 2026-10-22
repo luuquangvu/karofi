@@ -6,16 +6,10 @@ from homeassistant.const import PERCENTAGE, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import (
-    DOMAIN,
-    FILTER_LIFETIME_DAYS,
-    UNIT_PPM,
-    KarofiFilter,
-    KarofiIcon,
-    WaterQuality,
-)
+from .const import DOMAIN, UNIT_PPM, KarofiFilter, KarofiIcon, WaterQuality
 from .coordinator import KarofiDataCoordinator
 from .entity import KarofiBaseEntity
+from .util import FILTER_STAGE_KEYS, filter_key_to_index
 
 
 async def async_setup_entry(
@@ -37,11 +31,35 @@ async def async_setup_entry(
         KarofiQualitySensor(coordinator, entry),
     ]
 
-    for filter_stage, days in FILTER_LIFETIME_DAYS.items():
-        entities.append(KarofiFilterPercentSensor(coordinator, entry, filter_stage, days))
-        entities.append(KarofiFilterDaysRemainingSensor(coordinator, entry, filter_stage, days))
+    known_keys: set[str] = set()
+
+    # Generate filter sensors during initialization ONLY if data is found; otherwise hide them
+    for filter_key in coordinator.get_known_filter_keys():
+        known_keys.add(filter_key)
+        max_days = coordinator.get_filter_lifetime_days(filter_key)
+        entities.append(KarofiFilterPercentSensor(coordinator, entry, filter_key, max_days))
+        entities.append(KarofiFilterDaysRemainingSensor(coordinator, entry, filter_key, max_days))
 
     async_add_entities(entities)
+
+    @callback
+    def _async_check_and_add_filter_sensors() -> None:
+        """Check for newly discovered filters and register sensor entities."""
+        new_keys = [k for k in coordinator.get_known_filter_keys() if k not in known_keys]
+        if not new_keys:
+            return
+        new_entities: list[SensorEntity] = []
+        for filter_key in new_keys:
+            known_keys.add(filter_key)
+            max_days = coordinator.get_filter_lifetime_days(filter_key)
+            new_entities.append(KarofiFilterPercentSensor(coordinator, entry, filter_key, max_days))
+            new_entities.append(
+                KarofiFilterDaysRemainingSensor(coordinator, entry, filter_key, max_days)
+            )
+        if new_entities:
+            async_add_entities(new_entities)
+
+    entry.async_on_unload(coordinator.async_add_listener(_async_check_and_add_filter_sensors))
 
 
 class KarofiTDSSensor(KarofiBaseEntity, SensorEntity):
@@ -135,7 +153,13 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
             filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
         )
         self.max_days = max_days
-        self._attr_translation_key = f"{self.filter_key}_percent"
+        if custom_name := self.coordinator.get_filter_name(self.filter_key):
+            self._attr_name = f"{custom_name} life"
+        elif self.filter_key in FILTER_STAGE_KEYS:
+            self._attr_translation_key = f"{self.filter_key}_percent"
+        else:
+            idx = filter_key_to_index(self.filter_key)
+            self._attr_name = f"Filter {idx + 1} life"
         self._attr_unique_id = f"{self._mac}_{self.filter_key}_pct"
         self._attr_native_value = self._calculate_percent()
 
@@ -150,6 +174,10 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
+        if custom_name := self.coordinator.get_filter_name(self.filter_key):
+            self._attr_name = f"{custom_name} life"
+            self._attr_translation_key = None
+        self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
         self._attr_native_value = self._calculate_percent()
         super()._handle_coordinator_update()
 
@@ -181,7 +209,13 @@ class KarofiFilterDaysRemainingSensor(KarofiBaseEntity, SensorEntity):
             filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
         )
         self.max_days = max_days
-        self._attr_translation_key = f"{self.filter_key}_days"
+        if custom_name := self.coordinator.get_filter_name(self.filter_key):
+            self._attr_name = f"{custom_name} days remaining"
+        elif self.filter_key in FILTER_STAGE_KEYS:
+            self._attr_translation_key = f"{self.filter_key}_days"
+        else:
+            idx = filter_key_to_index(self.filter_key)
+            self._attr_name = f"Filter {idx + 1} days remaining"
         self._attr_unique_id = f"{self._mac}_{self.filter_key}_days"
         self._attr_native_value = self._calculate_days()
 
@@ -196,5 +230,9 @@ class KarofiFilterDaysRemainingSensor(KarofiBaseEntity, SensorEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
+        if custom_name := self.coordinator.get_filter_name(self.filter_key):
+            self._attr_name = f"{custom_name} days remaining"
+            self._attr_translation_key = None
+        self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
         self._attr_native_value = self._calculate_days()
         super()._handle_coordinator_update()

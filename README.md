@@ -2,7 +2,7 @@
 
 **🇺🇸 English | [🇻🇳 Tiếng Việt](README.vi.md)**
 
-**Karofi Water Purifier** provides local Bluetooth Low Energy (BLE) integration for Karofi smart water purifiers in Home Assistant. Monitor purified water Total Dissolved Solids (TDS), track drinking water quality ratings, manage 5-stage filter lifespans in both percentage and remaining days, and adjust or reset maintenance schedules directly from your Home Assistant dashboard with zero cloud dependence.
+**Karofi Water Purifier** provides local Bluetooth Low Energy (BLE) integration for Karofi smart water purifiers in Home Assistant. Monitor purified water Total Dissolved Solids (TDS), track drinking water quality ratings, manage multi-stage filter lifespans (5 to 12+ stages) in both percentage and remaining days, and adjust or reset maintenance schedules directly from your Home Assistant dashboard with zero cloud dependence.
 
 ---
 
@@ -34,12 +34,9 @@
   - **Fair** (50-150 ppm): Acceptable drinking water; monitor for gradual increases.
   - **Poor** (> 150 ppm): Water purity compromised; inspection or cartridge replacement recommended.
   - **Unknown**: Waiting for telemetry or sensor unavailable.
-- **Complete 5-Stage Filter Cartridge Tracking**:
-  - **Filter 1 (PP 5 micron)**: 180 days (6 months) rated lifespan.
-  - **Filter 2 (OCB-GAC)**: 270 days (9 months) rated lifespan.
-  - **Filter 3 (PP 1 micron)**: 270 days (9 months) rated lifespan.
-  - **Filter RO (RO Purifim membrane)**: 730 days (24 months) rated lifespan.
-  - **Filter Mineral (Mineral / hydrogen)**: 365 days (12 months) rated lifespan.
+- **Dynamic Multi-Stage Filter Tracking (5, 7, 8, 9, 10, 11, 12+ filters)**:
+  - Dynamically discovers and tracks filter cartridges from device telemetry.
+  - Simple, clean naming (`Filter 1`, `Filter 2`, `Filter 3`, etc.) that adapts dynamically to your actual model without misleading hardcoded cartridge types.
 - **Dual Lifespan Indicators**: Every filter stage provides both a remaining percentage sensor (0% to 100%) and a remaining days sensor for intuitive dashboard cards and automations.
 - **Interactive Maintenance Controls**:
   - **One-Click Reset Buttons**: Press the reset button in Home Assistant when replacing a physical cartridge to refresh the installation date to today.
@@ -63,23 +60,15 @@ This integration is designed for Karofi smart water purifiers equipped with Maki
 
 ## Entities Provided
 
-| Platform          | Entity ID                                  | Device Class / Unit | Description                                                 |
-| :---------------- | :----------------------------------------- | :------------------ | :---------------------------------------------------------- |
-| **Sensor**        | `sensor.<mac>_tds`                         | `ppm`               | Real-time pure water TDS concentration.                     |
-| **Sensor**        | `sensor.<mac>_quality`                     | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).   |
-| **Sensor**        | `sensor.<mac>_filter_1_percent`            | `%`                 | Filter 1 (PP 5 micron) remaining life percentage.           |
-| **Sensor**        | `sensor.<mac>_filter_1_days`               | `days`              | Filter 1 remaining days until replacement.                  |
-| **Sensor**        | `sensor.<mac>_filter_2_percent`            | `%`                 | Filter 2 (OCB-GAC) remaining life percentage.               |
-| **Sensor**        | `sensor.<mac>_filter_2_days`               | `days`              | Filter 2 remaining days until replacement.                  |
-| **Sensor**        | `sensor.<mac>_filter_3_percent`            | `%`                 | Filter 3 (PP 1 micron) remaining life percentage.           |
-| **Sensor**        | `sensor.<mac>_filter_3_days`               | `days`              | Filter 3 remaining days until replacement.                  |
-| **Sensor**        | `sensor.<mac>_filter_ro_percent`           | `%`                 | RO Purifim membrane remaining life percentage.              |
-| **Sensor**        | `sensor.<mac>_filter_ro_days`              | `days`              | RO Purifim membrane remaining days until replacement.       |
-| **Sensor**        | `sensor.<mac>_filter_mineral_percent`      | `%`                 | Mineral / hydrogen filter remaining life percentage.        |
-| **Sensor**        | `sensor.<mac>_filter_mineral_days`         | `days`              | Mineral / hydrogen filter remaining days until replacement. |
-| **Binary Sensor** | `binary_sensor.<mac>_connectivity`         | `connectivity`      | Bluetooth connection status with the purifier.              |
-| **Number**        | `number.<mac>_num_<filter>_remaining_days` | `duration` (`days`) | Configuration slider to adjust remaining filter lifespan.   |
-| **Button**        | `button.<mac>_btn_reset_<filter>`          | `restore`           | Reset the installation date for the specified filter stage. |
+| Platform          | Entity ID                                    | Device Class / Unit | Description                                                 |
+| :---------------- | :------------------------------------------- | :------------------ | :---------------------------------------------------------- |
+| **Sensor**        | `sensor.<mac>_tds`                           | `ppm`               | Real-time pure water TDS concentration.                     |
+| **Sensor**        | `sensor.<mac>_quality`                       | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).   |
+| **Sensor**        | `sensor.<mac>_filter_<n>_percent`            | `%`                 | Filter `<n>` remaining life percentage (dynamically added). |
+| **Sensor**        | `sensor.<mac>_filter_<n>_days`               | `days`              | Filter `<n>` remaining days until replacement.              |
+| **Binary Sensor** | `binary_sensor.<mac>_connectivity`           | `connectivity`      | Bluetooth connection status with the purifier.              |
+| **Number**        | `number.<mac>_num_filter_<n>_remaining_days` | `duration` (`days`) | Configuration slider to adjust remaining filter lifespan.   |
+| **Button**        | `button.<mac>_btn_reset_filter_<n>`          | `restore`           | Reset the installation date for the specified filter stage. |
 
 ---
 
@@ -124,7 +113,7 @@ $$\text{Remaining Percent} = \max\left(0, \min\left(100, \text{round}\left(\frac
 ### When Replacing a Filter Cartridge
 
 1. Navigate to the Karofi device page in **Settings** > **Devices & Services** > **Karofi**.
-2. Under the **Buttons** section, click **Press** on the corresponding reset button (e.g., `Reset filter 1 (PP 5 micron)`).
+2. Under the **Buttons** section, click **Press** on the corresponding reset button (e.g., `Reset filter 1`).
 3. The installation date is reset to current UTC time, immediately setting the remaining days to 100% of its rated lifespan.
 
 ### When Synchronizing Existing Filters
@@ -135,26 +124,44 @@ If you recently installed cartridges before setting up this integration, use the
 
 ## Automation Example
 
-Receive a mobile notification when the drinking water TDS indicates poor quality, or when any filter cartridge has less than 15 days remaining:
+Receive a mobile notification when the drinking water TDS indicates poor quality, or dynamically monitor all discovered filter cartridges and alert when any filter has less than 15 days remaining:
 
 ```yaml
 automation:
   - id: karofi_filter_replacement_alert
     alias: "Karofi: Filter Replacement Needed"
+    # Runs daily to check if any discovered filter stage (5 to 12+) has less than 15 days remaining
     trigger:
-      - platform: numeric_state
-        entity_id:
-          - sensor.karofi_water_purifier_filter_1_days_remaining
-          - sensor.karofi_water_purifier_filter_2_days_remaining
-          - sensor.karofi_water_purifier_filter_3_days_remaining
-          - sensor.karofi_water_purifier_ro_purifim_membrane_days_remaining
-          - sensor.karofi_water_purifier_mineral_hydrogen_filter_days_remaining
-        below: 15
+      - platform: time
+        at: "09:00:00"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ integration_entities('karofi')
+            | select('match', '^sensor\.')
+            | select('search', '_days$')
+            | expand
+            | selectattr('state', 'is_number')
+            | map(attribute='state')
+            | map('int')
+            | select('lt', 15)
+            | list | count > 0 }}
     action:
       - action: notify.notify
         data:
           title: "Water Filter Replacement Reminder"
-          message: "{{ state_attr(trigger.entity_id, 'friendly_name') }} has only {{ trigger.to_state.state }} days remaining. Please prepare a replacement cartridge."
+          message: >-
+            The following filter cartridge(s) need replacement soon:
+            {% for item in integration_entities('karofi')
+               | select('match', '^sensor\.')
+               | select('search', '_days$')
+               | expand
+               | selectattr('state', 'is_number') %}
+              {% if item.state | int < 15 %}
+              - {{ item.name }}: {{ item.state }} days remaining
+              {% endif %}
+            {% endfor %}
+            Please prepare replacement cartridges.
 
   - id: karofi_high_tds_alert
     alias: "Karofi: High TDS Alert"
