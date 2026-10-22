@@ -1176,12 +1176,18 @@ async def test_coordinator_scan_data_characteristics_success(
         "0000ac02-0000-1000-8000-00805f9b34fb", ["read", "write", "notify"]
     )
     char_tds = _mock_characteristic("0000ac03-0000-1000-8000-00805f9b34fb", ["read", "notify"])
+    char_filter_lifetime = _mock_characteristic(
+        "0000ac04-0000-1000-8000-00805f9b34fb", ["read", "notify"]
+    )
+    char_filter_remaining = _mock_characteristic(
+        "0000ac05-0000-1000-8000-00805f9b34fb", ["read", "notify"]
+    )
 
     mock_service = MagicMock()
-    mock_service.characteristics = [char_cmd, char_tds]
+    mock_service.characteristics = [char_cmd, char_tds, char_filter_lifetime, char_filter_remaining]
     mock_services.get_service.return_value = mock_service
-    mock_services.get_characteristic.side_effect = lambda u: (
-        char_cmd if "ac02" in str(u) else (char_tds if "ac03" in str(u) else None)
+    mock_services.get_characteristic.side_effect = lambda u: next(
+        (char for char in mock_service.characteristics if char.uuid == str(u)), None
     )
 
     async def _mock_read(target: object) -> bytes:
@@ -1196,7 +1202,13 @@ async def test_coordinator_scan_data_characteristics_success(
         target_uuid = getattr(target, "uuid", str(target))
         if "ac02" in target_uuid:
             return bytes.fromhex("017b226574223a224e50227d04")
-        return b'{"pc":"iro_tds","d":42}' if "ac03" in target_uuid else b""
+        if "ac03" in target_uuid:
+            return b'{"pc":"iro_tds","d":42}'
+        if "ac04" in target_uuid:
+            return b'{"pc":"iro_lTime","d":[4320,8640]}'
+        if "ac05" in target_uuid:
+            return b'{"pc":"iro_rtr","d":[2160,4320]}'
+        return b""
 
     mock_client.read_gatt_char.side_effect = _mock_read
     mock_client.write_gatt_char.return_value = None
@@ -1207,6 +1219,264 @@ async def test_coordinator_scan_data_characteristics_success(
 
     assert coordinator._parse_tds_reading(result) == 42
     assert coordinator._known_tds_char_uuid == "0000ac03-0000-1000-8000-00805f9b34fb"
+    coordinator._process_tds_payload(result)
+    assert coordinator.get_known_filter_keys() == ["filter_1", "filter_2"]
+    assert coordinator.get_filter_lifetime_days("filter_1") == 180
+    assert coordinator.get_filter_remaining_days("filter_1") == 90
+
+
+async def test_coordinator_direct_tds_read_still_collects_filter_telemetry(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test a successful direct TDS read does not skip filter telemetry polling.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    tds_payload = bytearray(b'{"pc":"iro_tds","d":9}')
+    filter_payload = bytearray(b'{"pc":"iro_rtr","d":[1200]}')
+    read_char = _mock_characteristic("0000ac0a-0000-1000-8000-00805f9b34fb", ["read"])
+    notify_char = _mock_characteristic("0000ac02-0000-1000-8000-00805f9b34fb", ["notify"])
+    mock_client = AsyncMock()
+    send_read_request = AsyncMock()
+    scan_characteristics = AsyncMock(return_value=(filter_payload, bytearray()))
+
+    with (
+        patch.object(
+            coordinator,
+            "_resolve_io_targets",
+            return_value=(read_char, notify_char, notify_char, read_char, True),
+        ),
+        patch.object(
+            coordinator,
+            "_try_direct_read",
+            AsyncMock(return_value=(tds_payload, tds_payload)),
+        ),
+        patch.object(coordinator, "_send_read_request", send_read_request),
+        patch.object(coordinator, "_scan_candidate_data_chars", scan_characteristics),
+    ):
+        result = await coordinator._read_tds_characteristic(mock_client)
+
+    assert coordinator._parse_tds_reading(result) == 9
+    assert [payload["pc"] for payload in coordinator._extract_all_payload_dicts(result)] == [
+        "iro_tds",
+        "iro_rtr",
+    ]
+    send_read_request.assert_awaited_once_with(mock_client, notify_char, notify_char)
+    scan_args = scan_characteristics.await_args
+    assert scan_args is not None
+    assert scan_args.args == (mock_client, read_char, tds_payload)
+    assert isinstance(scan_args.kwargs["timeout_at"], float)
+
+
+async def test_coordinator_direct_tds_survives_supplemental_poll_timeout(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test supplemental telemetry timeout does not discard a direct TDS reading.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    tds_payload = bytearray(b'{"pc":"iro_tds","d":9}')
+    read_char = _mock_characteristic("0000ac0a-0000-1000-8000-00805f9b34fb", ["read"])
+    notify_char = _mock_characteristic("0000ac02-0000-1000-8000-00805f9b34fb", ["notify"])
+    mock_client = AsyncMock()
+    scan_characteristics = AsyncMock()
+
+    with (
+        patch.object(
+            coordinator,
+            "_resolve_io_targets",
+            return_value=(read_char, notify_char, notify_char, read_char, True),
+        ),
+        patch.object(
+            coordinator,
+            "_try_direct_read",
+            AsyncMock(return_value=(tds_payload, tds_payload)),
+        ),
+        patch.object(
+            coordinator,
+            "_send_read_request",
+            AsyncMock(side_effect=TimeoutError),
+        ),
+        patch.object(coordinator, "_scan_candidate_data_chars", scan_characteristics),
+    ):
+        result = await coordinator._read_tds_characteristic(mock_client)
+
+    assert result == tds_payload
+    scan_characteristics.assert_not_awaited()
+
+
+async def test_coordinator_skips_supplemental_poll_near_ble_deadline(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test little remaining BLE time skips supplemental polling after direct TDS.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    tds_payload = bytearray(b'{"pc":"iro_tds","d":9}')
+    read_char = _mock_characteristic("0000ac0a-0000-1000-8000-00805f9b34fb", ["read"])
+    notify_char = _mock_characteristic("0000ac02-0000-1000-8000-00805f9b34fb", ["notify"])
+    mock_client = AsyncMock()
+    send_read_request = AsyncMock()
+    scan_characteristics = AsyncMock()
+    deadline = asyncio.get_running_loop().time() + 1
+
+    with (
+        patch.object(
+            coordinator,
+            "_resolve_io_targets",
+            return_value=(read_char, notify_char, notify_char, read_char, True),
+        ),
+        patch.object(
+            coordinator,
+            "_try_direct_read",
+            AsyncMock(return_value=(tds_payload, tds_payload)),
+        ),
+        patch.object(coordinator, "_send_read_request", send_read_request),
+        patch.object(coordinator, "_scan_candidate_data_chars", scan_characteristics),
+    ):
+        result = await coordinator._read_tds_characteristic(mock_client, deadline=deadline)
+
+    assert result == tds_payload
+    send_read_request.assert_not_awaited()
+    scan_characteristics.assert_not_awaited()
+
+
+async def test_coordinator_characteristic_scan_timeout_returns_partial_telemetry(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test characteristic scan timeout retains telemetry read before expiration.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    first_char = _mock_characteristic("0000ac03-0000-1000-8000-00805f9b34fb", ["read"])
+    second_char = _mock_characteristic("0000ac04-0000-1000-8000-00805f9b34fb", ["read"])
+    mock_client = MagicMock()
+    mock_services = MagicMock(spec=BleakGATTServiceCollection)
+    mock_client.services = mock_services
+    mock_service = MagicMock()
+    mock_service.characteristics = [first_char, second_char]
+    mock_services.get_service.return_value = mock_service
+    filter_payload = bytearray(b'{"pc":"iro_rtr","d":[1200]}')
+
+    async def _read_characteristic(
+        _client: object, characteristic: BleakGATTCharacteristic
+    ) -> bytearray:
+        """Return filter data once, then wait long enough to trigger scan timeout."""
+        if characteristic == first_char:
+            return filter_payload
+        await asyncio.sleep(1)
+        return bytearray()
+
+    with patch.object(
+        coordinator,
+        "_read_characteristic_safe",
+        side_effect=_read_characteristic,
+    ):
+        telemetry, _ = await coordinator._scan_candidate_data_chars(
+            mock_client, None, bytearray(), timeout_at=asyncio.get_running_loop().time() + 0.02
+        )
+
+    assert telemetry == filter_payload
+
+
+async def test_coordinator_filter_telemetry_uses_follow_up_tds(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test filter-only telemetry is retained when follow-up reading finds TDS.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    filter_payload = bytearray(b'{"pc":"iro_rtr","d":[1200]}')
+    tds_payload = bytearray(b'{"pc":"iro_tds","d":9}')
+    read_char = _mock_characteristic("0000ac0a-0000-1000-8000-00805f9b34fb", ["read"])
+    notify_char = _mock_characteristic("0000ac02-0000-1000-8000-00805f9b34fb", ["notify"])
+    mock_client = AsyncMock()
+    follow_up_read = AsyncMock(return_value=(tds_payload, bytearray()))
+
+    with (
+        patch.object(
+            coordinator,
+            "_resolve_io_targets",
+            return_value=(read_char, notify_char, notify_char, read_char, True),
+        ),
+        patch.object(
+            coordinator,
+            "_try_direct_read",
+            AsyncMock(return_value=(None, bytearray())),
+        ),
+        patch.object(
+            coordinator,
+            "_try_active_polling",
+            AsyncMock(return_value=(None, filter_payload)),
+        ),
+        patch.object(
+            coordinator,
+            "_scan_candidate_data_chars",
+            AsyncMock(return_value=(None, bytearray())),
+        ),
+        patch.object(coordinator, "_try_follow_up_read", follow_up_read),
+    ):
+        result = await coordinator._read_tds_characteristic(mock_client)
+
+    assert [payload["pc"] for payload in coordinator._extract_all_payload_dicts(result)] == [
+        "iro_tds",
+        "iro_rtr",
+    ]
+    follow_up_read.assert_awaited_once_with(
+        mock_client, read_char, True, bytearray(), timeout_at=None
+    )
+
+
+async def test_coordinator_active_polling_tds_precedes_candidate_tds(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Keep active-polling TDS first while retaining candidate telemetry."""
+    polling_payload = bytearray(b'{"pc":"iro_tds","d":9}')
+    candidate_payload = bytearray(b'{"pc":"iro_tds","d":42}')
+    read_char = _mock_characteristic("0000ac0a-0000-1000-8000-00805f9b34fb", ["read"])
+    notify_char = _mock_characteristic("0000ac02-0000-1000-8000-00805f9b34fb", ["notify"])
+    mock_client = AsyncMock()
+
+    with (
+        patch.object(
+            coordinator,
+            "_resolve_io_targets",
+            return_value=(read_char, notify_char, notify_char, read_char, True),
+        ),
+        patch.object(coordinator, "_try_direct_read", AsyncMock(return_value=(None, bytearray()))),
+        patch.object(
+            coordinator,
+            "_try_active_polling",
+            AsyncMock(return_value=(polling_payload, polling_payload)),
+        ),
+        patch.object(
+            coordinator,
+            "_scan_candidate_data_chars",
+            AsyncMock(return_value=(candidate_payload, bytearray())),
+        ) as scan_characteristics,
+    ):
+        result = await coordinator._read_tds_characteristic(mock_client)
+
+    assert coordinator._parse_tds_reading(result) == 9
+    assert [payload["d"] for payload in coordinator._extract_all_payload_dicts(result)] == [9, 42]
+    scan_characteristics.assert_awaited_once_with(
+        mock_client, read_char, bytearray(), timeout_at=None
+    )
+
+
+def test_coordinator_process_invalid_then_valid_tds_frame(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Continue past invalid TDS frames and store the first valid reading."""
+    coordinator._process_tds_payload(b'{"pc":"iro_tds","d":65535}\n{"pc":"iro_tds","d":27}')
+
+    assert coordinator.data.tds == 27
+    assert coordinator.data.quality == WaterQuality.GOOD
 
 
 async def test_coordinator_notify_id_resolves_service_characteristic(
@@ -1475,6 +1745,22 @@ def test_coordinator_process_tds_payload_dynamic_filters_and_names(
     assert coordinator.get_filter_name("filter_7") == "Nano Silver"
     assert coordinator.get_filter_remaining_days("filter_2") == 100  # 2400 hours // 24 = 100 days
     assert coordinator.get_filter_lifetime_days("filter_2") == 360  # 8640 hours // 24 = 360 days
+
+
+def test_coordinator_process_payloads_preserves_first_tds_reading(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test later conflicting TDS frames do not replace the prioritized value.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"d":12}\n{"pc":"iro_tds","d":9}\n{"pc":"iro_tds","d":99}\n{"pc":"iro_rtr","d":[1200]}'
+    )
+
+    assert coordinator.data.tds == 9
+    assert coordinator.data.filters["filter_1"].remaining_days == 50
 
 
 async def test_coordinator_async_send_reset_command_ble(
