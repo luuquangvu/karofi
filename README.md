@@ -60,15 +60,15 @@ This integration is designed for Karofi smart water purifiers equipped with Maki
 
 ## Entities Provided
 
-| Platform          | Entity ID                                    | Device Class / Unit | Description                                                 |
-| :---------------- | :------------------------------------------- | :------------------ | :---------------------------------------------------------- |
-| **Sensor**        | `sensor.<mac>_tds`                           | `ppm`               | Real-time pure water TDS concentration.                     |
-| **Sensor**        | `sensor.<mac>_quality`                       | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).   |
-| **Sensor**        | `sensor.<mac>_filter_<n>_percent`            | `%`                 | Filter `<n>` remaining life percentage (dynamically added). |
-| **Sensor**        | `sensor.<mac>_filter_<n>_days`               | `days`              | Filter `<n>` remaining days until replacement.              |
-| **Binary Sensor** | `binary_sensor.<mac>_connectivity`           | `connectivity`      | Bluetooth connection status with the purifier.              |
-| **Number**        | `number.<mac>_num_filter_<n>_remaining_days` | `duration` (`days`) | Configuration slider to adjust remaining filter lifespan.   |
-| **Button**        | `button.<mac>_btn_reset_filter_<n>`          | `restore`           | Reset the installation date for the specified filter stage. |
+| Platform          | Entity ID                                    | Device Class / Unit | Description                                                                     |
+| :---------------- | :------------------------------------------- | :------------------ | :------------------------------------------------------------------------------ |
+| **Sensor**        | `sensor.<mac>_tds`                           | `ppm`               | Real-time pure water TDS concentration.                                         |
+| **Sensor**        | `sensor.<mac>_quality`                       | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).                       |
+| **Sensor**        | `sensor.<mac>_filter_<n>_percent`            | `%`                 | Filter `<n>` remaining life percentage (dynamically added).                     |
+| **Sensor**        | `<mac>_filter_<n>_days` (unique ID)          | `days`              | Filter `<n>` remaining days until replacement; `_days` is the unique-ID suffix. |
+| **Binary Sensor** | `binary_sensor.<mac>_connectivity`           | `connectivity`      | Bluetooth connection status with the purifier.                                  |
+| **Number**        | `number.<mac>_num_filter_<n>_remaining_days` | `duration` (`days`) | Configuration slider to adjust remaining filter lifespan.                       |
+| **Button**        | `button.<mac>_btn_reset_filter_<n>`          | `restore`           | Reset the installation date for the specified filter stage.                     |
 
 ---
 
@@ -139,8 +139,8 @@ automation:
         value_template: >-
           {{ integration_entities('karofi')
             | select('match', '^sensor\.')
-            | select('search', '_days$')
             | expand
+            | selectattr('attributes.unit_of_measurement', 'eq', 'd')
             | selectattr('state', 'is_number')
             | map(attribute='state')
             | map('int')
@@ -154,8 +154,8 @@ automation:
             The following filter cartridge(s) need replacement soon:
             {% for item in integration_entities('karofi')
                | select('match', '^sensor\.')
-               | select('search', '_days$')
                | expand
+               | selectattr('attributes.unit_of_measurement', 'eq', 'd')
                | selectattr('state', 'is_number') %}
               {% if item.state | int < 15 %}
               - {{ item.name }}: {{ item.state }} days remaining

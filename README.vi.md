@@ -60,15 +60,15 @@ Tiện ích này tương thích với các dòng máy lọc nước thông minh 
 
 ## Danh sách thực thể (Entities)
 
-| Nền tảng (Platform) | Mã thực thể (Entity ID)                      | Đơn vị / Kiểu  | Mô tả                                                         |
-| :------------------ | :------------------------------------------- | :------------- | :------------------------------------------------------------ |
-| **Sensor**          | `sensor.<mac>_tds`                           | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.               |
-| **Sensor**          | `sensor.<mac>_quality`                       | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`). |
-| **Sensor**          | `sensor.<mac>_filter_<n>_percent`            | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).     |
-| **Sensor**          | `sensor.<mac>_filter_<n>_days`               | `ngày`         | Số ngày còn lại đến hạn thay Lõi `<n>`.                       |
-| **Binary Sensor**   | `binary_sensor.<mac>_connectivity`           | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước.                |
-| **Number**          | `number.<mac>_num_filter_<n>_remaining_days` | `ngày`         | Thanh trượt điều chỉnh số ngày sử dụng còn lại của lõi lọc.   |
-| **Button**          | `button.<mac>_btn_reset_filter_<n>`          | `restore`      | Nút đặt lại ngày bắt đầu sử dụng cho cấp lõi lọc tương ứng.   |
+| Nền tảng (Platform) | Mã thực thể (Entity ID)                      | Đơn vị / Kiểu  | Mô tả                                                                    |
+| :------------------ | :------------------------------------------- | :------------- | :----------------------------------------------------------------------- |
+| **Sensor**          | `sensor.<mac>_tds`                           | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                          |
+| **Sensor**          | `sensor.<mac>_quality`                       | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).            |
+| **Sensor**          | `sensor.<mac>_filter_<n>_percent`            | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).                |
+| **Sensor**          | `<mac>_filter_<n>_days` (unique ID)          | `ngày`         | Số ngày còn lại đến hạn thay Lõi `<n>`; `_days` là hậu tố của unique ID. |
+| **Binary Sensor**   | `binary_sensor.<mac>_connectivity`           | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước.                           |
+| **Number**          | `number.<mac>_num_filter_<n>_remaining_days` | `ngày`         | Thanh trượt điều chỉnh số ngày sử dụng còn lại của lõi lọc.              |
+| **Button**          | `button.<mac>_btn_reset_filter_<n>`          | `restore`      | Nút đặt lại ngày bắt đầu sử dụng cho cấp lõi lọc tương ứng.              |
 
 ---
 
@@ -139,8 +139,8 @@ automation:
         value_template: >-
           {{ integration_entities('karofi')
             | select('match', '^sensor\.')
-            | select('search', '_days$')
             | expand
+            | selectattr('attributes.unit_of_measurement', 'eq', 'd')
             | selectattr('state', 'is_number')
             | map(attribute='state')
             | map('int')
@@ -154,8 +154,8 @@ automation:
             Các lõi lọc sau đây sắp hết hạn sử dụng (dưới 15 ngày):
             {% for item in integration_entities('karofi')
                | select('match', '^sensor\.')
-               | select('search', '_days$')
                | expand
+               | selectattr('attributes.unit_of_measurement', 'eq', 'd')
                | selectattr('state', 'is_number') %}
               {% if item.state | int < 15 %}
               - {{ item.name }}: chỉ còn {{ item.state }} ngày
