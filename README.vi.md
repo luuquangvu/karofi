@@ -100,6 +100,9 @@ Tiện ích này tương thích với các dòng máy lọc nước thông minh 
 4. Chọn máy lọc nước của bạn từ danh sách thiết bị tìm thấy, hoặc chọn **"Nhập địa chỉ MAC thủ công..."** để điền địa chỉ MAC Bluetooth (ví dụ: `AA:BB:CC:11:22:33`).
 5. Xác nhận thiết lập. Các thực thể tương ứng sẽ được tự động tạo và gán vào thiết bị.
 
+> [!NOTE]
+> Sau khi thiết lập, dữ liệu lõi lọc có thể cần vài lần quét nền để ổn định. Số liệu ban đầu có thể chưa đầy đủ hoặc chưa chính xác trong khi các cấp lõi lọc và trạng thái thiết bị đang được phát hiện; hãy đợi vài phút để các giá trị cập nhật.
+
 ---
 
 ## Quản lý vòng đời lõi lọc
