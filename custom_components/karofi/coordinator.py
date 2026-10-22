@@ -114,6 +114,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             errors=[],
         )
         self._known_tds_char_uuid: str | None = None
+        self._telemetry_generation = 0
+        self._filter_local_override_generation: dict[str, int] = {}
         self._mac_candidates: tuple[str, str] = (
             normalize_mac(mac_address, uppercase=True),
             normalize_mac(mac_address, uppercase=False),
@@ -426,6 +428,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """
         iso_str = dt_util.as_utc(dt).isoformat()
         self.data.filter_reset_dates[filter_key] = iso_str
+        self._filter_local_override_generation[filter_key] = self._telemetry_generation
         lifetime = self.get_filter_lifetime_days(filter_key)
         used_days = (dt_util.utcnow() - dt_util.as_utc(dt)).days
         rem_days = max(0, min(lifetime, lifetime - max(0, used_days)))
@@ -761,6 +764,25 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         services = getattr(client, "services", None)
         if not isinstance(services, BleakGATTServiceCollection):
             return None
+
+        command_service = services.get_service(
+            KarofiCharacteristic.COMMAND_SERVICE
+        ) or services.get_service(KarofiShortUUID.COMMAND_SERVICE)
+        if command_service is not None:
+            command_char = next(
+                (
+                    char
+                    for char in command_service.characteristics
+                    if char.uuid.lower() == KarofiCharacteristic.COMMAND.lower()
+                    and (
+                        GattProperty.WRITE in char.properties
+                        or GattProperty.WRITE_WITHOUT_RESPONSE in char.properties
+                    )
+                ),
+                None,
+            )
+            if command_char is not None:
+                return command_char
 
         return self._find_char_by_property(
             services,
@@ -1491,7 +1513,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     timeout_at=supplemental_deadline,
                     update_tds_uuid=False,
                 )
-            except (BleakError, OSError, TimeoutError) as err:
+            except (BleakError, OSError) as err:
                 _LOGGER.debug(
                     "Supplemental filter telemetry read failed for %s; keeping direct TDS: %s",
                     self.masked_mac,
@@ -1952,6 +1974,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         ltime_h: int | None,
         rtt_h: int | None,
         name: str | None = None,
+        *,
+        telemetry_generation: int | None = None,
     ) -> None:
         """Update telemetry, lifetime, and optional name for a single filter stage.
 
@@ -1961,24 +1985,37 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             ltime_h: Lifetime hours or None.
             rtt_h: Total run hours or None.
             name: Optional dynamic filter name from device payload.
+            telemetry_generation: Poll generation associated with this telemetry.
         """
         key = filter_index_to_key(idx)
         fdata = self.data.filters.setdefault(key, KarofiFilterData(index=idx, key=key))
         if name:
             fdata.name = name
 
-        if rtr_h is not None:
+        override_generation = self._filter_local_override_generation.get(key)
+        is_stale_override_response = (
+            override_generation is not None
+            and telemetry_generation is not None
+            and telemetry_generation <= override_generation
+        )
+        if rtr_h is not None and not is_stale_override_response:
             fdata.remaining_hours = rtr_h
             fdata.remaining_days = max(0, round(rtr_h / 24.0))
             fdata.telemetry_synced = True
+            if override_generation is not None:
+                self._filter_local_override_generation.pop(key, None)
 
-        if ltime_h is not None:
+        if ltime_h is not None and not is_stale_override_response:
             fdata.lifetime_hours = ltime_h
             fdata.lifetime_days = max(1, round(ltime_h / 24.0))
         elif fdata.lifetime_days is None:
             fdata.lifetime_days = self.get_filter_lifetime_days(key)
 
-        if fdata.remaining_days is not None and fdata.lifetime_days:
+        if (
+            not is_stale_override_response
+            and fdata.remaining_days is not None
+            and fdata.lifetime_days
+        ):
             fdata.percent = max(
                 0, min(100, round((fdata.remaining_days / fdata.lifetime_days) * 100))
             )
@@ -2028,11 +2065,16 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return lst[idx]
         return None
 
-    def _process_filter_stages_from_payload(self, payload: dict[str, object]) -> bool:
+    def _process_filter_stages_from_payload(
+        self,
+        payload: dict[str, object],
+        telemetry_generation: int | None = None,
+    ) -> bool:
         """Process filter telemetry (rtr, lTime, rtt) and names from payload dictionary.
 
         Args:
             payload: Parsed JSON payload dictionary.
+            telemetry_generation: Poll generation associated with this payload.
 
         Returns:
             True if filter telemetry was found and processed, False otherwise.
@@ -2072,6 +2114,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 self._get_list_element(ltime_list, idx),
                 self._get_list_element(rtt_list, idx),
                 self._get_list_element(names_list, idx),
+                telemetry_generation=telemetry_generation,
             )
 
         return True
@@ -2109,13 +2152,17 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         return bool(raw_bytes and (b"{" in raw_bytes or b"[" in raw_bytes))
 
     def _process_all_payload_dicts(
-        self, payload_dicts: list[dict[str, object]], raw_bytes: bytearray | bytes
+        self,
+        payload_dicts: list[dict[str, object]],
+        raw_bytes: bytearray | bytes,
+        telemetry_generation: int | None = None,
     ) -> tuple[bool, bool]:
         """Process all decoded payload dictionaries.
 
         Args:
             payload_dicts: List of decoded dictionary frames.
             raw_bytes: Raw bytes for debug logging.
+            telemetry_generation: Poll generation associated with this response.
 
         Returns:
             Tuple of (has_sensor_data, filters_updated).
@@ -2138,18 +2185,23 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 if self.data.tds is not None:
                     break
         for payload in payload_dicts:
-            if self._process_filter_stages_from_payload(payload):
+            if self._process_filter_stages_from_payload(payload, telemetry_generation):
                 has_sensor_data = True
                 filters_updated = True
             if self._process_errors_from_payload(payload):
                 has_sensor_data = True
         return has_sensor_data, filters_updated
 
-    def _process_tds_payload(self, raw_bytes: bytearray | bytes) -> None:
+    def _process_tds_payload(
+        self,
+        raw_bytes: bytearray | bytes,
+        telemetry_generation: int | None = None,
+    ) -> None:
         """Process raw bytes payload from the TDS sensor and purifier telemetry.
 
         Args:
             raw_bytes: Payload bytes read from the characteristic.
+            telemetry_generation: Poll generation associated with this response.
         """
         if not self._is_valid_json_buffer(raw_bytes):
             self.data.connected = False
@@ -2182,7 +2234,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return
 
         reset_dates_snapshot = dict(self.data.filter_reset_dates)
-        has_sensor_data, filters_updated = self._process_all_payload_dicts(payload_dicts, raw_bytes)
+        has_sensor_data, filters_updated = self._process_all_payload_dicts(
+            payload_dicts, raw_bytes, telemetry_generation
+        )
 
         if not has_sensor_data:
             _LOGGER.debug(
@@ -2201,6 +2255,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Returns:
             Updated KarofiData object with the latest readings.
         """
+        self._telemetry_generation += 1
+        telemetry_generation = self._telemetry_generation
         ble_device = self._get_ble_device()
         if not ble_device:
             self.data.connected = False
@@ -2230,7 +2286,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     raw_bytes = await self._read_tds_characteristic(
                         client, deadline=ble_timeout.when()
                     )
-                    self._process_tds_payload(raw_bytes)
+                    self._process_tds_payload(raw_bytes, telemetry_generation)
                 finally:
                     await client.disconnect()
         except TimeoutError:

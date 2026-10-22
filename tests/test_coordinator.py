@@ -947,6 +947,28 @@ def test_coordinator_resolve_notify_and_cmd_characteristics(
     assert coordinator._resolve_notify_characteristic(mock_client) is notify_char
 
 
+def test_coordinator_resolve_command_characteristic_uses_command_service(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Prefer the writable command characteristic in COMMAND_SERVICE when UUIDs collide."""
+    non_writable_char = _mock_characteristic(KarofiCharacteristic.COMMAND, [GattProperty.NOTIFY])
+    writable_command_char = _mock_characteristic(KarofiCharacteristic.COMMAND, [GattProperty.WRITE])
+    command_service = MagicMock()
+    command_service.characteristics = [writable_command_char]
+
+    mock_services = MagicMock(spec=BleakGATTServiceCollection)
+    mock_services.get_characteristic.return_value = non_writable_char
+    mock_services.get_service.side_effect = lambda uuid: (
+        command_service
+        if uuid in (KarofiCharacteristic.COMMAND_SERVICE, KarofiShortUUID.COMMAND_SERVICE)
+        else None
+    )
+    mock_client = MagicMock()
+    mock_client.services = mock_services
+
+    assert coordinator._resolve_command_characteristic(mock_client) is writable_command_char
+
+
 async def test_coordinator_write_command_with_fallback() -> None:
     """Test _write_command_with_fallback handling responses and error fallbacks."""
     mock_client = AsyncMock()
@@ -2040,6 +2062,31 @@ def test_coordinator_telemetry_synced_tracking(
     coordinator._apply_filter_installation_date("filter_1", past_date)
     assert coordinator.data.filters["filter_1"].telemetry_synced is False
     assert coordinator.get_filter_remaining_days("filter_1") == 160
+
+    # Telemetry from the poll that was already in progress is stale.
+    coordinator._process_tds_payload(
+        b'{"iro_rtr":[1200],"iro_lTime":[8760],"names":["Sediment"]}',
+        telemetry_generation=0,
+    )
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.telemetry_synced is False
+    assert fdata.remaining_days == 160
+    assert fdata.lifetime_hours == 4320
+    assert fdata.lifetime_days == 180
+    assert fdata.percent == round((160 / 180) * 100)
+    assert coordinator.get_filter_remaining_days("filter_1") == 160
+
+    # A later poll is authoritative and reconciles the local value with the device.
+    coordinator._process_tds_payload(
+        b'{"iro_rtr":[1200],"iro_lTime":[8760],"names":["Sediment"]}',
+        telemetry_generation=1,
+    )
+    assert fdata.telemetry_synced is True
+    assert fdata.remaining_days == 50
+    assert fdata.lifetime_hours == 8760
+    assert fdata.lifetime_days == 365
+    assert fdata.percent == round((50 / 365) * 100)
+    assert coordinator.get_filter_remaining_days("filter_1") == 50
 
 
 async def test_coordinator_try_active_polling_accepts_filter_only_telemetry(

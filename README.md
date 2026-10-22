@@ -100,6 +100,9 @@ This integration is designed for Karofi smart water purifiers equipped with Maki
 4. Select your discovered purifier from the drop-down list, or choose **"Enter MAC address manually..."** to input the 6-octet Bluetooth MAC address (e.g., `AA:BB:CC:11:22:33`).
 5. Confirm the setup. Your entities will immediately be created and mapped to the device.
 
+> [!NOTE]
+> Filter data may take a few background scans to settle after setup. Initial readings can be incomplete or inaccurate while filter stages and telemetry are being discovered; wait a few minutes for the values to update.
+
 ---
 
 ## Filter Lifetime Management
