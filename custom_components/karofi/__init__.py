@@ -5,7 +5,13 @@ from homeassistant.const import CONF_MAC, CONF_NAME, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .const import DEFAULT_NAME, DOMAIN, STORAGE_KEY_PREFIX, STORAGE_VERSION
+from .const import (
+    DEFAULT_NAME,
+    DOMAIN,
+    PENDING_RESET_STORAGE_SUFFIX,
+    STORAGE_KEY_PREFIX,
+    STORAGE_VERSION,
+)
 from .coordinator import KarofiDataCoordinator
 from .util import normalize_mac
 
@@ -13,7 +19,6 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
-    Platform.NUMBER,
 ]
 
 
@@ -68,3 +73,8 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         entry: Integration config entry being removed.
     """
     await Store(hass, STORAGE_VERSION, f"{STORAGE_KEY_PREFIX}_{entry.entry_id}").async_remove()
+    await Store(
+        hass,
+        STORAGE_VERSION,
+        f"{STORAGE_KEY_PREFIX}_{entry.entry_id}_{PENDING_RESET_STORAGE_SUFFIX}",
+    ).async_remove()

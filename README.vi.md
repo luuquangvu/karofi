@@ -39,8 +39,7 @@
   - Tên gọi đơn giản, nhất quán (`Lõi 1`, `Lõi 2`, `Lõi 3`, ...) phù hợp cho mọi dòng máy mà không bị gán cứng sai loại lõi.
 - **Cơ chế hiển thị kép cho từng lõi**: Mỗi cấp lõi lọc cung cấp song song cảm biến tỷ lệ phần trăm còn lại (0% đến 100%) và cảm biến số ngày còn lại, giúp theo dõi trực quan trên thẻ giao diện và thiết lập tự động hóa.
 - **Thao tác bảo trì linh hoạt**:
-  - **Nút đặt lại một chạm**: Nhấn nút đặt lại trên Home Assistant khi thay lõi thực tế để cập nhật ngày bắt đầu sử dụng về ngày hiện tại.
-  - **Thanh trượt điều chỉnh số ngày**: Dễ dàng tinh chỉnh hoặc đồng bộ số ngày sử dụng còn lại qua các thực thể number mà không cần đặt lại từ đầu.
+  - **Nút đặt lại một chạm**: Khi thay lõi thực tế, nhấn nút trên Home Assistant để gửi lệnh đặt lại đến máy; số ngày còn lại sẽ cập nhật theo dữ liệu máy phản hồi.
 - **Lưu trữ dữ liệu cục bộ bền vững**: Mốc thời gian thay lõi và dữ liệu bảo trì được lưu an toàn trong hệ thống lưu trữ của Home Assistant (`.storage`), đảm bảo không bị thất lạc khi khởi động lại hệ thống hoặc khởi động lại máy chủ.
 - **Tương thích Bluetooth Proxy và ESPHome**: Hoạt động ổn định với các bộ thu phát Bluetooth Proxy (ESPHome hoặc Shelly BLE Proxy), giúp nhận dữ liệu tin cậy ngay cả khi máy lọc nước đặt cách xa máy chủ Home Assistant.
 - **Xử lý kết nối BLE tin cậy**: Sử dụng thư viện `bleak-retry-connector` cùng cơ chế phân tích luồng JSON đa khung (multi-frame stream), ghi lệnh dự phòng không chờ phản hồi (write-without-response) và cơ chế kiểm soát thời gian chờ để duy trì kết nối ổn định trong môi trường tần số 2.4 GHz nhiều can nhiễu.
@@ -60,15 +59,14 @@ Tiện ích này tương thích với các dòng máy lọc nước thông minh 
 
 ## Danh sách thực thể (Entities)
 
-| Nền tảng (Platform) | Mã thực thể (Entity ID)                      | Đơn vị / Kiểu  | Mô tả                                                                    |
-| :------------------ | :------------------------------------------- | :------------- | :----------------------------------------------------------------------- |
-| **Sensor**          | `sensor.<mac>_tds`                           | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                          |
-| **Sensor**          | `sensor.<mac>_quality`                       | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).            |
-| **Sensor**          | `sensor.<mac>_filter_<n>_percent`            | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).                |
-| **Sensor**          | `<mac>_filter_<n>_days` (unique ID)          | `ngày`         | Số ngày còn lại đến hạn thay Lõi `<n>`; `_days` là hậu tố của unique ID. |
-| **Binary Sensor**   | `binary_sensor.<mac>_connectivity`           | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước.                           |
-| **Number**          | `number.<mac>_num_filter_<n>_remaining_days` | `ngày`         | Thanh trượt điều chỉnh số ngày sử dụng còn lại của lõi lọc.              |
-| **Button**          | `button.<mac>_btn_reset_filter_<n>`          | `restore`      | Nút đặt lại ngày bắt đầu sử dụng cho cấp lõi lọc tương ứng.              |
+| Nền tảng (Platform) | Mã thực thể (Entity ID)             | Đơn vị / Kiểu  | Mô tả                                                                    |
+| :------------------ | :---------------------------------- | :------------- | :----------------------------------------------------------------------- |
+| **Sensor**          | `sensor.<mac>_tds`                  | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                          |
+| **Sensor**          | `sensor.<mac>_quality`              | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).            |
+| **Sensor**          | `sensor.<mac>_filter_<n>_percent`   | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).                |
+| **Sensor**          | `<mac>_filter_<n>_days` (unique ID) | `ngày`         | Số ngày còn lại đến hạn thay Lõi `<n>`; `_days` là hậu tố của unique ID. |
+| **Binary Sensor**   | `binary_sensor.<mac>_connectivity`  | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước.                           |
+| **Button**          | `button.<mac>_btn_reset_filter_<n>` | `restore`      | Gửi lệnh đặt lại cho cấp lõi lọc tương ứng.                              |
 
 ---
 
@@ -107,21 +105,19 @@ Tiện ích này tương thích với các dòng máy lọc nước thông minh 
 
 ## Quản lý vòng đời lõi lọc
 
-Thời gian sử dụng của mỗi cấp lõi lọc được tính theo công thức:
+Hai trường thiết bị (`iro_rtr` và `iro_lTime`) đều có đơn vị giờ. Số ngày còn lại được tính bằng `max(0, round(iro_rtr / 24))`; tuổi thọ định mức theo ngày được tính bằng `max(1, round(iro_lTime / 24))`. Tỷ lệ phần trăm dùng hai giá trị theo ngày này. Ngày thay lõi đã lưu chỉ được dùng làm giá trị dự phòng khi chưa có dữ liệu thời gian còn lại từ thiết bị.
 
-$$\text{Số ngày đã dùng} = \text{Ngày hiện tại} - \text{Ngày đặt lại lõi}$$
-$$\text{Số ngày còn lại} = \max\left(0, \text{Tuổi thọ tối đa} - \text{Số ngày đã dùng}\right)$$
 $$\text{Tỷ lệ phần trăm còn lại} = \max\left(0, \min\left(100, \text{làm tròn}\left(\frac{\text{Số ngày còn lại}}{\text{Tuổi thọ tối đa}} \times 100\right)\right)\right)$$
 
 ### Khi thay lõi lọc mới
 
 1. Truy cập trang thiết bị Karofi tại **Cài đặt** > **Thiết bị & Dịch vụ** > **Karofi**.
 2. Trong khu vực các nút bấm, chọn **Nhấn** tại nút đặt lại tương ứng (ví dụ: `Đặt lại lõi 1`).
-3. Ngày kích hoạt sẽ được đặt lại về thời điểm hiện tại, đưa số ngày còn lại và tỷ lệ phần trăm về mức 100%.
+3. Tiện ích gửi lệnh đặt lại đến máy. Cảm biến số ngày còn lại sẽ cập nhật theo dữ liệu thiết bị báo.
 
 ### Khi đồng bộ lõi lọc đang sử dụng
 
-Nếu bạn đã thay lõi lọc trước khi cài đặt tiện ích này, hãy sử dụng **thanh trượt số ngày còn lại** của lõi tương ứng để điều chỉnh cho khớp với nhật ký theo dõi thực tế.
+Số ngày còn lại được đọc từ máy lọc và không thể chỉnh sửa qua tiện ích. Nếu giá trị không đúng, hãy đặt lại lõi tương ứng trên máy rồi chờ dữ liệu cập nhật; có thể dùng nút đặt lại trong Home Assistant khi thay lõi.
 
 ---
 

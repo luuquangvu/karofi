@@ -8,7 +8,12 @@ from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi import async_remove_entry
-from custom_components.karofi.const import DOMAIN, STORAGE_KEY_PREFIX, STORAGE_VERSION
+from custom_components.karofi.const import (
+    DOMAIN,
+    PENDING_RESET_STORAGE_SUFFIX,
+    STORAGE_KEY_PREFIX,
+    STORAGE_VERSION,
+)
 
 
 async def test_setup_and_unload_entry(
@@ -57,12 +62,18 @@ async def test_remove_entry(
     """
     mock_config_entry.add_to_hass(hass)
     storage_key = f"{STORAGE_KEY_PREFIX}_{mock_config_entry.entry_id}"
+    pending_storage_key = f"{storage_key}_{PENDING_RESET_STORAGE_SUFFIX}"
     hass_storage[storage_key] = {
         "version": STORAGE_VERSION,
         "data": {"filter_1": "2026-01-01T00:00:00"},
     }
+    hass_storage[pending_storage_key] = {
+        "version": STORAGE_VERSION,
+        "data": {"filter_1": 4320},
+    }
     await async_remove_entry(hass, mock_config_entry)
     assert storage_key not in hass_storage
+    assert pending_storage_key not in hass_storage
 
 
 async def test_setup_entry_schedules_background_refresh(

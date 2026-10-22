@@ -26,6 +26,7 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -38,6 +39,7 @@ from .const import (
     DIRECT_TDS_RETURN_RESERVE_SECONDS,
     MAX_VALID_TDS,
     NOTIFY_UUID_PREFIX,
+    PENDING_RESET_STORAGE_SUFFIX,
     REQUEST_READ_DATA_COMMAND,
     STORAGE_KEY_PREFIX,
     STORAGE_VERSION,
@@ -68,6 +70,7 @@ from .util import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+RESET_CONFIRMATION_POLLS = 3
 
 
 class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
@@ -115,7 +118,12 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         )
         self._known_tds_char_uuid: str | None = None
         self._telemetry_generation = 0
-        self._filter_local_override_generation: dict[str, int] = {}
+        self._pending_reset_store: Store[dict[str, int | None]] = Store(
+            hass,
+            STORAGE_VERSION,
+            f"{STORAGE_KEY_PREFIX}_{entry.entry_id}_{PENDING_RESET_STORAGE_SUFFIX}",
+        )
+        self._pending_filter_resets: dict[str, tuple[int, int, int | None, int | None]] = {}
         self._mac_candidates: tuple[str, str] = (
             normalize_mac(mac_address, uppercase=True),
             normalize_mac(mac_address, uppercase=False),
@@ -236,9 +244,62 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     reset_date=resolved_dates[key],
                 )
 
+        stored_pending_resets = await self._pending_reset_store.async_load()
+        valid_pending_resets: dict[str, int | None] = {}
+        if isinstance(stored_pending_resets, dict):
+            for key, lifetime_hours in stored_pending_resets.items():
+                if (
+                    not isinstance(key, str)
+                    or not is_valid_filter_key(key)
+                    or (
+                        lifetime_hours is not None
+                        and (
+                            not isinstance(lifetime_hours, int)
+                            or isinstance(lifetime_hours, bool)
+                            or lifetime_hours <= 0
+                        )
+                    )
+                ):
+                    continue
+
+                if key not in resolved_dates:
+                    reset_date = dt_util.utcnow()
+                    resolved_dates[key] = reset_date.isoformat()
+                    self.data.filter_reset_dates[key] = resolved_dates[key]
+                    self.data.filters[key] = KarofiFilterData(
+                        index=filter_key_to_index(key),
+                        key=key,
+                        lifetime_days=self.get_filter_lifetime_days(key),
+                        reset_date=resolved_dates[key],
+                    )
+                    needs_save = True
+                else:
+                    reset_date = dt_util.parse_datetime(resolved_dates[key])
+                if reset_date is None:
+                    continue
+
+                fdata = self.data.filters[key]
+                if lifetime_hours is not None:
+                    fdata.lifetime_hours = lifetime_hours
+                    fdata.lifetime_days = max(1, round(lifetime_hours / 24.0))
+                self._apply_filter_installation_date(key, reset_date)
+                if lifetime_hours is not None:
+                    fdata.remaining_hours = lifetime_hours
+                    fdata.remaining_days = fdata.lifetime_days
+                    fdata.percent = 100
+                self._pending_filter_resets[key] = (
+                    self._telemetry_generation,
+                    0,
+                    None,
+                    lifetime_hours,
+                )
+                valid_pending_resets[key] = lifetime_hours
+
+        if stored_pending_resets is not None and valid_pending_resets != stored_pending_resets:
+            await self._pending_reset_store.async_save(valid_pending_resets)
+
         if needs_save:
             await self._store.async_save(self.data.filter_reset_dates)
-
         self.async_update_listeners()
 
     def get_known_filter_keys(self) -> list[str]:
@@ -256,6 +317,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         known_keys = set(self.data.filters.keys()) | set(self.data.filter_reset_dates.keys())
         return sorted(known_keys, key=_sort_key)
+
+    def _get_pending_reset_storage(self) -> dict[str, int | None]:
+        """Return pending reset metadata for persistent storage."""
+        return {key: pending_reset[3] for key, pending_reset in self._pending_filter_resets.items()}
+
+    async def _async_save_filter_tracking(self) -> None:
+        """Persist filter installation dates."""
+        await self._store.async_save(self.data.filter_reset_dates)
 
     def get_filter_name(self, filter_stage: KarofiFilter | str) -> str | None:
         """Get dynamic filter name if provided by device telemetry.
@@ -303,6 +372,15 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         lifetime = max_days if max_days is not None else self.get_filter_lifetime_days(key)
         if lifetime <= 0:
             return 0
+
+        if (
+            key in self._pending_filter_resets
+            and key in self.data.filters
+            and self.data.filters[key].remaining_days is not None
+        ):
+            remaining_days = self.data.filters[key].remaining_days
+            if remaining_days is not None:
+                return max(0, min(lifetime, remaining_days))
 
         if (
             key in self.data.filters
@@ -397,6 +475,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         Args:
             filter_key: The dictionary key of the filter to reset.
+
+        Raises:
+            HomeAssistantError: If the reset command cannot be sent to the device.
         """
         try:
             filter_index = filter_key_to_index(filter_key)
@@ -406,20 +487,34 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         if not await self._async_send_reset_command(filter_index):
             _LOGGER.warning(
-                "Hardware reset command failed for %s on device %s; updated local tracking only",
+                "Hardware reset command failed for %s on device %s",
                 filter_key,
                 self.masked_mac,
             )
+            raise HomeAssistantError(f"Failed to send reset command for {filter_key}")
 
-        if filter_key in self.data.filters:
-            fdata = self.data.filters[filter_key]
-            fdata.remaining_hours = fdata.lifetime_hours
-            fdata.remaining_days = fdata.lifetime_days
-            fdata.percent = 100
+        fdata = self.data.filters.get(filter_key)
+        lifetime_hours = (
+            fdata.lifetime_hours
+            if fdata is not None and fdata.lifetime_hours is not None and fdata.lifetime_hours > 0
+            else None
+        )
+        self._apply_filter_installation_date(filter_key, dt_util.utcnow())
+        self._pending_filter_resets[filter_key] = (
+            self._telemetry_generation,
+            0,
+            None,
+            lifetime_hours,
+        )
+        await self._pending_reset_store.async_save(self._get_pending_reset_storage())
+        await self._async_save_filter_tracking()
+        self.async_set_updated_data(self.data)
 
-        await self.async_set_filter_used_days(filter_key, 0)
-
-    def _apply_filter_installation_date(self, filter_key: str, dt: datetime) -> None:
+    def _apply_filter_installation_date(
+        self,
+        filter_key: str,
+        dt: datetime,
+    ) -> None:
         """Apply installation date and update or create filter record.
 
         Args:
@@ -428,7 +523,6 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """
         iso_str = dt_util.as_utc(dt).isoformat()
         self.data.filter_reset_dates[filter_key] = iso_str
-        self._filter_local_override_generation[filter_key] = self._telemetry_generation
         lifetime = self.get_filter_lifetime_days(filter_key)
         used_days = (dt_util.utcnow() - dt_util.as_utc(dt)).days
         rem_days = max(0, min(lifetime, lifetime - max(0, used_days)))
@@ -453,84 +547,6 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             fdata.percent = pct
             fdata.remaining_hours = rem_hours
             fdata.telemetry_synced = False
-
-    async def async_set_filter_date(self, filter_key: str, date: datetime | str) -> None:
-        """Set the installation/replacement date of a filter.
-
-        Args:
-            filter_key: The dictionary key of the filter to calibrate.
-            date: Datetime or ISO format string of the installation date.
-
-        Raises:
-            ValueError: If date string cannot be parsed.
-        """
-        if (
-            filter_key not in self.data.filter_reset_dates
-            and filter_key not in self.data.filters
-            and not is_valid_filter_key(filter_key)
-        ):
-            return
-
-        if isinstance(date, str):
-            dt = dt_util.parse_datetime(date)
-            if dt is None:
-                parsed_date = dt_util.parse_date(date)
-                if parsed_date is not None:
-                    dt = dt_util.start_of_local_day(parsed_date)
-            if dt is None:
-                raise ValueError(f"Invalid date format: {date}")
-        else:
-            dt = date
-
-        self._apply_filter_installation_date(filter_key, dt)
-        await self._store.async_save(self.data.filter_reset_dates)
-        self.async_set_updated_data(self.data)
-
-    async def async_set_filter_used_days(self, filter_key: str, used_days: int) -> None:
-        """Set the filter installation date based on days already in use.
-
-        Args:
-            filter_key: The dictionary key of the filter to calibrate.
-            used_days: Number of days the filter has been in use.
-        """
-        installation_date = dt_util.utcnow() - timedelta(days=max(0, used_days))
-        await self.async_set_filter_date(filter_key, installation_date)
-
-    async def async_set_filter_remaining_days(self, filter_key: str, remaining_days: int) -> None:
-        """Set filter installation date based on remaining lifetime days.
-
-        Args:
-            filter_key: The dictionary key of the filter to calibrate.
-            remaining_days: Remaining days before filter replacement.
-        """
-        lifetime = self.get_filter_lifetime_days(filter_key)
-        used_days = max(0, lifetime - remaining_days)
-        if filter_key in self.data.filters:
-            fdata = self.data.filters[filter_key]
-            fdata.remaining_days = remaining_days
-            fdata.percent = max(0, min(100, round((remaining_days / lifetime) * 100)))
-            fdata.remaining_hours = remaining_days * 24
-        await self.async_set_filter_used_days(filter_key, used_days)
-
-    async def async_calibrate_all_filters(self, used_days_map: dict[str, int]) -> None:
-        """Calibrate multiple filters at once by specifying days in use.
-
-        Args:
-            used_days_map: Mapping of filter stage key to days in use.
-        """
-        now = dt_util.utcnow()
-        for key, used_days in used_days_map.items():
-            if (
-                key not in self.data.filter_reset_dates
-                and key not in self.data.filters
-                and not is_valid_filter_key(key)
-            ):
-                continue
-            inst_date = now - timedelta(days=max(0, used_days))
-            self._apply_filter_installation_date(key, inst_date)
-
-        await self._store.async_save(self.data.filter_reset_dates)
-        self.async_set_updated_data(self.data)
 
     def _log_discovered_services(self, client: BleakClientWithServiceCache) -> None:
         """Log discovered GATT services and characteristics for debugging.
@@ -1992,30 +2008,81 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         if name:
             fdata.name = name
 
-        override_generation = self._filter_local_override_generation.get(key)
-        is_stale_override_response = (
-            override_generation is not None
+        pending_reset = self._pending_filter_resets.get(key)
+        pending_reset_generation = pending_reset[0] if pending_reset is not None else None
+        last_counted_generation = pending_reset[2] if pending_reset is not None else None
+        is_stale_reset_response = (
+            pending_reset_generation is not None
             and telemetry_generation is not None
-            and telemetry_generation <= override_generation
+            and telemetry_generation <= pending_reset_generation
         )
-        if rtr_h is not None and not is_stale_override_response:
-            fdata.remaining_hours = rtr_h
-            fdata.remaining_days = max(0, round(rtr_h / 24.0))
-            fdata.telemetry_synced = True
-            if override_generation is not None:
-                self._filter_local_override_generation.pop(key, None)
+        use_pending_reset_value = is_stale_reset_response
+        reset_resolved = False
+        if rtr_h is not None and pending_reset is not None and not is_stale_reset_response:
+            lifetime_hours = (
+                ltime_h
+                if ltime_h is not None and ltime_h > 0
+                else pending_reset[3]
+                if pending_reset[3] is not None and pending_reset[3] > 0
+                else fdata.lifetime_hours
+            )
+            confirmation_tolerance = (
+                min(24.0, lifetime_hours * 0.1)
+                if lifetime_hours is not None and lifetime_hours > 0
+                else None
+            )
+            if (
+                lifetime_hours is not None
+                and lifetime_hours > 0
+                and confirmation_tolerance is not None
+                and 0 <= rtr_h <= lifetime_hours
+                and lifetime_hours - rtr_h <= confirmation_tolerance
+            ):
+                self._pending_filter_resets.pop(key, None)
+                self._pending_reset_store.async_delay_save(self._get_pending_reset_storage, 1)
+                reset_resolved = True
+            elif (
+                telemetry_generation is not None and telemetry_generation == last_counted_generation
+            ):
+                use_pending_reset_value = True
+            else:
+                mismatch_count = pending_reset[1] + 1
+                if mismatch_count >= RESET_CONFIRMATION_POLLS:
+                    self._pending_filter_resets.pop(key, None)
+                    self._pending_reset_store.async_delay_save(self._get_pending_reset_storage, 1)
+                    reset_resolved = True
+                    _LOGGER.warning(
+                        "Device did not confirm reset for %s after %d telemetry polls; "
+                        "using device-reported remaining time",
+                        key,
+                        mismatch_count,
+                    )
+                else:
+                    self._pending_filter_resets[key] = (
+                        pending_reset[0],
+                        mismatch_count,
+                        telemetry_generation,
+                        pending_reset[3],
+                    )
+                    use_pending_reset_value = True
 
-        if ltime_h is not None and not is_stale_override_response:
+        if (
+            ltime_h is not None
+            and ltime_h > 0
+            and not is_stale_reset_response
+            and (pending_reset is None or reset_resolved)
+        ):
             fdata.lifetime_hours = ltime_h
             fdata.lifetime_days = max(1, round(ltime_h / 24.0))
         elif fdata.lifetime_days is None:
             fdata.lifetime_days = self.get_filter_lifetime_days(key)
 
-        if (
-            not is_stale_override_response
-            and fdata.remaining_days is not None
-            and fdata.lifetime_days
-        ):
+        if rtr_h is not None and not use_pending_reset_value:
+            fdata.remaining_hours = rtr_h
+            fdata.remaining_days = max(0, round(rtr_h / 24.0))
+            fdata.telemetry_synced = True
+
+        if not is_stale_reset_response and fdata.remaining_days is not None and fdata.lifetime_days:
             fdata.percent = max(
                 0, min(100, round((fdata.remaining_days / fdata.lifetime_days) * 100))
             )

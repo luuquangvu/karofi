@@ -159,44 +159,6 @@
       "reset_filter_12": {
         "name": "Đặt lại lõi 12"
       }
-    },
-    "number": {
-      "filter_1_remaining_days": {
-        "name": "Số ngày còn lại lõi 1"
-      },
-      "filter_2_remaining_days": {
-        "name": "Số ngày còn lại lõi 2"
-      },
-      "filter_3_remaining_days": {
-        "name": "Số ngày còn lại lõi 3"
-      },
-      "filter_4_remaining_days": {
-        "name": "Số ngày còn lại lõi 4"
-      },
-      "filter_5_remaining_days": {
-        "name": "Số ngày còn lại lõi 5"
-      },
-      "filter_6_remaining_days": {
-        "name": "Số ngày còn lại lõi 6"
-      },
-      "filter_7_remaining_days": {
-        "name": "Số ngày còn lại lõi 7"
-      },
-      "filter_8_remaining_days": {
-        "name": "Số ngày còn lại lõi 8"
-      },
-      "filter_9_remaining_days": {
-        "name": "Số ngày còn lại lõi 9"
-      },
-      "filter_10_remaining_days": {
-        "name": "Số ngày còn lại lõi 10"
-      },
-      "filter_11_remaining_days": {
-        "name": "Số ngày còn lại lõi 11"
-      },
-      "filter_12_remaining_days": {
-        "name": "Số ngày còn lại lõi 12"
-      }
     }
   }
 }

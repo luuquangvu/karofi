@@ -96,11 +96,17 @@ def build_reset_filter_command(filter_index: int) -> bytes:
 
     Returns:
         Framed SOH/EOT command bytes.
+
+    Raises:
+        ValueError: If the filter index is negative.
     """
+    if filter_index < 0:
+        raise ValueError("Filter index must be non-negative")
+
     return (
         f'\x01{{"{MakiposPayloadKey.EVENT_TYPE}":"{MakiposEventType.CP}",'
         f'"{MakiposPayloadKey.PROPERTY_CODE}":"{MakiposPropertyCode.IRO_RSFT}",'
-        f'"{MakiposPayloadKey.DATA}":{filter_index}}}\x04'.encode()
+        f'"{MakiposPayloadKey.DATA}":{filter_index + 1}}}\x04'.encode()
     )
 
 
@@ -165,6 +171,7 @@ class KarofiDevicePrefix(StrEnum):
 # Storage constants
 STORAGE_VERSION: Final = 1
 STORAGE_KEY_PREFIX: Final = "karofi_filters"
+PENDING_RESET_STORAGE_SUFFIX: Final = "pending_resets"
 
 # Water Quality Thresholds (ppm)
 TDS_THRESHOLD_GOOD: Final = 50
