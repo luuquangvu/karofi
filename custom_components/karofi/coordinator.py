@@ -35,11 +35,13 @@ from .const import (
     BLE_TIMEOUT_SECONDS,
     DEFAULT_FILTER_LIFETIME_DAYS,
     DEFAULT_SCAN_INTERVAL,
+    DIRECT_TDS_RETURN_RESERVE_SECONDS,
     MAX_VALID_TDS,
     NOTIFY_UUID_PREFIX,
     REQUEST_READ_DATA_COMMAND,
     STORAGE_KEY_PREFIX,
     STORAGE_VERSION,
+    SUPPLEMENTAL_TELEMETRY_TIMEOUT_SECONDS,
     TDS_PAYLOAD_KEYS,
     TDS_SENTINEL_ERROR,
     TDS_THRESHOLD_FAIR,
@@ -1277,47 +1279,66 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         client: BleakClientWithServiceCache,
         read_char: BleakGATTCharacteristic | None,
         direct_bytes: bytearray,
+        *,
+        timeout_at: float | None = None,
+        update_tds_uuid: bool = True,
     ) -> tuple[bytearray | None, bytearray]:
-        """Scan candidate characteristics under Karofi service for TDS readings.
+        """Scan service characteristics and collect TDS and filter telemetry.
 
         Args:
             client: Connected Bleak client instance.
             read_char: Initially resolved read characteristic.
             direct_bytes: Bytes already read in direct read step.
+            timeout_at: Optional event loop time at which to stop scanning.
+            update_tds_uuid: Whether to remember a discovered TDS characteristic UUID.
 
         Returns:
-            Tuple of (valid_tds_bytes or None, fallback_payload).
+            Tuple of collected telemetry bytes or None and fallback payload.
         """
         services = getattr(client, "services", None)
         if not isinstance(services, BleakGATTServiceCollection):
             return None, bytearray()
 
         fallback_payload = bytearray()
+        telemetry_payloads: list[bytearray] = []
+        tds_payload: bytearray | None = None
         data_chars = self._get_readable_data_characteristics(client)
-        for candidate in data_chars:
-            if candidate == read_char and direct_bytes:
-                continue
-            cand_bytes = await self._read_characteristic_safe(client, candidate)
-            if cand_bytes:
-                _LOGGER.debug(
-                    "Data characteristic %s read returned %d bytes (hex: %s, text: %r)",
-                    candidate.uuid,
-                    len(cand_bytes),
-                    cand_bytes.hex(),
-                    cand_bytes.decode("utf-8", errors="replace"),
-                )
-                if self._parse_tds_reading(cand_bytes) is not None:
-                    self._known_tds_char_uuid = candidate.uuid
-                    _LOGGER.debug(
-                        "Discovered TDS sensor characteristic on %s: %s (%s ppm)",
-                        self.masked_mac,
-                        candidate.uuid,
-                        self._parse_tds_reading(cand_bytes),
-                    )
-                    return cand_bytes, cand_bytes
-                if not fallback_payload and not self._is_handshake_payload(cand_bytes):
-                    fallback_payload = cand_bytes
-        return None, fallback_payload
+        try:
+            async with asyncio.timeout_at(timeout_at):
+                for candidate in data_chars:
+                    if candidate == read_char and direct_bytes:
+                        continue
+                    cand_bytes = await self._read_characteristic_safe(client, candidate)
+                    if cand_bytes:
+                        _LOGGER.debug(
+                            "Data characteristic %s read returned %d bytes (hex: %s, text: %r)",
+                            candidate.uuid,
+                            len(cand_bytes),
+                            cand_bytes.hex(),
+                            cand_bytes.decode("utf-8", errors="replace"),
+                        )
+                        if self._has_telemetry_payload(cand_bytes):
+                            telemetry_payloads.append(cand_bytes)
+                        if self._parse_tds_reading(cand_bytes) is not None:
+                            if update_tds_uuid:
+                                self._known_tds_char_uuid = candidate.uuid
+                                _LOGGER.debug(
+                                    "Discovered TDS sensor characteristic on %s: %s (%s ppm)",
+                                    self.masked_mac,
+                                    candidate.uuid,
+                                    self._parse_tds_reading(cand_bytes),
+                                )
+                            tds_payload = cand_bytes
+                        if not fallback_payload and not self._is_handshake_payload(cand_bytes):
+                            fallback_payload = cand_bytes
+        except TimeoutError:
+            _LOGGER.debug(
+                "Timed out scanning data characteristics for %s; using telemetry collected so far",
+                self.masked_mac,
+            )
+        if telemetry_payloads:
+            return bytearray(b"\n".join(telemetry_payloads)), fallback_payload
+        return tds_payload, fallback_payload
 
     async def _try_follow_up_read(
         self,
@@ -1325,6 +1346,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         read_target: BleakGATTCharacteristic | str,
         can_read: bool,
         fallback_payload: bytearray,
+        *,
+        timeout_at: float | None = None,
     ) -> tuple[bytearray | None, bytearray]:
         """Perform follow-up read on read target after polling commands.
 
@@ -1333,12 +1356,21 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             read_target: Target characteristic to read.
             can_read: Whether characteristic supports reading.
             fallback_payload: Current fallback payload.
+            timeout_at: Optional event loop time at which to stop reading.
 
         Returns:
             Tuple of (valid_tds_bytes or None, updated fallback_payload).
         """
         if can_read and (not fallback_payload or self._is_handshake_payload(fallback_payload)):
-            post_cmd_bytes = await self._read_characteristic_safe(client, read_target)
+            try:
+                async with asyncio.timeout_at(timeout_at):
+                    post_cmd_bytes = await self._read_characteristic_safe(client, read_target)
+            except TimeoutError:
+                _LOGGER.debug(
+                    "Timed out reading follow-up data for %s; keeping payload collected so far",
+                    self.masked_mac,
+                )
+                return None, fallback_payload
             if post_cmd_bytes:
                 _LOGGER.debug(
                     "Follow-up read of %s after polling returned %d bytes (hex: %s, text: %r)",
@@ -1389,19 +1421,25 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return notify_bytes, notify_bytes
         return None, notify_bytes
 
-    async def _read_tds_characteristic(self, client: BleakClientWithServiceCache) -> bytearray:
+    async def _read_tds_characteristic(
+        self,
+        client: BleakClientWithServiceCache,
+        *,
+        deadline: float | None = None,
+    ) -> bytearray:
         """Find and read the TDS sensor characteristic.
 
         Logs discovered GATT services and characteristics for debugging.
         Resolves the appropriate characteristics for READ, NOTIFY, and COMMAND.
         Attempts direct read first if characteristic has READ property.
-        If direct read already returns valid TDS, returns it immediately.
+        Reads filter telemetry characteristics even when direct TDS succeeds.
         Otherwise, triggers the device via command write and notification subscription.
         If notifications do not arrive, attempts a follow-up read.
         Falls back to handshake bytes to maintain connection state if available.
 
         Args:
             client: Connected Bleak client instance.
+            deadline: Optional event loop time deadline for the full BLE update.
 
         Returns:
             Raw bytearray returned by characteristic read or notification.
@@ -1426,26 +1464,92 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         # Step 1: Direct read attempt if supported
         tds_result, direct_bytes = await self._try_direct_read(client, read_target, can_read)
         if tds_result is not None:
-            return tds_result
+            # The purifier exposes filter state on separate characteristics. A TDS
+            # direct read must not short-circuit the poll and discard that state.
+            loop = asyncio.get_running_loop()
+            remaining_seconds = deadline - loop.time() if deadline is not None else float("inf")
+            supplemental_seconds = min(
+                SUPPLEMENTAL_TELEMETRY_TIMEOUT_SECONDS,
+                remaining_seconds - DIRECT_TDS_RETURN_RESERVE_SECONDS,
+            )
+            if supplemental_seconds <= 0:
+                _LOGGER.debug(
+                    "Skipping supplemental telemetry for %s to preserve direct TDS",
+                    self.masked_mac,
+                )
+                return tds_result
+
+            supplemental_deadline = loop.time() + supplemental_seconds
+            telemetry_bytes = bytearray()
+            try:
+                async with asyncio.timeout_at(supplemental_deadline):
+                    await self._send_read_request(client, cmd_target, notify_target)
+                telemetry_bytes, _ = await self._scan_candidate_data_chars(
+                    client,
+                    read_char,
+                    direct_bytes,
+                    timeout_at=supplemental_deadline,
+                    update_tds_uuid=False,
+                )
+            except (BleakError, OSError, TimeoutError) as err:
+                _LOGGER.debug(
+                    "Supplemental filter telemetry read failed for %s; keeping direct TDS: %s",
+                    self.masked_mac,
+                    err,
+                )
+            return (
+                bytearray(b"\n".join((tds_result, telemetry_bytes)))
+                if telemetry_bytes
+                else tds_result
+            )
 
         # Step 2: Active polling via notification subscription and command request
-        tds_result, notify_bytes = await self._try_active_polling(
+        polling_result, notify_bytes = await self._try_active_polling(
             client, notify_target, cmd_target, read_target
         )
-        if tds_result is not None:
-            return tds_result
+
+        # Reserve time to return notification TDS if a candidate characteristic stalls.
+        scan_timeout_at = (
+            deadline - DIRECT_TDS_RETURN_RESERVE_SECONDS if deadline is not None else None
+        )
 
         # Step 3: Scan candidate data characteristics under service
-        tds_result, cand_fallback = await self._scan_candidate_data_chars(
-            client, read_char, direct_bytes
+        candidate_result, cand_fallback = await self._scan_candidate_data_chars(
+            client,
+            read_char,
+            direct_bytes,
+            timeout_at=scan_timeout_at,
         )
-        if tds_result is not None:
-            return tds_result
+        telemetry_payloads: list[bytearray] = []
+        for payload in (polling_result, candidate_result, notify_bytes):
+            if (
+                payload
+                and self._has_telemetry_payload(payload)
+                and payload not in telemetry_payloads
+            ):
+                telemetry_payloads.append(payload)
+        telemetry_bytes = bytearray(b"\n".join(telemetry_payloads))
+        if telemetry_bytes and self._parse_tds_reading(telemetry_bytes) is None:
+            follow_up_tds, _ = await self._try_follow_up_read(
+                client,
+                read_target,
+                can_read,
+                bytearray(),
+                timeout_at=scan_timeout_at,
+            )
+            if follow_up_tds is not None:
+                return bytearray(b"\n".join((follow_up_tds, telemetry_bytes)))
+        if telemetry_bytes:
+            return telemetry_bytes
 
         # Step 4: Follow-up read of read_target after command write
         fallback_payload = direct_bytes or cand_fallback
         tds_result, follow_up_fallback = await self._try_follow_up_read(
-            client, read_target, can_read, fallback_payload
+            client,
+            read_target,
+            can_read,
+            fallback_payload,
+            timeout_at=scan_timeout_at,
         )
         if tds_result is not None:
             return tds_result
@@ -2018,9 +2122,22 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """
         has_sensor_data = False
         filters_updated = False
-        for payload in payload_dicts:
+        tds_payloads = [
+            payload
+            for payload in payload_dicts
+            if self._has_tds_field(payload) and self._is_priority_tds_payload(payload)
+        ]
+        tds_payloads.extend(
+            payload
+            for payload in payload_dicts
+            if self._has_tds_field(payload) and not self._is_priority_tds_payload(payload)
+        )
+        for payload in tds_payloads:
             if self._process_tds_reading_from_payload(payload, raw_bytes):
                 has_sensor_data = True
+                if self.data.tds is not None:
+                    break
+        for payload in payload_dicts:
             if self._process_filter_stages_from_payload(payload):
                 has_sensor_data = True
                 filters_updated = True
@@ -2102,7 +2219,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return self.data
 
         try:
-            async with asyncio.timeout(BLE_TIMEOUT_SECONDS):
+            async with asyncio.timeout(BLE_TIMEOUT_SECONDS) as ble_timeout:
                 client = await establish_connection(
                     BleakClientWithServiceCache,
                     ble_device,
@@ -2110,7 +2227,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     max_attempts=BLE_CONNECT_ATTEMPTS,
                 )
                 try:
-                    raw_bytes = await self._read_tds_characteristic(client)
+                    raw_bytes = await self._read_tds_characteristic(
+                        client, deadline=ble_timeout.when()
+                    )
                     self._process_tds_payload(raw_bytes)
                 finally:
                     await client.disconnect()
