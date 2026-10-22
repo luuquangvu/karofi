@@ -1281,6 +1281,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         direct_bytes: bytearray,
         *,
         timeout_at: float | None = None,
+        update_tds_uuid: bool = True,
     ) -> tuple[bytearray | None, bytearray]:
         """Scan service characteristics and collect TDS and filter telemetry.
 
@@ -1289,6 +1290,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             read_char: Initially resolved read characteristic.
             direct_bytes: Bytes already read in direct read step.
             timeout_at: Optional event loop time at which to stop scanning.
+            update_tds_uuid: Whether to remember a discovered TDS characteristic UUID.
 
         Returns:
             Tuple of collected telemetry bytes or None and fallback payload.
@@ -1318,13 +1320,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                         if self._has_telemetry_payload(cand_bytes):
                             telemetry_payloads.append(cand_bytes)
                         if self._parse_tds_reading(cand_bytes) is not None:
-                            self._known_tds_char_uuid = candidate.uuid
-                            _LOGGER.debug(
-                                "Discovered TDS sensor characteristic on %s: %s (%s ppm)",
-                                self.masked_mac,
-                                candidate.uuid,
-                                self._parse_tds_reading(cand_bytes),
-                            )
+                            if update_tds_uuid:
+                                self._known_tds_char_uuid = candidate.uuid
+                                _LOGGER.debug(
+                                    "Discovered TDS sensor characteristic on %s: %s (%s ppm)",
+                                    self.masked_mac,
+                                    candidate.uuid,
+                                    self._parse_tds_reading(cand_bytes),
+                                )
                             tds_payload = cand_bytes
                         if not fallback_payload and not self._is_handshake_payload(cand_bytes):
                             fallback_payload = cand_bytes
@@ -1486,6 +1489,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     read_char,
                     direct_bytes,
                     timeout_at=supplemental_deadline,
+                    update_tds_uuid=False,
                 )
             except (BleakError, OSError, TimeoutError) as err:
                 _LOGGER.debug(

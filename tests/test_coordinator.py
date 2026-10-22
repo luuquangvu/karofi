@@ -1269,6 +1269,44 @@ async def test_coordinator_direct_tds_read_still_collects_filter_telemetry(
     assert isinstance(scan_args.kwargs["timeout_at"], float)
 
 
+async def test_coordinator_supplemental_scan_preserves_direct_tds_uuid(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Keep the direct TDS UUID when supplemental telemetry includes another TDS source."""
+    tds_payload = bytearray(b'{"pc":"iro_tds","d":9}')
+    candidate_payload = bytearray(b'{"pc":"iro_tds","d":42}')
+    filter_payload = bytearray(b'{"pc":"iro_rtr","d":[1200]}')
+    read_char = _mock_characteristic("0000ac0a-0000-1000-8000-00805f9b34fb", ["read"])
+    candidate_char = _mock_characteristic("0000ac03-0000-1000-8000-00805f9b34fb", ["read"])
+    filter_char = _mock_characteristic("0000ac04-0000-1000-8000-00805f9b34fb", ["read"])
+    mock_client = AsyncMock()
+    mock_client.services = MagicMock(spec=BleakGATTServiceCollection)
+    mock_client.read_gatt_char.side_effect = [tds_payload, candidate_payload, filter_payload]
+
+    with (
+        patch.object(
+            coordinator,
+            "_resolve_io_targets",
+            return_value=(read_char, read_char, read_char, read_char, True),
+        ),
+        patch.object(
+            coordinator,
+            "_get_readable_data_characteristics",
+            return_value=[read_char, candidate_char, filter_char],
+        ),
+        patch.object(coordinator, "_send_read_request", AsyncMock()),
+    ):
+        result = await coordinator._read_tds_characteristic(mock_client)
+
+    assert coordinator._known_tds_char_uuid == read_char.uuid
+    assert coordinator._parse_tds_reading(result) == 9
+    assert [payload["d"] for payload in coordinator._extract_all_payload_dicts(result)] == [
+        9,
+        42,
+        [1200],
+    ]
+
+
 async def test_coordinator_direct_tds_survives_supplemental_poll_timeout(
     coordinator: KarofiDataCoordinator,
 ) -> None:
