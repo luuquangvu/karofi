@@ -34,6 +34,21 @@
     "binary_sensor": {
       "connectivity": {
         "name": "Connectivity"
+      },
+      "problem": {
+        "name": "Problem",
+        "state_attributes": {
+          "error_messages": {
+            "state": {
+              "1": "Pump works continuously for more than 5 hours",
+              "2": "Weak inlet water",
+              "4": "No inlet water",
+              "5": "The water is leaking",
+              "100": "TDS high",
+              "unknown": "Unknown device error code"
+            }
+          }
+        }
       }
     },
     "sensor": {
@@ -158,44 +173,6 @@
       },
       "reset_filter_12": {
         "name": "Reset filter 12"
-      }
-    },
-    "number": {
-      "filter_1_remaining_days": {
-        "name": "Filter 1 remaining days"
-      },
-      "filter_2_remaining_days": {
-        "name": "Filter 2 remaining days"
-      },
-      "filter_3_remaining_days": {
-        "name": "Filter 3 remaining days"
-      },
-      "filter_4_remaining_days": {
-        "name": "Filter 4 remaining days"
-      },
-      "filter_5_remaining_days": {
-        "name": "Filter 5 remaining days"
-      },
-      "filter_6_remaining_days": {
-        "name": "Filter 6 remaining days"
-      },
-      "filter_7_remaining_days": {
-        "name": "Filter 7 remaining days"
-      },
-      "filter_8_remaining_days": {
-        "name": "Filter 8 remaining days"
-      },
-      "filter_9_remaining_days": {
-        "name": "Filter 9 remaining days"
-      },
-      "filter_10_remaining_days": {
-        "name": "Filter 10 remaining days"
-      },
-      "filter_11_remaining_days": {
-        "name": "Filter 11 remaining days"
-      },
-      "filter_12_remaining_days": {
-        "name": "Filter 12 remaining days"
       }
     }
   }

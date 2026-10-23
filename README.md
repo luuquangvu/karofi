@@ -2,7 +2,7 @@
 
 **🇺🇸 English | [🇻🇳 Tiếng Việt](README.vi.md)**
 
-**Karofi Water Purifier** provides local Bluetooth Low Energy (BLE) integration for Karofi smart water purifiers in Home Assistant. Monitor purified water Total Dissolved Solids (TDS), track drinking water quality ratings, manage multi-stage filter lifespans (5 to 12+ stages) in both percentage and remaining days, and adjust or reset maintenance schedules directly from your Home Assistant dashboard with zero cloud dependence.
+**Karofi Water Purifier** provides local Bluetooth Low Energy (BLE) integration for Karofi smart water purifiers in Home Assistant. Monitor purified water Total Dissolved Solids (TDS), track drinking water quality ratings, and monitor multi-stage filter lifespans (5 to 12+ stages) using time reported by the device, with zero cloud dependence.
 
 ---
 
@@ -11,6 +11,7 @@
 - [Features](#features)
 - [Hardware Compatibility](#hardware-compatibility)
 - [Entities Provided](#entities-provided)
+- [Device Error Codes](#device-error-codes)
 - [Installation](#installation)
   - [Option 1: Using HACS (Recommended)](#option-1-using-hacs-recommended)
   - [Option 2: Manual Installation](#option-2-manual-installation)
@@ -39,8 +40,8 @@
   - Simple, clean naming (`Filter 1`, `Filter 2`, `Filter 3`, etc.) that adapts dynamically to your actual model without misleading hardcoded cartridge types.
 - **Dual Lifespan Indicators**: Every filter stage provides both a remaining percentage sensor (0% to 100%) and a remaining days sensor for intuitive dashboard cards and automations.
 - **Interactive Maintenance Controls**:
-  - **One-Click Reset Buttons**: Press the reset button in Home Assistant when replacing a physical cartridge to refresh the installation date to today.
-  - **Adjustable Days Sliders**: Directly fine-tune or synchronize remaining days using configuration number entities without having to reset from scratch.
+  - **One-Click Reset Buttons**: Press the reset button in Home Assistant when replacing a physical cartridge to send the reset command to the device.
+- **Clear Error Alerts**: If your purifier has a problem, a Problem sensor turns on. Open it to see the error code and a short explanation in your Home Assistant language.
 - **Persistent Local Storage**: Filter reset timestamps and maintenance state are saved to Home Assistant's persistent storage (`.storage`), ensuring zero data loss across restarts or reboots.
 - **Bluetooth Proxy and ESPHome Support**: Fully compatible with Home Assistant Bluetooth Proxies (ESPHome or Shelly BLE Proxies), allowing reliable reception even when your water purifier is located far from the server.
 - **Resilient BLE Engine**: Employs `bleak-retry-connector` with multi-frame JSON packet stream parsing, write-without-response fallbacks, and connection timeout guardrails to handle noisy 2.4 GHz environments smoothly.
@@ -60,15 +61,33 @@ This integration is designed for Karofi smart water purifiers equipped with Maki
 
 ## Entities Provided
 
-| Platform          | Entity ID                                    | Device Class / Unit | Description                                                                     |
-| :---------------- | :------------------------------------------- | :------------------ | :------------------------------------------------------------------------------ |
-| **Sensor**        | `sensor.<mac>_tds`                           | `ppm`               | Real-time pure water TDS concentration.                                         |
-| **Sensor**        | `sensor.<mac>_quality`                       | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).                       |
-| **Sensor**        | `sensor.<mac>_filter_<n>_percent`            | `%`                 | Filter `<n>` remaining life percentage (dynamically added).                     |
-| **Sensor**        | `<mac>_filter_<n>_days` (unique ID)          | `days`              | Filter `<n>` remaining days until replacement; `_days` is the unique-ID suffix. |
-| **Binary Sensor** | `binary_sensor.<mac>_connectivity`           | `connectivity`      | Bluetooth connection status with the purifier.                                  |
-| **Number**        | `number.<mac>_num_filter_<n>_remaining_days` | `duration` (`days`) | Configuration slider to adjust remaining filter lifespan.                       |
-| **Button**        | `button.<mac>_btn_reset_filter_<n>`          | `restore`           | Reset the installation date for the specified filter stage.                     |
+| Platform          | Identifier                                              | Device Class / Unit | Description                                                                                            |
+| :---------------- | :------------------------------------------------------ | :------------------ | :----------------------------------------------------------------------------------------------------- |
+| **Sensor**        | `sensor.<mac>_tds` (Entity ID pattern)                  | `ppm`               | Real-time pure water TDS concentration.                                                                |
+| **Sensor**        | `sensor.<mac>_quality` (Entity ID pattern)              | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).                                              |
+| **Sensor**        | `sensor.<mac>_filter_<n>_percent` (Entity ID pattern)   | `%`                 | Filter `<n>` remaining life percentage (dynamically added).                                            |
+| **Sensor**        | `<mac>_filter_<n>_days` (Unique ID)                     | `days`              | Filter `<n>` remaining days until replacement; `_days` is the unique-ID suffix.                        |
+| **Binary Sensor** | `binary_sensor.<mac>_connectivity` (Entity ID pattern)  | `connectivity`      | Bluetooth connection status with the purifier.                                                         |
+| **Binary Sensor** | `binary_sensor.<mac>_problem` (Entity ID pattern)       | `problem`           | Turns on when the purifier reports a problem. Its details show the error code and a short explanation. |
+| **Button**        | `button.<mac>_btn_reset_filter_<n>` (Entity ID pattern) | `restore`           | Send a reset command for the specified filter stage.                                                   |
+
+Home Assistant assigns entity IDs; the Entity ID patterns above are illustrative and may differ from your actual entity IDs.
+
+---
+
+## Device Error Codes
+
+If something goes wrong, the purifier reports an error code. The **Problem** sensor turns on, and its details show the code together with a short explanation in your Home Assistant language.
+
+| Code | What it means                                    |
+| ---: | :----------------------------------------------- |
+|    1 | The pump has been running for more than 5 hours. |
+|    2 | The incoming water pressure is low.              |
+|    4 | No water is reaching the purifier.               |
+|    5 | The purifier may be leaking.                     |
+|  100 | The TDS level of the filtered water is high.     |
+
+When everything is working normally, the sensor stays off. If the purifier goes offline, the sensor will show as unavailable until it reconnects. If you see a code that is not listed, Home Assistant will show `Unknown device error code <code>` in your language. If the problem keeps coming back, contact Karofi support.
 
 ---
 
@@ -107,21 +126,19 @@ This integration is designed for Karofi smart water purifiers equipped with Maki
 
 ## Filter Lifetime Management
 
-Each filter stage calculates its lifespan using the formula:
+Filter timer values are in hours: remaining days are `max(0, round(iro_lTime / 24))`, and rated stage lifetime in days is `max(1, round(iro_hsd / 24))`. The remaining percentage uses `iro_lTime` and `iro_hsd`; a stored reset date is used only as a fallback before remaining-time telemetry is available.
 
-$$\text{Elapsed Days} = \text{Current Date} - \text{Filter Reset Date}$$
-$$\text{Remaining Days} = \max\left(0, \text{Max Lifespan} - \text{Elapsed Days}\right)$$
-$$\text{Remaining Percent} = \max\left(0, \min\left(100, \text{round}\left(\frac{\text{Remaining Days}}{\text{Max Lifespan}} \times 100\right)\right)\right)$$
+$$\text{Remaining Percent} = \max\left(0, \min\left(100, \text{round}\left(\frac{\text{Remaining Hours}}{\text{Rated Lifetime Hours}} \times 100\right)\right)\right)$$
 
 ### When Replacing a Filter Cartridge
 
 1. Navigate to the Karofi device page in **Settings** > **Devices & Services** > **Karofi**.
-2. Under the **Buttons** section, click **Press** on the corresponding reset button (e.g., `Reset filter 1`).
-3. The installation date is reset to current UTC time, immediately setting the remaining days to 100% of its rated lifespan.
+2. Under the **Buttons** section, press the corresponding reset button (e.g., `Reset filter 1`).
+3. The integration sends the reset command to the purifier. After `async_reset_filter` succeeds, the local reset value remains pending while telemetry is stale or has not confirmed the reset; confirmed device telemetry then becomes the source of truth.
 
 ### When Synchronizing Existing Filters
 
-If you recently installed cartridges before setting up this integration, use the **Number slider** for that filter to slide the remaining days to match your manual records.
+Remaining days are read from the purifier and cannot be edited through the integration. If they appear incorrect, reset the corresponding filter on the purifier and allow telemetry to update; a Home Assistant reset button can reset a filter when it is physically replaced.
 
 ---
 

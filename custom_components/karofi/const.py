@@ -16,7 +16,7 @@ DEFAULT_MODEL: Final = "Karofi Water Purifier"
 UNIT_PPM: Final = UnitOfRatio.PARTS_PER_MILLION
 
 
-# Makipos protocol frame literals and keys
+# Makipos protocol payload keys
 class MakiposPayloadKey(StrEnum):
     """Makipos protocol JSON payload dictionary keys."""
 
@@ -82,10 +82,12 @@ TELEMETRY_FILTER_MARKERS: Final[tuple[bytes, ...]] = (
     MakiposPayloadKey.IRO_LTIME.encode(),
 )
 
-# Polling and command frames (Makipos / Karofi protocol)
+# Polling and command payloads (Makipos / Karofi protocol)
 REQUEST_READ_DATA_COMMAND: Final = (
-    f'\x01{{"{MakiposPayloadKey.EVENT_TYPE}":"{MakiposEventType.NP}"}}\x04'.encode()
+    f'{{"{MakiposPayloadKey.EVENT_TYPE}":"{MakiposEventType.NP}"}}'.encode()
 )
+MAKIPOS_COMMAND_START: Final = b"\x01"
+MAKIPOS_COMMAND_TERMINATOR: Final = b"\x04"
 
 
 def build_reset_filter_command(filter_index: int) -> bytes:
@@ -96,11 +98,21 @@ def build_reset_filter_command(filter_index: int) -> bytes:
 
     Returns:
         Framed SOH/EOT command bytes.
+
+    Raises:
+        ValueError: If the filter index is negative.
     """
+    if filter_index < 0:
+        raise ValueError("Filter index must be non-negative")
+
     return (
-        f'\x01{{"{MakiposPayloadKey.EVENT_TYPE}":"{MakiposEventType.CP}",'
-        f'"{MakiposPayloadKey.PROPERTY_CODE}":"{MakiposPropertyCode.IRO_RSFT}",'
-        f'"{MakiposPayloadKey.DATA}":{filter_index}}}\x04'.encode()
+        MAKIPOS_COMMAND_START
+        + (
+            f'{{"{MakiposPayloadKey.EVENT_TYPE}":"{MakiposEventType.CP}",'
+            f'"{MakiposPayloadKey.PROPERTY_CODE}":"{MakiposPropertyCode.IRO_RSFT}",'
+            f'"{MakiposPayloadKey.DATA}":{filter_index}}}'
+        ).encode()
+        + MAKIPOS_COMMAND_TERMINATOR
     )
 
 
@@ -165,6 +177,7 @@ class KarofiDevicePrefix(StrEnum):
 # Storage constants
 STORAGE_VERSION: Final = 1
 STORAGE_KEY_PREFIX: Final = "karofi_filters"
+PENDING_RESET_STORAGE_SUFFIX: Final = "pending_resets"
 
 # Water Quality Thresholds (ppm)
 TDS_THRESHOLD_GOOD: Final = 50
@@ -182,10 +195,33 @@ class WaterQuality(StrEnum):
     UNKNOWN = "unknown"
 
 
+# English fallback messages from the Karofi 365 app's water-purifier mapping.
+DEVICE_ERROR_MESSAGES: Final[dict[int, str]] = {
+    1: "Pump works continuously for more than 5 hours",
+    2: "Weak inlet water",
+    4: "No inlet water",
+    5: "The water is leaking",
+    100: "TDS high",
+}
+
+
+def describe_device_error(code: int) -> str:
+    """Return the English fallback description for a device error code.
+
+    Args:
+        code: Device error code reported in ``iro_errs``.
+
+    Returns:
+        English vendor error description, or a generic fallback for unknown codes.
+    """
+    return DEVICE_ERROR_MESSAGES.get(code, f"Unknown device error code {code}")
+
+
 # Polling and connection settings
 DEFAULT_SCAN_INTERVAL: Final = 60
 BLE_CONNECT_ATTEMPTS: Final = 2
 BLE_TIMEOUT_SECONDS: Final = 25
+BLE_COMMAND_CHUNK_SIZE: Final = 19
 SUPPLEMENTAL_TELEMETRY_TIMEOUT_SECONDS: Final = 10
 DIRECT_TDS_RETURN_RESERVE_SECONDS: Final = 2
 
