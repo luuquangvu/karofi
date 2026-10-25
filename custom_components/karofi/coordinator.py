@@ -146,10 +146,10 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         service_info: BluetoothServiceInfoBleak,
         change: BluetoothChange = BluetoothChange.ADVERTISEMENT,
     ) -> None:
-        """Handle bluetooth discovery and advertisement events.
+        """Update advertisement RSSI and notify listeners only when it changes.
 
         Args:
-            service_info: Service info from Bluetooth scanner.
+            service_info: Scanner report containing the device's RSSI in dBm.
             change: Type of change event.
         """
         _LOGGER.debug(
@@ -243,7 +243,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         return resolved, needs_save
 
     async def async_setup(self) -> None:
-        """Load persistent filter tracking dates and register active Bluetooth scanner."""
+        """Restore filter tracking state and register Bluetooth signal tracking.
+
+        Request active scanning and subscribe to advertisements and their expiry,
+        with callback cleanup on config entry unload. RuntimeError and KeyError
+        during Bluetooth registration are ignored so filter restoration can continue.
+        Restore filter dates and pending resets, save corrected state when needed,
+        and notify listeners. Errors from loading storage propagate to the caller.
+        """
         try:
             for addr in self._mac_candidates:
                 # Keep the active-scan request; per-advertisement callbacks do not provide it.

@@ -145,9 +145,15 @@ class KarofiSignalStrengthSensor(KarofiBaseEntity, SensorEntity):
     def __init__(self, coordinator: KarofiDataCoordinator, entry: ConfigEntry) -> None:
         """Initialize the Bluetooth signal strength sensor.
 
+        Use the current advertisement RSSI in dBm, with None making the sensor
+        unavailable regardless of GATT connection status.
+
         Args:
             coordinator: Coordinator providing data.
-            entry: Configuration entry.
+            entry: Configuration entry containing the device MAC address.
+
+        Raises:
+            KeyError: If the configuration entry has no MAC address.
         """
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{self._mac}_signal_strength"
@@ -156,7 +162,7 @@ class KarofiSignalStrengthSensor(KarofiBaseEntity, SensorEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
+        """Publish RSSI in dBm, marking the sensor unavailable when RSSI is None."""
         signal_strength = self.coordinator.data.signal_strength
         self._attr_native_value = signal_strength
         self._attr_available = signal_strength is not None
