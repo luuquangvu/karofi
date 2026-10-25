@@ -123,6 +123,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             filter_reset_dates={},
             filters={},
             errors=[],
+            signal_strength=None,
         )
         self._known_tds_char_uuid: str | None = None
         self._telemetry_generation = 0
@@ -155,6 +156,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             service_info.rssi,
             change,
         )
+        if self.data.signal_strength != service_info.rssi:
+            self.data.signal_strength = service_info.rssi
+            self.async_update_listeners()
 
     def _get_ble_device(self) -> BLEDevice | None:
         """Locate the BLEDevice across known address formats and active scanners.

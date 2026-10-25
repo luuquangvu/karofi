@@ -30,6 +30,7 @@
 
 - **Kết nối cục bộ 100% (Không cần Cloud)**: Hoạt động hoàn toàn qua kết nối Bluetooth Low Energy (BLE) thông qua ngăn xếp Bluetooth tích hợp sẵn của Home Assistant. Không yêu cầu hub chuyên dụng, không cần tài khoản đám mây hay kết nối internet.
 - **Giám sát chỉ số TDS nước tinh khiết thời gian thực**: Đo chính xác nồng độ tổng chất rắn hòa tan (đơn vị ppm) sau màng lọc RO trực tiếp từ cảm biến tích hợp của máy.
+- **Cường độ tín hiệu Bluetooth**: Hiển thị độ mạnh tín hiệu Bluetooth của máy theo đơn vị dBm, giúp bạn kiểm tra vùng phủ sóng và tìm vị trí phù hợp cho Bluetooth Proxy.
 - **Phân loại chất lượng nước theo chuẩn an toàn**: Tự động đánh giá độ tinh khiết của nước thành các mức rõ ràng:
   - **Tốt** (< 50 ppm): Nước có độ tinh khiết cao, đạt chuẩn uống trực tiếp.
   - **Khá** (50-150 ppm): Nước ở mức an toàn; nên theo dõi sự thay đổi theo thời gian.
@@ -65,9 +66,10 @@ Tiện ích này tương thích với các dòng máy lọc nước thông minh 
 | :------------------ | :-------------------------------------------------- | :------------- | :------------------------------------------------------------------------------------- |
 | **Sensor**          | `sensor.<mac>_tds` (mẫu Entity ID)                  | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                                        |
 | **Sensor**          | `sensor.<mac>_quality` (mẫu Entity ID)              | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).                          |
+| **Sensor**          | `sensor.<mac>_signal_strength` (mẫu Entity ID)      | `dBm`          | Cường độ tín hiệu Bluetooth (dBm), đọc từ quảng cáo của thiết bị. Cảm biến chẩn đoán.  |
 | **Sensor**          | `sensor.<mac>_filter_<n>_percent` (mẫu Entity ID)   | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).                              |
 | **Sensor**          | `<mac>_filter_<n>_days` (Unique ID)                 | `ngày`         | Số ngày còn lại đến hạn thay Lõi `<n>`; `_days` là hậu tố của unique ID.               |
-| **Binary Sensor**   | `binary_sensor.<mac>_connectivity` (mẫu Entity ID)  | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước.                                         |
+| **Binary Sensor**   | `binary_sensor.<mac>_connectivity` (mẫu Entity ID)  | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước. Cảm biến chẩn đoán.                     |
 | **Binary Sensor**   | `binary_sensor.<mac>_problem` (mẫu Entity ID)       | `problem`      | Bật khi máy lọc nước báo sự cố. Thuộc tính hiển thị mã lỗi và lời giải thích ngắn gọn. |
 | **Button**          | `button.<mac>_btn_reset_filter_<n>` (mẫu Entity ID) | `restore`      | Gửi lệnh đặt lại cho cấp lõi lọc tương ứng.                                            |
 

@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
-from homeassistant.const import PERCENTAGE, UnitOfTime
+from homeassistant.const import (
+    PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    EntityCategory,
+    UnitOfTime,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import dt as dt_util
@@ -24,6 +29,7 @@ from custom_components.karofi.sensor import (
     KarofiFilterDaysRemainingSensor,
     KarofiFilterPercentSensor,
     KarofiQualitySensor,
+    KarofiSignalStrengthSensor,
     KarofiTDSSensor,
     async_setup_entry,
 )
@@ -95,17 +101,17 @@ async def test_sensor_async_setup_entry(
         """
         added_entities.extend(new_entities)
 
-    # Initially without known filters: 2 sensors (TDS + Quality)
+    # Initially without known filters: 3 sensors (TDS + Quality + Signal strength)
     await async_setup_entry(hass, mock_config_entry, mock_add_entities)
-    assert len(added_entities) == 2
+    assert len(added_entities) == 3
 
     # Simulate discovery of 2 filters via coordinator data
     mock_coordinator.data.filter_reset_dates["filter_1"] = "2026-01-01T00:00:00"
     mock_coordinator.data.filter_reset_dates["filter_2"] = "2026-01-01T00:00:00"
     mock_coordinator.async_update_listeners()
 
-    # 2 base sensors + 4 filter sensors (2 per filter)
-    assert len(added_entities) == 6
+    # 3 base sensors + 4 filter sensors (2 per filter)
+    assert len(added_entities) == 7
 
 
 async def test_tds_sensor(
@@ -173,6 +179,47 @@ async def test_quality_sensor(
     # Disconnect device
     mock_coordinator.data.connected = False
     sensor._handle_coordinator_update()
+    assert sensor.available is False
+
+
+async def test_signal_strength_sensor(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test BLE signal strength sensor attributes and coordinator updates.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    sensor = KarofiSignalStrengthSensor(mock_coordinator, mock_config_entry)
+    _init_test_sensor(sensor, "sensor.karofi_signal_strength", hass)
+    assert sensor.translation_key == "signal_strength"
+    assert sensor.unique_id == "aa:bb:cc:11:22:33_signal_strength"
+    assert sensor.device_class == SensorDeviceClass.SIGNAL_STRENGTH
+    assert sensor.state_class == SensorStateClass.MEASUREMENT
+    assert sensor.native_unit_of_measurement == SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    assert sensor.entity_category == EntityCategory.DIAGNOSTIC
+    assert sensor.entity_registry_enabled_default is True
+    assert sensor.native_value is None
+    assert sensor.available is False
+
+    # An advertisement provides an RSSI reading even before a GATT connection.
+    mock_coordinator.data.signal_strength = -67
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == -67
+    assert sensor.available is True
+
+    mock_coordinator.data.signal_strength = -82
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == -82
+    assert sensor.available is True
+
+    mock_coordinator.data.signal_strength = None
+    sensor._handle_coordinator_update()
+    assert sensor.native_value is None
     assert sensor.available is False
 
 

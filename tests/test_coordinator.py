@@ -489,7 +489,7 @@ async def test_coordinator_update_data_connection_errors(
 
 
 async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordinator) -> None:
-    """Test _async_handle_bluetooth_event executes without error.
+    """Test _async_handle_bluetooth_event tracks advertisement RSSI.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
@@ -497,7 +497,21 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
     mock_service_info = MagicMock(spec=BluetoothServiceInfoBleak)
     mock_service_info.address = "AA:BB:CC:11:22:33"
     mock_service_info.rssi = -60
-    coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
+    with patch.object(coordinator, "async_update_listeners") as mock_update_listeners:
+        coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
+        assert coordinator.data.signal_strength == -60
+        mock_update_listeners.assert_called_once()
+
+        # Unchanged RSSI does not trigger redundant coordinator updates.
+        mock_update_listeners.reset_mock()
+        coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
+        mock_update_listeners.assert_not_called()
+
+        # A new RSSI reading is propagated to entities.
+        mock_service_info.rssi = -71
+        coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
+        assert coordinator.data.signal_strength == -71
+        mock_update_listeners.assert_called_once()
 
 
 async def test_coordinator_notify_fallback_success(

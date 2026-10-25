@@ -2,7 +2,12 @@
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfTime
+from homeassistant.const import (
+    PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    EntityCategory,
+    UnitOfTime,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -29,6 +34,7 @@ async def async_setup_entry(
     entities: list[SensorEntity] = [
         KarofiTDSSensor(coordinator, entry),
         KarofiQualitySensor(coordinator, entry),
+        KarofiSignalStrengthSensor(coordinator, entry),
     ]
 
     known_keys: set[str] = set()
@@ -123,6 +129,37 @@ class KarofiQualitySensor(KarofiBaseEntity, SensorEntity):
             if isinstance(self.coordinator.data.quality, WaterQuality)
             else self.coordinator.data.quality
         )
+        super()._handle_coordinator_update()
+
+
+class KarofiSignalStrengthSensor(KarofiBaseEntity, SensorEntity):
+    """Sensor showing the Bluetooth signal strength reported by the device."""
+
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = KarofiIcon.SIGNAL
+    _attr_translation_key = "signal_strength"
+
+    def __init__(self, coordinator: KarofiDataCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the Bluetooth signal strength sensor.
+
+        Args:
+            coordinator: Coordinator providing data.
+            entry: Configuration entry.
+        """
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{self._mac}_signal_strength"
+        self._attr_native_value = coordinator.data.signal_strength
+        self._attr_available = coordinator.data.signal_strength is not None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        signal_strength = self.coordinator.data.signal_strength
+        self._attr_native_value = signal_strength
+        self._attr_available = signal_strength is not None
         super()._handle_coordinator_update()
 
 
