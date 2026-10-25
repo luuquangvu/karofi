@@ -10,9 +10,13 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak.backends.service import BleakGATTServiceCollection
 from bleak.exc import BleakError
+from bluetooth_data_tools import monotonic_time_coarse
+from habluetooth import get_manager
 from homeassistant.components.bluetooth import (
     BluetoothChange,
+    BluetoothScanningMode,
     BluetoothServiceInfoBleak,
+    async_register_callback,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -512,6 +516,105 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         assert coordinator.data.signal_strength == -71
         mock_update_listeners.assert_called_once()
+
+
+@pytest.mark.usefixtures("enable_bluetooth")
+@pytest.mark.parametrize("address", ["AA:BB:CC:11:22:33", "aa:bb:cc:11:22:33"])
+@pytest.mark.parametrize("connectable", [True, False])
+async def test_coordinator_advertisement_rssi_lifecycle(
+    coordinator: KarofiDataCoordinator,
+    address: str,
+    connectable: bool,
+) -> None:
+    """Receive unchanged advertisements, expire RSSI, recover, and unsubscribe.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        address: Address format reported by the scanner.
+        connectable: Whether the scanner supports GATT connections.
+    """
+    manager = get_manager()
+    with patch(
+        "custom_components.karofi.coordinator.async_register_callback",
+        wraps=async_register_callback,
+    ) as mock_register:
+        await coordinator.async_setup()
+        assert mock_register.call_count == 2
+        for registration, candidate in zip(
+            mock_register.call_args_list, coordinator._mac_candidates, strict=True
+        ):
+            assert registration.args[2] == {"address": candidate, "connectable": True}
+            assert registration.args[3] == BluetoothScanningMode.ACTIVE
+
+    def advertise(rssi: int, device_address: str = address) -> BluetoothServiceInfoBleak:
+        """Send an advertisement with an otherwise unchanged payload."""
+        service_info = BluetoothServiceInfoBleak(
+            name="RSSI test device",
+            address=device_address,
+            rssi=rssi,
+            manufacturer_data={},
+            service_data={},
+            service_uuids=[],
+            source="test-scanner",
+            device=BLEDevice(device_address, "RSSI test device", {}),
+            advertisement=None,
+            connectable=connectable,
+            time=monotonic_time_coarse(),
+            tx_power=None,
+        )
+        manager.scanner_adv_received(service_info)
+        return service_info
+
+    with patch.object(coordinator, "async_update_listeners") as mock_update_listeners:
+        advertise(-90, "11:22:33:44:55:66")
+        assert coordinator.data.signal_strength is None
+        mock_update_listeners.assert_not_called()
+
+        advertise(-60)
+        assert coordinator.data.signal_strength == -60
+        assert coordinator.data.connected is False
+        mock_update_listeners.assert_called_once()
+
+        mock_update_listeners.reset_mock()
+        advertise(-60)
+        mock_update_listeners.assert_not_called()
+
+        service_info = advertise(-71)
+        assert coordinator.data.signal_strength == -71
+        mock_update_listeners.assert_called_once()
+
+        # A missing GATT path must not clear RSSI while advertisements remain available.
+        with patch.object(coordinator, "_get_ble_device", return_value=None):
+            await coordinator._async_update_data()
+        assert coordinator.data.signal_strength == -71
+
+        mock_update_listeners.reset_mock()
+        service_info.time -= 3600
+        # Replace the scheduled check when invoking expiry directly.
+        if manager._cancel_unavailable_tracking is not None:
+            manager._cancel_unavailable_tracking.cancel()
+        manager._async_check_unavailable()
+        assert coordinator.data.signal_strength is None
+        mock_update_listeners.assert_called_once()
+
+        mock_update_listeners.reset_mock()
+        coordinator._async_handle_bluetooth_unavailable(service_info)
+        mock_update_listeners.assert_not_called()
+
+        advertise(-71)
+        assert coordinator.data.signal_strength == -71
+        assert coordinator.data.connected is False
+        mock_update_listeners.assert_called_once()
+
+        await coordinator.entry._async_process_on_unload(coordinator.hass)
+        mock_update_listeners.reset_mock()
+        service_info = advertise(-82)
+        service_info.time -= 3600
+        if manager._cancel_unavailable_tracking is not None:
+            manager._cancel_unavailable_tracking.cancel()
+        manager._async_check_unavailable()
+        assert coordinator.data.signal_strength == -71
+        mock_update_listeners.assert_not_called()
 
 
 async def test_coordinator_notify_fallback_success(

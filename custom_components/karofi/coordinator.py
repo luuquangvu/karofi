@@ -22,7 +22,9 @@ from homeassistant.components.bluetooth import (
     async_address_reachability_diagnostics,
     async_ble_device_from_address,
     async_discovered_service_info,
+    async_register_advertisement_callback,
     async_register_callback,
+    async_track_unavailable,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -142,7 +144,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
     def _async_handle_bluetooth_event(
         self,
         service_info: BluetoothServiceInfoBleak,
-        change: BluetoothChange,
+        change: BluetoothChange = BluetoothChange.ADVERTISEMENT,
     ) -> None:
         """Handle bluetooth discovery and advertisement events.
 
@@ -158,6 +160,18 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         )
         if self.data.signal_strength != service_info.rssi:
             self.data.signal_strength = service_info.rssi
+            self.async_update_listeners()
+
+    @callback
+    def _async_handle_bluetooth_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
+        """Clear RSSI when advertisements for the device expire.
+
+        Args:
+            service_info: Last service info for the unavailable device.
+        """
+        _LOGGER.debug("Karofi advertisements expired for %s", hide_mac(service_info.address))
+        if self.data.signal_strength is not None:
+            self.data.signal_strength = None
             self.async_update_listeners()
 
     def _get_ble_device(self) -> BLEDevice | None:
@@ -232,12 +246,26 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """Load persistent filter tracking dates and register active Bluetooth scanner."""
         try:
             for addr in self._mac_candidates:
+                # Keep the active-scan request; per-advertisement callbacks do not provide it.
                 self.entry.async_on_unload(
                     async_register_callback(
                         self.hass,
                         self._async_handle_bluetooth_event,
                         BluetoothCallbackMatcher(address=addr, connectable=True),
                         BluetoothScanningMode.ACTIVE,
+                    )
+                )
+                self.entry.async_on_unload(
+                    async_register_advertisement_callback(
+                        self.hass, self._async_handle_bluetooth_event, addr
+                    )
+                )
+                self.entry.async_on_unload(
+                    async_track_unavailable(
+                        self.hass,
+                        self._async_handle_bluetooth_unavailable,
+                        addr,
+                        connectable=False,
                     )
                 )
         except RuntimeError, KeyError:
