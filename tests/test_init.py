@@ -1,9 +1,11 @@
 """Tests for the Karofi component initialization and unloading."""
 
 import asyncio
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -174,6 +176,50 @@ async def test_unload_entry_cancels_background_refresh(
 
         assert task_cancelled.is_set()
         assert mock_config_entry.entry_id not in hass.data[DOMAIN]
+
+
+async def test_unload_entry_cancels_pending_unknown_payload_flush(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test unloading an entry cancels queued unknown payload diagnostics.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    mock_config_entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "custom_components.karofi.coordinator.KarofiDataCoordinator.async_setup",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.karofi.coordinator.KarofiDataCoordinator.async_refresh",
+            new_callable=AsyncMock,
+        ),
+    ):
+        result = await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        assert result is True
+        await hass.async_block_till_done()
+
+        coordinator = hass.data[DOMAIN][mock_config_entry.entry_id]
+        coordinator._process_tds_payload(b'{"first_unknown":1}')
+        coordinator._process_tds_payload(b'{"second_unknown":2}')
+        assert "second_unknown=2" not in caplog.text
+        assert coordinator._unknown_payload_flush_handle is not None
+
+        unload_result = await hass.config_entries.async_unload(mock_config_entry.entry_id)
+        assert unload_result is True
+        await hass.async_block_till_done()
+
+        assert coordinator._unknown_payload_flush_handle is None
+        coordinator._handle_unknown_payload_flush()
+        assert "second_unknown=2" not in caplog.text
 
 
 async def test_unload_entry_failure(
