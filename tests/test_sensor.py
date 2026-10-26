@@ -222,6 +222,13 @@ async def test_signal_strength_sensor(
     assert sensor.native_value is None
     assert sensor.available is False
 
+    # RSSI availability is independent of coordinator poll success.
+    mock_coordinator.last_update_success = False
+    mock_coordinator.data.signal_strength = -67
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == -67
+    assert sensor.available is True
+
 
 async def test_filter_percent_sensor_calculations(
     hass: HomeAssistant,

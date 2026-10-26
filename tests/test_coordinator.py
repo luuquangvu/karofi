@@ -149,6 +149,35 @@ async def test_coordinator_setup_handles_empty_store(
     assert coordinator.get_known_filter_keys() == []
 
 
+async def test_coordinator_setup_registers_each_bluetooth_callback(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Bluetooth registration failures do not skip later addresses or callbacks.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    with (
+        patch(
+            "custom_components.karofi.coordinator.async_register_callback",
+            side_effect=[RuntimeError("manager unavailable"), MagicMock()],
+        ) as mock_scan,
+        patch(
+            "custom_components.karofi.coordinator.async_register_advertisement_callback",
+            return_value=MagicMock(),
+        ) as mock_advertisement,
+        patch(
+            "custom_components.karofi.coordinator.async_track_unavailable",
+            return_value=MagicMock(),
+        ) as mock_unavailable,
+    ):
+        await coordinator.async_setup()
+
+    assert mock_scan.call_count == 2
+    assert mock_advertisement.call_count == 2
+    assert mock_unavailable.call_count == 2
+
+
 async def test_coordinator_setup_no_save_when_valid(
     coordinator: KarofiDataCoordinator,
     hass_storage: dict[str, Any],
@@ -516,6 +545,13 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         assert coordinator.data.signal_strength == -71
         mock_update_listeners.assert_called_once()
+
+        # A zero RSSI means the scanner had no reading; keep the last valid value.
+        mock_update_listeners.reset_mock()
+        mock_service_info.rssi = 0
+        coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
+        assert coordinator.data.signal_strength == -71
+        mock_update_listeners.assert_not_called()
 
 
 @pytest.mark.usefixtures("enable_bluetooth")

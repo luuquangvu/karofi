@@ -152,14 +152,22 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             service_info: Scanner report containing the device's RSSI in dBm.
             change: Type of change event.
         """
+        rssi = service_info.rssi
         _LOGGER.debug(
             "Karofi advertisement seen for %s (RSSI: %s, change: %s)",
             hide_mac(service_info.address),
-            service_info.rssi,
+            rssi,
             change,
         )
-        if self.data.signal_strength != service_info.rssi:
-            self.data.signal_strength = service_info.rssi
+        if rssi == 0:
+            _LOGGER.debug(
+                "Ignoring missing RSSI for %s; retaining the last valid reading",
+                hide_mac(service_info.address),
+            )
+            return
+
+        if self.data.signal_strength != rssi:
+            self.data.signal_strength = rssi
             self.async_update_listeners()
 
     @callback
@@ -242,41 +250,62 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         return resolved, needs_save
 
+    def _async_register_bluetooth_callbacks(self, address: str) -> None:
+        """Register Bluetooth callbacks for one address without cross-failure.
+
+        Args:
+            address: Device address to track.
+        """
+        registrations: tuple[tuple[str, Callable[[], Callable[[], None]]], ...] = (
+            (
+                "active scan",
+                lambda: async_register_callback(
+                    self.hass,
+                    self._async_handle_bluetooth_event,
+                    BluetoothCallbackMatcher(address=address, connectable=True),
+                    BluetoothScanningMode.ACTIVE,
+                ),
+            ),
+            (
+                "advertisement",
+                lambda: async_register_advertisement_callback(
+                    self.hass,
+                    self._async_handle_bluetooth_event,
+                    address,
+                ),
+            ),
+            (
+                "unavailable",
+                lambda: async_track_unavailable(
+                    self.hass,
+                    self._async_handle_bluetooth_unavailable,
+                    address,
+                    connectable=False,
+                ),
+            ),
+        )
+        for description, register in registrations:
+            try:
+                self.entry.async_on_unload(register())
+            except RuntimeError, KeyError:
+                _LOGGER.debug(
+                    "Bluetooth manager not available to register %s callback for %s",
+                    description,
+                    hide_mac(address),
+                )
+
     async def async_setup(self) -> None:
         """Restore filter tracking state and register Bluetooth signal tracking.
 
         Request active scanning and subscribe to advertisements and their expiry,
-        with callback cleanup on config entry unload. RuntimeError and KeyError
-        during Bluetooth registration are ignored so filter restoration can continue.
+        with callback cleanup on config entry unload. Registration failures are
+        isolated per callback so filter restoration can continue.
         Restore filter dates and pending resets, save corrected state when needed,
         and notify listeners. Errors from loading storage propagate to the caller.
         """
-        try:
-            for addr in self._mac_candidates:
-                # Keep the active-scan request; per-advertisement callbacks do not provide it.
-                self.entry.async_on_unload(
-                    async_register_callback(
-                        self.hass,
-                        self._async_handle_bluetooth_event,
-                        BluetoothCallbackMatcher(address=addr, connectable=True),
-                        BluetoothScanningMode.ACTIVE,
-                    )
-                )
-                self.entry.async_on_unload(
-                    async_register_advertisement_callback(
-                        self.hass, self._async_handle_bluetooth_event, addr
-                    )
-                )
-                self.entry.async_on_unload(
-                    async_track_unavailable(
-                        self.hass,
-                        self._async_handle_bluetooth_unavailable,
-                        addr,
-                        connectable=False,
-                    )
-                )
-        except RuntimeError, KeyError:
-            _LOGGER.debug("Bluetooth manager not available to register active scanner callback")
+        for addr in self._mac_candidates:
+            # Keep the active-scan request; per-advertisement callbacks do not provide it.
+            self._async_register_bluetooth_callbacks(addr)
 
         stored = await self._store.async_load()
         resolved_dates, needs_save = self._resolve_initial_dates(stored)
