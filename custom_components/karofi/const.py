@@ -166,6 +166,7 @@ class KarofiIcon(StrEnum):
     FILTER = "mdi:filter-outline"
     CALENDAR = "mdi:calendar-clock"
     RESTORE = "mdi:restore"
+    SIGNAL = "mdi:signal"
 
 
 class KarofiDevicePrefix(StrEnum):

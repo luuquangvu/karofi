@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.binary_sensor.const import BinarySensorDeviceClass
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.translation import async_get_translations
@@ -111,6 +112,7 @@ async def test_connectivity_binary_sensor(
 
     assert sensor.translation_key == "connectivity"
     assert sensor.device_class == BinarySensorDeviceClass.CONNECTIVITY
+    assert sensor.entity_category == EntityCategory.DIAGNOSTIC
     assert sensor.unique_id == "aa:bb:cc:11:22:33_connectivity"
     assert sensor.is_on is False
     assert sensor.available is True

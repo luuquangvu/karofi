@@ -30,6 +30,7 @@
 
 - **100% Local Control (No Cloud Required)**: Communicates directly via Bluetooth Low Energy (BLE) using Home Assistant's native Bluetooth stack. No proprietary hubs, external cloud accounts, or internet connectivity needed.
 - **Real-Time Pure Water TDS Monitoring**: Accurately measures Total Dissolved Solids in parts per million (ppm) directly from the purifier's sensor after the RO membrane.
+- **Bluetooth Signal Strength**: Shows how strong the purifier's Bluetooth signal is, in dBm, so you can check coverage and find the best place for a Bluetooth proxy.
 - **Health-Graded Water Quality Classification**: Automatically categorizes water purity into actionable ratings:
   - **Good** (< 50 ppm): High-purity drinking water with optimal mineral balance.
   - **Fair** (50-150 ppm): Acceptable drinking water; monitor for gradual increases.
@@ -61,17 +62,16 @@ This integration is designed for Karofi smart water purifiers equipped with Maki
 
 ## Entities Provided
 
-| Platform          | Identifier                                              | Device Class / Unit | Description                                                                                            |
-| :---------------- | :------------------------------------------------------ | :------------------ | :----------------------------------------------------------------------------------------------------- |
-| **Sensor**        | `sensor.<mac>_tds` (Entity ID pattern)                  | `ppm`               | Real-time pure water TDS concentration.                                                                |
-| **Sensor**        | `sensor.<mac>_quality` (Entity ID pattern)              | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).                                              |
-| **Sensor**        | `sensor.<mac>_filter_<n>_percent` (Entity ID pattern)   | `%`                 | Filter `<n>` remaining life percentage (dynamically added).                                            |
-| **Sensor**        | `<mac>_filter_<n>_days` (Unique ID)                     | `days`              | Filter `<n>` remaining days until replacement; `_days` is the unique-ID suffix.                        |
-| **Binary Sensor** | `binary_sensor.<mac>_connectivity` (Entity ID pattern)  | `connectivity`      | Bluetooth connection status with the purifier.                                                         |
-| **Binary Sensor** | `binary_sensor.<mac>_problem` (Entity ID pattern)       | `problem`           | Turns on when the purifier reports a problem. Its details show the error code and a short explanation. |
-| **Button**        | `button.<mac>_btn_reset_filter_<n>` (Entity ID pattern) | `restore`           | Send a reset command for the specified filter stage.                                                   |
-
-Home Assistant assigns entity IDs; the Entity ID patterns above are illustrative and may differ from your actual entity IDs.
+| Platform          | Identifier                                                           | Device Class / Unit | Description                                                                                            |
+| :---------------- | :------------------------------------------------------------------- | :------------------ | :----------------------------------------------------------------------------------------------------- |
+| **Sensor**        | `sensor.<device_name>_pure_water_tds` (Entity ID pattern)            | `ppm`               | Real-time pure water TDS concentration.                                                                |
+| **Sensor**        | `sensor.<device_name>_water_quality` (Entity ID pattern)             | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).                                              |
+| **Sensor**        | `sensor.<device_name>_signal_strength` (Entity ID pattern)           | `dBm`               | Bluetooth signal strength in dBm, read from device advertisements. Diagnostic sensor.                  |
+| **Sensor**        | `sensor.<device_name>_filter_<n>_life` (Entity ID pattern)           | `%`                 | Filter `<n>` remaining life percentage (dynamically added).                                            |
+| **Sensor**        | `sensor.<device_name>_filter_<n>_days_remaining` (Entity ID pattern) | `days`              | Filter `<n>` remaining days until replacement.                                                         |
+| **Binary Sensor** | `binary_sensor.<device_name>_connectivity` (Entity ID pattern)       | `connectivity`      | Bluetooth connection status with the purifier. Diagnostic sensor.                                      |
+| **Binary Sensor** | `binary_sensor.<device_name>_problem` (Entity ID pattern)            | `problem`           | Turns on when the purifier reports a problem. Its details show the error code and a short explanation. |
+| **Button**        | `button.<device_name>_reset_filter_<n>` (Entity ID pattern)          | `restore`           | Send a reset command for the specified filter stage.                                                   |
 
 ---
 

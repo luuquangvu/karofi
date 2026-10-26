@@ -22,7 +22,9 @@ from homeassistant.components.bluetooth import (
     async_address_reachability_diagnostics,
     async_ble_device_from_address,
     async_discovered_service_info,
+    async_register_advertisement_callback,
     async_register_callback,
+    async_track_unavailable,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -123,8 +125,10 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             filter_reset_dates={},
             filters={},
             errors=[],
+            signal_strength=None,
         )
         self._known_tds_char_uuid: str | None = None
+        self._latest_advertisement_time: float | None = None
         self._telemetry_generation = 0
         self._pending_reset_store: Store[dict[str, int | None]] = Store(
             hass,
@@ -141,20 +145,57 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
     def _async_handle_bluetooth_event(
         self,
         service_info: BluetoothServiceInfoBleak,
-        change: BluetoothChange,
+        change: BluetoothChange = BluetoothChange.ADVERTISEMENT,
     ) -> None:
-        """Handle bluetooth discovery and advertisement events.
+        """Update advertisement RSSI and notify listeners only when it changes.
 
         Args:
-            service_info: Service info from Bluetooth scanner.
+            service_info: Scanner report containing the device's RSSI in dBm.
             change: Type of change event.
         """
+        rssi = service_info.rssi
         _LOGGER.debug(
             "Karofi advertisement seen for %s (RSSI: %s, change: %s)",
             hide_mac(service_info.address),
-            service_info.rssi,
+            rssi,
             change,
         )
+        if rssi == 0:
+            _LOGGER.debug(
+                "Ignoring missing RSSI for %s; retaining the last valid reading",
+                hide_mac(service_info.address),
+            )
+            return
+
+        advertisement_time = service_info.time
+        if (
+            self._latest_advertisement_time is not None
+            and advertisement_time < self._latest_advertisement_time
+        ):
+            _LOGGER.debug(
+                "Ignoring out-of-order advertisement for %s (time %.3f is older than %.3f)",
+                hide_mac(service_info.address),
+                advertisement_time,
+                self._latest_advertisement_time,
+            )
+            return
+
+        self._latest_advertisement_time = advertisement_time
+        if self.data.signal_strength != rssi:
+            self.data.signal_strength = rssi
+            self.async_update_listeners()
+
+    @callback
+    def _async_handle_bluetooth_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
+        """Clear RSSI when advertisements for the device expire.
+
+        Args:
+            service_info: Last service info for the unavailable device.
+        """
+        _LOGGER.debug("Karofi advertisements expired for %s", hide_mac(service_info.address))
+        if self.data.signal_strength is not None:
+            self.data.signal_strength = None
+            self.async_update_listeners()
 
     def _get_ble_device(self) -> BLEDevice | None:
         """Locate the BLEDevice across known address formats and active scanners.
@@ -224,20 +265,62 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         return resolved, needs_save
 
-    async def async_setup(self) -> None:
-        """Load persistent filter tracking dates and register active Bluetooth scanner."""
-        try:
-            for addr in self._mac_candidates:
-                self.entry.async_on_unload(
-                    async_register_callback(
-                        self.hass,
-                        self._async_handle_bluetooth_event,
-                        BluetoothCallbackMatcher(address=addr, connectable=True),
-                        BluetoothScanningMode.ACTIVE,
-                    )
+    def _async_register_bluetooth_callbacks(self, address: str) -> None:
+        """Register Bluetooth callbacks for one address without cross-failure.
+
+        Args:
+            address: Device address to track.
+        """
+        registrations: tuple[tuple[str, Callable[[], Callable[[], None]]], ...] = (
+            (
+                "active scan",
+                lambda: async_register_callback(
+                    self.hass,
+                    self._async_handle_bluetooth_event,
+                    BluetoothCallbackMatcher(address=address, connectable=True),
+                    BluetoothScanningMode.ACTIVE,
+                ),
+            ),
+            (
+                "advertisement",
+                lambda: async_register_advertisement_callback(
+                    self.hass,
+                    self._async_handle_bluetooth_event,
+                    address,
+                ),
+            ),
+            (
+                "unavailable",
+                lambda: async_track_unavailable(
+                    self.hass,
+                    self._async_handle_bluetooth_unavailable,
+                    address,
+                    connectable=False,
+                ),
+            ),
+        )
+        for description, register in registrations:
+            try:
+                self.entry.async_on_unload(register())
+            except RuntimeError, KeyError:
+                _LOGGER.debug(
+                    "Bluetooth manager not available to register %s callback for %s",
+                    description,
+                    hide_mac(address),
                 )
-        except RuntimeError, KeyError:
-            _LOGGER.debug("Bluetooth manager not available to register active scanner callback")
+
+    async def async_setup(self) -> None:
+        """Restore filter tracking state and register Bluetooth signal tracking.
+
+        Request active scanning and subscribe to advertisements and their expiry,
+        with callback cleanup on config entry unload. Registration failures are
+        isolated per callback so filter restoration can continue.
+        Restore filter dates and pending resets, save corrected state when needed,
+        and notify listeners. Errors from loading storage propagate to the caller.
+        """
+        for addr in self._mac_candidates:
+            # Keep the active-scan request; per-advertisement callbacks do not provide it.
+            self._async_register_bluetooth_callbacks(addr)
 
         stored = await self._store.async_load()
         resolved_dates, needs_save = self._resolve_initial_dates(stored)

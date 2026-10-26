@@ -52,6 +52,9 @@
       }
     },
     "sensor": {
+      "signal_strength": {
+        "name": "Signal strength"
+      },
       "tds": {
         "name": "Pure water TDS"
       },

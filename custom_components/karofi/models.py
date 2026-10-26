@@ -68,3 +68,4 @@ class KarofiData:
     filter_reset_dates: dict[str, str]
     filters: dict[str, KarofiFilterData] = field(default_factory=dict)
     errors: list[int] = field(default_factory=list)
+    signal_strength: int | None = None

@@ -3,6 +3,7 @@
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.binary_sensor.const import BinarySensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.translation import async_translate_state_attr
@@ -37,6 +38,7 @@ class KarofiConnectivityBinarySensor(KarofiBaseEntity, BinarySensorEntity):
     """Binary sensor indicating device Bluetooth connectivity."""
 
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_translation_key = "connectivity"
 
     def __init__(self, coordinator: KarofiDataCoordinator, entry: ConfigEntry) -> None:
