@@ -522,7 +522,7 @@ async def test_coordinator_update_data_connection_errors(
 
 
 async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordinator) -> None:
-    """Test _async_handle_bluetooth_event tracks advertisement RSSI.
+    """Test _async_handle_bluetooth_event caches advertisement RSSI.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
@@ -532,6 +532,7 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
     mock_service_info.rssi = -60
     mock_service_info.time = 100.0
     with patch.object(coordinator, "async_update_listeners") as mock_update_listeners:
+        # The first reading is published immediately to make the sensor available.
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         assert coordinator.data.signal_strength == -60
         mock_update_listeners.assert_called_once()
@@ -541,15 +542,15 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         mock_update_listeners.assert_not_called()
 
-        # A new RSSI reading is propagated to entities.
+        # A new reading is cached but not published per advertisement; the next
+        # coordinator refresh publishes it.
         mock_service_info.rssi = -71
         mock_service_info.time = 200.0
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         assert coordinator.data.signal_strength == -71
-        mock_update_listeners.assert_called_once()
+        mock_update_listeners.assert_not_called()
 
         # A zero RSSI means the scanner had no reading; keep the last valid value.
-        mock_update_listeners.reset_mock()
         mock_service_info.rssi = 0
         mock_service_info.time = 300.0
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
@@ -563,11 +564,49 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
         assert coordinator.data.signal_strength == -71
         mock_update_listeners.assert_not_called()
 
-        # A newer advertisement is still accepted.
+        # A newer advertisement is still accepted and cached without publishing.
         mock_service_info.time = 250.0
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         assert coordinator.data.signal_strength == -55
-        mock_update_listeners.assert_called_once()
+        mock_update_listeners.assert_not_called()
+
+
+async def test_coordinator_signal_strength_publishes_on_refresh(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test changed RSSI is published by the next coordinator refresh.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    service_info = MagicMock(spec=BluetoothServiceInfoBleak)
+    service_info.address = "AA:BB:CC:11:22:33"
+    service_info.rssi = -60
+    service_info.time = 100.0
+
+    published: list[int | None] = []
+    remove_listener = coordinator.async_add_listener(
+        lambda: published.append(coordinator.data.signal_strength)
+    )
+    try:
+        coordinator._async_handle_bluetooth_event(service_info, BluetoothChange.ADVERTISEMENT)
+        assert published == [-60]
+
+        service_info.rssi = -75
+        service_info.time = 101.0
+        coordinator._async_handle_bluetooth_event(service_info, BluetoothChange.ADVERTISEMENT)
+        assert coordinator.data.signal_strength == -75
+        assert published == [-60]
+
+        with patch(
+            "custom_components.karofi.coordinator.async_ble_device_from_address",
+            return_value=None,
+        ):
+            await coordinator.async_refresh()
+
+        assert published == [-60, -75]
+    finally:
+        remove_listener()
 
 
 @pytest.mark.usefixtures("enable_bluetooth")
@@ -633,12 +672,14 @@ async def test_coordinator_advertisement_rssi_lifecycle(
 
         service_info = advertise(-71)
         assert coordinator.data.signal_strength == -71
-        mock_update_listeners.assert_called_once()
+        # Changed RSSI is coalesced into the next coordinator refresh.
+        mock_update_listeners.assert_not_called()
 
         # A missing GATT path must not clear RSSI while advertisements remain available.
         with patch.object(coordinator, "_get_ble_device", return_value=None):
-            await coordinator._async_update_data()
+            await coordinator.async_refresh()
         assert coordinator.data.signal_strength == -71
+        mock_update_listeners.assert_called_once()
 
         mock_update_listeners.reset_mock()
         service_info.time -= 3600

@@ -148,7 +148,13 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         service_info: BluetoothServiceInfoBleak,
         change: BluetoothChange = BluetoothChange.ADVERTISEMENT,
     ) -> None:
-        """Update advertisement RSSI and notify listeners only when it changes.
+        """Update the cached advertisement RSSI without publishing every change.
+
+        RSSI fluctuates by a few dBm between advertisements, so prompting the
+        coordinator to notify listeners here would write a state update for
+        every packet. The first reading is published immediately to make the
+        sensor available; later readings are coalesced into the coordinator's
+        regular refresh, which runs every ``DEFAULT_SCAN_INTERVAL`` seconds.
 
         Args:
             service_info: Scanner report containing the device's RSSI in dBm.
@@ -182,8 +188,11 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return
 
         self._latest_advertisement_time = advertisement_time
-        if self.data.signal_strength != rssi:
-            self.data.signal_strength = rssi
+        had_signal_strength = self.data.signal_strength is not None
+        self.data.signal_strength = rssi
+        if not had_signal_strength:
+            # Publish the first valid reading immediately so the diagnostic
+            # sensor becomes available without waiting for the next poll.
             self.async_update_listeners()
 
     @callback
@@ -196,6 +205,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         _LOGGER.debug("Karofi advertisements expired for %s", self.masked_mac)
         if self.data.signal_strength is not None:
             self.data.signal_strength = None
+            # Expiry is a one-off transition, so publish it immediately.
             self.async_update_listeners()
 
     def _get_ble_device(self) -> BLEDevice | None:
