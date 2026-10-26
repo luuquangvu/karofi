@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Coroutine, Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TypeGuard
 
@@ -41,7 +42,13 @@ from .const import (
     DEFAULT_FILTER_LIFETIME_DAYS,
     DEFAULT_SCAN_INTERVAL,
     DIRECT_TDS_RETURN_RESERVE_SECONDS,
+    FILTER_DATA_STALE_AFTER_SECONDS,
+    FULL_TELEMETRY_SCAN_INTERVAL,
+    MAX_FILTER_STAGES,
+    MAX_TELEMETRY_CACHE_ENTRIES,
     MAX_VALID_TDS,
+    NOTIFICATION_TELEMETRY_GRACE_SECONDS,
+    NOTIFICATION_WAIT_SECONDS,
     NOTIFY_UUID_PREFIX,
     PENDING_RESET_STORAGE_SUFFIX,
     REQUEST_READ_DATA_COMMAND,
@@ -56,6 +63,7 @@ from .const import (
     TDS_THRESHOLD_FAIR,
     TDS_THRESHOLD_GOOD,
     TELEMETRY_PAYLOAD_KEYS,
+    WARNING_LOG_INTERVAL_SECONDS,
     GattProperty,
     KarofiCharacteristic,
     KarofiFilter,
@@ -86,6 +94,29 @@ _LOGGER = logging.getLogger(__name__)
 RESET_CONFIRMATION_POLLS = 3
 RESET_COMMAND_SETTLE_SECONDS = 1.0
 MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS = 256
+
+
+@dataclass
+class _TelemetryScanState:
+    """Accumulated state while scanning GATT characteristics."""
+
+    telemetry_payloads: list[bytearray] = field(default_factory=list)
+    tds_payload: bytearray | None = None
+    fallback_payload: bytearray = field(default_factory=bytearray)
+    discovered_char_uuids: list[str] = field(default_factory=list)
+    failed_char_uuids: list[str] = field(default_factory=list)
+    filter_telemetry_found: bool = False
+
+
+@dataclass
+class _NotificationWaitState:
+    """State for a notification subscription waiting for TDS or telemetry."""
+
+    notify_future: asyncio.Future[bytearray]
+    telemetry: bytearray | None = None
+    timer: asyncio.TimerHandle | None = None
+    allow_early_telemetry_return: bool = True
+    pending_id_reads: int = 0
 
 
 class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
@@ -128,14 +159,19 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             quality=WaterQuality.UNKNOWN,
             connected=False,
             last_seen=None,
+            filters_last_seen=None,
             filter_reset_dates={},
             filters={},
             errors=[],
             signal_strength=None,
         )
         self._known_tds_char_uuid: str | None = None
+        self._telemetry_char_uuids: list[str] = []
+        self._polls_since_full_scan = 0
+        self._ble_lock = asyncio.Lock()
         self._latest_advertisement_time: float | None = None
         self._debug_log_times: dict[str, float] = {}
+        self._warning_log_times: dict[str, float] = {}
         self._logged_unknown_payload_fields: dict[str, None] = {}
         self._pending_unknown_payload_fields: dict[str, str] = {}
         self._unknown_payload_flush_handle: asyncio.TimerHandle | None = None
@@ -170,6 +206,58 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return False
         self._debug_log_times[category] = now
         return True
+
+    def _warning_due(self, category: str) -> bool:
+        """Return whether a rate-limited warning may be emitted now.
+
+        Invalid device payloads can persist across every poll. Warnings are
+        therefore limited to one message per category per
+        ``WARNING_LOG_INTERVAL_SECONDS`` so a persistent fault does not flood
+        the log; repeat occurrences are emitted at debug level by the caller.
+
+        Args:
+            category: Cooldown bucket identifying the warning category.
+
+        Returns:
+            True when the caller may emit the category's warning message.
+        """
+        now = time.monotonic()
+        last_logged = self._warning_log_times.get(category)
+        if last_logged is not None and now - last_logged < WARNING_LOG_INTERVAL_SECONDS:
+            return False
+        self._warning_log_times[category] = now
+        return True
+
+    def is_filter_data_stale(self, filter_key: str | None = None) -> bool:
+        """Return whether filter telemetry is older than the stale threshold.
+
+        Args:
+            filter_key: Optional filter stage key. When provided, freshness is
+                evaluated from that stage's dynamic telemetry timestamp; when
+                omitted, the most recent dynamic telemetry from any stage is
+                used.
+
+        Returns:
+            True when the relevant dynamic filter telemetry is older than
+            ``FILTER_DATA_STALE_AFTER_SECONDS``, or when a filter record exists
+            but no dynamic filter telemetry has arrived since startup.
+        """
+        if filter_key is not None:
+            fdata = self.data.filters.get(filter_key)
+            if fdata is None:
+                return True
+            filters_last_seen = fdata.last_seen
+            if filters_last_seen is None:
+                return True
+        else:
+            filters_last_seen = self.data.filters_last_seen
+            if filters_last_seen is None:
+                # last_seen also advances for TDS/handshake payloads, so it
+                # cannot prove filter telemetry is fresh. Stored filters are
+                # stale until the first dynamic filter-bearing payload arrives.
+                return bool(self.data.filters)
+        age = (dt_util.utcnow() - dt_util.as_utc(filters_last_seen)).total_seconds()
+        return age > FILTER_DATA_STALE_AFTER_SECONDS
 
     @callback
     def _async_handle_bluetooth_event(
@@ -273,7 +361,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         return entries
 
     def _resolve_initial_dates(self, stored: object) -> tuple[dict[str, str], bool]:
-        """Resolve filter dates from storage or initial config options.
+        """Resolve filter dates from persistent storage.
 
         Args:
             stored: Loaded storage dictionary or None.
@@ -282,22 +370,12 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             Tuple of resolved filter reset dates mapping and save-required flag.
         """
         stored_dict = stored if isinstance(stored, dict) else {}
-        initial_dates = self.entry.options.get("initial_filter_reset_dates", {})
-        needs_save = False
-
         resolved: dict[str, str] = {}
         for key, val in self._parse_filter_dates_entry(stored_dict):
             if key not in resolved:
                 resolved[key] = val
 
-        if len(resolved) != len(stored_dict):
-            needs_save = True
-
-        for key, val in self._parse_filter_dates_entry(initial_dates):
-            if key not in resolved:
-                resolved[key] = val
-                needs_save = True
-
+        needs_save = len(resolved) != len(stored_dict)
         return resolved, needs_save
 
     def _async_register_bluetooth_callbacks(self, address: str) -> None:
@@ -372,10 +450,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         for key in resolved_dates:
             if key not in self.data.filters:
                 self.data.filters[key] = KarofiFilterData(
-                    index=filter_key_to_index(key),
-                    key=key,
                     lifetime_days=self.get_filter_lifetime_days(key),
-                    reset_date=resolved_dates[key],
                 )
 
         stored_pending_resets = await self._pending_reset_store.async_load()
@@ -401,10 +476,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     resolved_dates[key] = reset_date.isoformat()
                     self.data.filter_reset_dates[key] = resolved_dates[key]
                     self.data.filters[key] = KarofiFilterData(
-                        index=filter_key_to_index(key),
-                        key=key,
                         lifetime_days=self.get_filter_lifetime_days(key),
-                        reset_date=resolved_dates[key],
                     )
                     needs_save = True
                 else:
@@ -448,7 +520,15 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 return 999999
 
         known_keys = set(self.data.filters.keys()) | set(self.data.filter_reset_dates.keys())
-        return sorted(known_keys, key=_sort_key)
+        supported_keys: set[str] = set()
+        for key in known_keys:
+            try:
+                index = filter_key_to_index(key)
+            except ValueError:
+                continue
+            if index < MAX_FILTER_STAGES:
+                supported_keys.add(key)
+        return sorted(supported_keys, key=_sort_key)
 
     def _get_pending_reset_storage(self) -> dict[str, int | None]:
         """Return pending reset metadata for persistent storage."""
@@ -489,12 +569,35 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 return lifetime
         return DEFAULT_FILTER_LIFETIME_DAYS.get(key, 365)
 
+    def _remaining_days_from_reset_date(self, key: str, lifetime: int) -> int | None:
+        """Return calendar remaining days derived from the stored reset date.
+
+        Args:
+            key: Filter stage key.
+            lifetime: Rated lifespan in days.
+
+        Returns:
+            Remaining days from the reset date, or None when no valid date exists.
+        """
+        iso_date = self.data.filter_reset_dates.get(key)
+        if not iso_date:
+            return None
+        start_date = dt_util.parse_datetime(iso_date)
+        if start_date is None:
+            return None
+        used_days = (dt_util.utcnow() - dt_util.as_utc(start_date)).days
+        return max(0, min(lifetime, lifetime - used_days))
+
     def get_filter_remaining_days(
         self,
         filter_stage: KarofiFilter | str,
         max_days: int | None = None,
     ) -> int:
         """Calculate remaining days of filter lifespan.
+
+        While a reset is pending, the optimistic device value is combined with
+        the value derived from the stored reset date so the sensor keeps aging
+        even if the device never confirms the reset.
 
         Args:
             filter_stage: Filter identifier or KarofiFilter enum.
@@ -508,14 +611,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         if lifetime <= 0:
             return 0
 
-        if (
-            key in self._pending_filter_resets
-            and key in self.data.filters
-            and self.data.filters[key].remaining_days is not None
-        ):
-            remaining_days = self.data.filters[key].remaining_days
-            if remaining_days is not None:
-                return max(0, min(lifetime, remaining_days))
+        pending_filter = self.data.filters.get(key)
+        pending_remaining = pending_filter.remaining_days if pending_filter is not None else None
+        if key in self._pending_filter_resets and pending_remaining is not None:
+            remaining_days: int = pending_remaining
+            date_based = self._remaining_days_from_reset_date(key, lifetime)
+            if date_based is not None:
+                remaining_days = min(remaining_days, date_based)
+            return max(0, min(lifetime, remaining_days))
 
         if (
             key in self.data.filters
@@ -526,14 +629,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             if rem_days is not None:
                 return max(0, min(lifetime, rem_days))
 
-        iso_date = self.data.filter_reset_dates.get(key)
-        if not iso_date:
-            return lifetime
-        start_date = dt_util.parse_datetime(iso_date)
-        if start_date is None:
-            return lifetime
-        used_days = (dt_util.utcnow() - dt_util.as_utc(start_date)).days
-        return max(0, min(lifetime, lifetime - used_days))
+        date_based = self._remaining_days_from_reset_date(key, lifetime)
+        return lifetime if date_based is None else date_based
 
     def get_filter_calendar_percent(
         self,
@@ -640,6 +737,21 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
     async def _async_send_reset_command(self, filter_index: int) -> bool:
         """Send the BLE hardware reset command to the device.
+
+        Serializes with the polling session so a reset cannot race the regular
+        coordinator refresh for the device's BLE connection.
+
+        Args:
+            filter_index: 0-based integer index of the filter.
+
+        Returns:
+            True if command was successfully transmitted, False otherwise.
+        """
+        async with self._ble_lock:
+            return await self._async_send_reset_command_locked(filter_index)
+
+    async def _async_send_reset_command_locked(self, filter_index: int) -> bool:
+        """Send the BLE hardware reset command while holding the session lock.
 
         Args:
             filter_index: 0-based integer index of the filter.
@@ -831,10 +943,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         if filter_key not in self.data.filters:
             self.data.filters[filter_key] = KarofiFilterData(
-                index=filter_key_to_index(filter_key),
-                key=filter_key,
                 lifetime_days=lifetime,
-                reset_date=iso_str,
                 remaining_days=rem_days,
                 percent=pct,
                 remaining_hours=rem_hours,
@@ -842,7 +951,6 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             )
         else:
             fdata = self.data.filters[filter_key]
-            fdata.reset_date = iso_str
             fdata.remaining_days = rem_days
             fdata.percent = pct
             fdata.remaining_hours = rem_hours
@@ -1235,6 +1343,32 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         return True
 
     @staticmethod
+    async def _read_characteristic_for_scan(
+        client: BleakClientWithServiceCache,
+        target: BleakGATTCharacteristic | str,
+    ) -> tuple[bytearray, bool]:
+        """Read a characteristic and report whether the transport read succeeded.
+
+        Args:
+            client: Connected Bleak client instance.
+            target: Characteristic object or UUID string to read.
+
+        Returns:
+            Tuple of read bytes (empty when the characteristic had no data) and
+            whether the BLE read completed without a transport error.
+        """
+        try:
+            res = await client.read_gatt_char(target)
+            return (bytearray(res) if res else bytearray()), True
+        except (BleakError, OSError) as err:
+            _LOGGER.debug(
+                "Direct read of %s failed: %s",
+                getattr(target, "uuid", target),
+                err,
+            )
+            return bytearray(), False
+
+    @staticmethod
     async def _read_characteristic_safe(
         client: BleakClientWithServiceCache,
         target: BleakGATTCharacteristic | str,
@@ -1248,17 +1382,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Returns:
             Read bytes as bytearray, or empty bytearray on failure.
         """
-        try:
-            res = await client.read_gatt_char(target)
-            if res:
-                return bytearray(res)
-        except (BleakError, OSError) as err:
-            _LOGGER.debug(
-                "Direct read of %s failed: %s",
-                getattr(target, "uuid", target),
-                err,
-            )
-        return bytearray()
+        data, _ = await KarofiDataCoordinator._read_characteristic_for_scan(client, target)
+        return data
 
     @staticmethod
     def _is_handshake_payload(raw_bytes: bytearray | bytes) -> bool:
@@ -1301,6 +1426,42 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             self._has_filter_or_telemetry_field(p) for p in self._extract_all_payload_dicts(buffer)
         )
 
+    def _has_filter_telemetry_payload(self, buffer: bytearray | bytes) -> bool:
+        """Check whether a buffer contains filter or error telemetry.
+
+        Args:
+            buffer: Raw payload bytes to check.
+
+        Returns:
+            True when the buffer contains a filter or error telemetry field.
+        """
+        return any(
+            self._has_filter_or_telemetry_field(payload)
+            for payload in self._extract_all_payload_dicts(buffer)
+        )
+
+    @staticmethod
+    def _find_packet_match(
+        packets: list[bytearray],
+        predicate: Callable[[bytearray], bool],
+    ) -> bytearray | None:
+        """Find a packet or concatenated stream matching a predicate.
+
+        Args:
+            packets: List of raw bytearray packets.
+            predicate: Callable deciding whether a buffer contains the wanted data.
+
+        Returns:
+            Combined buffer, matching single packet, or None.
+        """
+        if len(packets) > 1:
+            combined = bytearray()
+            for pkt in packets:
+                combined.extend(pkt)
+            if predicate(combined):
+                return combined
+        return next((pkt for pkt in reversed(packets) if predicate(pkt)), None)
+
     def _find_tds_in_packets(self, packets: list[bytearray]) -> bytearray | None:
         """Find valid TDS or telemetry payload from single packet or concatenated packets.
 
@@ -1310,16 +1471,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Returns:
             Matching bytearray or None.
         """
-        if len(packets) > 1:
-            combined = bytearray()
-            for pkt in packets:
-                combined.extend(pkt)
-            if self._has_telemetry_payload(combined):
-                return combined
-        return next(
-            (pkt for pkt in reversed(packets) if self._has_telemetry_payload(pkt)),
-            None,
-        )
+        return self._find_packet_match(packets, self._has_telemetry_payload)
 
     def _find_tds_reading_in_packets(self, packets: list[bytearray]) -> bytearray | None:
         """Find packet or combined buffer containing a valid TDS reading.
@@ -1330,15 +1482,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Returns:
             Matching bytearray containing TDS reading or None.
         """
-        if len(packets) > 1:
-            combined = bytearray()
-            for pkt in packets:
-                combined.extend(pkt)
-            if self._parse_tds_reading(combined) is not None:
-                return combined
-        return next(
-            (pkt for pkt in reversed(packets) if self._parse_tds_reading(pkt) is not None),
-            None,
+        return self._find_packet_match(
+            packets,
+            lambda payload: self._parse_tds_reading(payload) is not None,
         )
 
     @staticmethod
@@ -1375,6 +1521,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         default_target: BleakGATTCharacteristic | str,
         bg_tasks: set[asyncio.Task[None]],
         read_func: Callable[[BleakGATTCharacteristic | str], Coroutine[object, object, None]],
+        wait_state: _NotificationWaitState | None = None,
     ) -> None:
         """Check if notification data contains an ID key and schedule a read task.
 
@@ -1384,6 +1531,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             default_target: Fallback read characteristic target.
             bg_tasks: Active background task set tracking spawned tasks.
             read_func: Async read callback to execute.
+            wait_state: Optional notification wait state used to defer the
+                filter-telemetry grace timer until the read completes.
         """
         payload = self._parse_json_payload(data)
         if payload is not None and MakiposPayloadKey.ID in payload:
@@ -1398,6 +1547,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             task = asyncio.create_task(read_func(resolved))
             bg_tasks.add(task)
             task.add_done_callback(bg_tasks.discard)
+            if wait_state is not None:
+                wait_state.pending_id_reads += 1
+
+                def _mark_id_read_done(_: asyncio.Task[None]) -> None:
+                    """Release the deferred grace timer when the read completes."""
+                    wait_state.pending_id_reads = max(0, wait_state.pending_id_reads - 1)
+
+                task.add_done_callback(_mark_id_read_done)
 
     async def _send_read_request(
         self,
@@ -1432,6 +1589,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         char_target: BleakGATTCharacteristic | str,
         received_packets: list[bytearray],
         notify_future: asyncio.Future[bytearray],
+        wait_state: _NotificationWaitState,
     ) -> None:
         """Read characteristic after receiving an ID notification from the device.
 
@@ -1440,6 +1598,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             char_target: Characteristic object or UUID string to read.
             received_packets: List tracking all raw packets received.
             notify_future: Future to resolve when valid TDS reading is received.
+            wait_state: Per-subscription state holding buffered telemetry.
         """
         try:
             res = await client.read_gatt_char(char_target)
@@ -1458,8 +1617,17 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             if self._parse_tds_reading(res_bytes) is not None:
                 self._log_assembled_notification_fields(received_packets)
                 self._known_tds_char_uuid = getattr(char_target, "uuid", str(char_target))
+                if wait_state.timer is not None:
+                    wait_state.timer.cancel()
+                    wait_state.timer = None
                 if not notify_future.done():
-                    notify_future.set_result(res_bytes)
+                    # Preserve filter telemetry buffered during the grace
+                    # window when the follow-up read supplies TDS.
+                    notify_future.set_result(
+                        bytearray(b"\n".join((wait_state.telemetry, res_bytes)))
+                        if wait_state.telemetry is not None
+                        else res_bytes
+                    )
         except (BleakError, OSError) as err:
             _LOGGER.debug("Read after ID notification failed on %s: %s", char_target, err)
 
@@ -1472,6 +1640,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         received_packets: list[bytearray],
         notify_future: asyncio.Future[bytearray],
         bg_tasks: set[asyncio.Task[None]],
+        wait_state: _NotificationWaitState,
     ) -> None:
         """Process notification packet received from BLE device.
 
@@ -1481,8 +1650,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             target: Characteristic object or UUID subscribed to.
             read_target: Read characteristic target when ID notify arrives.
             received_packets: List tracking all received packets.
-            notify_future: Future to resolve when valid TDS packet is received.
+            notify_future: Future to resolve when valid TDS or telemetry data is received.
             bg_tasks: Active background task set tracking spawned tasks.
+            wait_state: Per-subscription state for the telemetry grace window.
         """
         received_packets.append(data)
         self._log_unknown_payload_fields(data)
@@ -1497,9 +1667,34 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             )
         if match := self._find_tds_reading_in_packets(received_packets):
             self._log_assembled_notification_fields(received_packets)
+            if wait_state.timer is not None:
+                wait_state.timer.cancel()
+                wait_state.timer = None
             if not notify_future.done():
                 notify_future.set_result(match)
             return
+
+        # Filter telemetry is useful even when this poll never reports TDS.
+        # Do not resolve immediately: keep listening for a short grace window
+        # so a TDS frame later in the same poll still wins. If no TDS arrives,
+        # the grace timer resolves with the latest filter telemetry.
+        if match := self._find_tds_in_packets(received_packets):
+            self._log_assembled_notification_fields(received_packets)
+            if wait_state.notify_future.done():
+                return
+            # Always retain the latest filter telemetry: an ID-triggered read
+            # may later supply TDS and must return both frames. The flag only
+            # controls whether the grace timer may resolve the wait early.
+            wait_state.telemetry = match
+            if wait_state.allow_early_telemetry_return and wait_state.timer is None:
+                wait_state.timer = self.hass.loop.call_later(
+                    NOTIFICATION_TELEMETRY_GRACE_SECONDS,
+                    self._resolve_notification_telemetry,
+                    wait_state,
+                )
+            # Fall through to ID-pointer handling: the current packet may also
+            # request a characteristic read for a later TDS frame during the
+            # grace window.
 
         self._check_and_schedule_id_read(
             client,
@@ -1507,9 +1702,32 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             read_target,
             bg_tasks,
             lambda char: self._async_read_char_on_id_notify(
-                client, char, received_packets, notify_future
+                client, char, received_packets, notify_future, wait_state
             ),
+            wait_state,
         )
+
+    def _resolve_notification_telemetry(self, wait_state: _NotificationWaitState) -> None:
+        """Resolve a notification wait with buffered filter telemetry.
+
+        Called by the grace timer when no TDS frame arrived after filter
+        telemetry was observed. In-flight ID-triggered reads are allowed to
+        finish first, since they may still supply TDS.
+
+        Args:
+            wait_state: Per-subscription state holding the latest telemetry.
+        """
+        wait_state.timer = None
+        if wait_state.notify_future.done() or wait_state.telemetry is None:
+            return
+        if wait_state.pending_id_reads > 0:
+            wait_state.timer = self.hass.loop.call_later(
+                NOTIFICATION_TELEMETRY_GRACE_SECONDS,
+                self._resolve_notification_telemetry,
+                wait_state,
+            )
+            return
+        wait_state.notify_future.set_result(wait_state.telemetry)
 
     def _log_assembled_notification_fields(self, received_packets: list[bytearray]) -> None:
         """Log unknown fields from the assembled notification stream.
@@ -1562,7 +1780,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             Matched TDS packet, last received packet, or empty bytearray.
         """
         _LOGGER.debug(
-            "Timed out (3.5s) waiting for TDS notification from Karofi device %s",
+            "Timed out (%gs) waiting for TDS notification from Karofi device %s",
+            NOTIFICATION_WAIT_SECONDS,
             self.masked_mac,
         )
         self._log_assembled_notification_fields(received_packets)
@@ -1576,6 +1795,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         target: BleakGATTCharacteristic | str,
         cmd_target: BleakGATTCharacteristic | str | None = None,
         read_target: BleakGATTCharacteristic | str | None = None,
+        *,
+        allow_early_telemetry_return: bool = True,
     ) -> bytearray:
         """Subscribe to TDS notifications and await sensor packet.
 
@@ -1584,11 +1805,18 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             target: Characteristic object or UUID string to subscribe to.
             cmd_target: Optional write characteristic to transmit request command to.
             read_target: Optional read characteristic to query when device requests read.
+            allow_early_telemetry_return: Whether filter-only telemetry may
+                resolve the wait before TDS arrives. This is only safe when a
+                readable TDS characteristic can recover TDS later in the poll.
 
         Returns:
             Raw bytearray received from the device notification or subsequent read.
         """
         notify_future: asyncio.Future[bytearray] = asyncio.get_running_loop().create_future()
+        wait_state = _NotificationWaitState(
+            notify_future=notify_future,
+            allow_early_telemetry_return=allow_early_telemetry_return,
+        )
         received_packets: list[bytearray] = []
         bg_tasks: set[asyncio.Task[None]] = set()
         actual_cmd_target = cmd_target or target
@@ -1604,6 +1832,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 received_packets,
                 notify_future,
                 bg_tasks,
+                wait_state,
             )
 
         subscribed = False
@@ -1626,11 +1855,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             await self._send_read_request(client, actual_cmd_target, target)
 
             if subscribed:
-                async with asyncio.timeout(3.5):
+                async with asyncio.timeout(NOTIFICATION_WAIT_SECONDS):
                     return await notify_future
         except TimeoutError:
             return self._resolve_notify_timeout(received_packets)
         finally:
+            if wait_state.timer is not None:
+                wait_state.timer.cancel()
+                wait_state.timer = None
             self._cleanup_bg_tasks(bg_tasks)
             if subscribed:
                 await self._stop_notify_safe(client, target, self.masked_mac)
@@ -1714,6 +1946,158 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 return direct_bytes, direct_bytes
         return None, direct_bytes
 
+    def _remember_telemetry_char(self, uuid: str) -> None:
+        """Remember a characteristic that returned usable telemetry.
+
+        The cache is bounded and most-recently-used first so subsequent polls
+        can read only known data characteristics instead of scanning the whole
+        service.
+
+        Args:
+            uuid: UUID of the characteristic that returned telemetry.
+        """
+        key = uuid.lower()
+        with contextlib.suppress(ValueError):
+            self._telemetry_char_uuids.remove(key)
+        self._telemetry_char_uuids.insert(0, key)
+        del self._telemetry_char_uuids[MAX_TELEMETRY_CACHE_ENTRIES:]
+
+    def _prepare_scan_phases(
+        self,
+        data_chars: list[BleakGATTCharacteristic],
+    ) -> tuple[list[list[BleakGATTCharacteristic]], bool, bool]:
+        """Build the characteristic read phases for a telemetry scan.
+
+        Args:
+            data_chars: Readable data characteristics in service order.
+
+        Returns:
+            Tuple of read phases, whether a full scan is required, and whether
+            the first phase came from the telemetry-character cache.
+        """
+        self._polls_since_full_scan += 1
+        if self._polls_since_full_scan >= FULL_TELEMETRY_SCAN_INTERVAL:
+            self._telemetry_char_uuids.clear()
+
+        cached_uuids = {uuid.lower() for uuid in self._telemetry_char_uuids}
+        cached_chars = [char for char in data_chars if char.uuid.lower() in cached_uuids]
+        if self._telemetry_char_uuids and not cached_chars:
+            self._telemetry_char_uuids.clear()
+
+        known_tds_uuid = (self._known_tds_char_uuid or "").lower()
+        if cached_chars and known_tds_uuid and known_tds_uuid not in cached_uuids:
+            known_tds_char = next(
+                (char for char in data_chars if char.uuid.lower() == known_tds_uuid),
+                None,
+            )
+            if known_tds_char is not None:
+                cached_chars.insert(0, known_tds_char)
+
+        phases: list[list[BleakGATTCharacteristic]] = []
+        if cached_chars:
+            phases.append(cached_chars)
+            cached_char_uuids = {char.uuid.lower() for char in cached_chars}
+            if remaining_chars := [
+                char for char in data_chars if char.uuid.lower() not in cached_char_uuids
+            ]:
+                phases.append(remaining_chars)
+        else:
+            phases.append(data_chars)
+
+        return phases, not cached_chars, bool(cached_chars)
+
+    def _record_candidate_bytes(
+        self,
+        candidate: BleakGATTCharacteristic,
+        cand_bytes: bytearray,
+        update_tds_uuid: bool,
+        state: _TelemetryScanState,
+    ) -> None:
+        """Record telemetry from one characteristic read.
+
+        Args:
+            candidate: Characteristic that produced the bytes.
+            cand_bytes: Raw bytes read from the characteristic.
+            update_tds_uuid: Whether to remember a discovered TDS UUID.
+            state: Accumulated scan state.
+        """
+        self._log_unknown_payload_fields(cand_bytes)
+        _LOGGER.debug(
+            "Data characteristic %s read returned %d bytes (hex: %s, text: %r)",
+            candidate.uuid,
+            len(cand_bytes),
+            cand_bytes.hex(),
+            cand_bytes.decode("utf-8", errors="replace"),
+        )
+        if self._has_telemetry_payload(cand_bytes):
+            state.telemetry_payloads.append(cand_bytes)
+            if self._has_filter_telemetry_payload(cand_bytes):
+                state.filter_telemetry_found = True
+                state.discovered_char_uuids.append(candidate.uuid)
+        if self._parse_tds_reading(cand_bytes) is not None:
+            if update_tds_uuid:
+                self._known_tds_char_uuid = candidate.uuid
+                _LOGGER.debug(
+                    "Discovered TDS sensor characteristic on %s: %s (%s ppm)",
+                    self.masked_mac,
+                    candidate.uuid,
+                    self._parse_tds_reading(cand_bytes),
+                )
+            state.tds_payload = cand_bytes
+        if not state.fallback_payload and not self._is_handshake_payload(cand_bytes):
+            state.fallback_payload = cand_bytes
+
+    async def _read_candidate_phase(
+        self,
+        client: BleakClientWithServiceCache,
+        candidates: list[BleakGATTCharacteristic],
+        read_char: BleakGATTCharacteristic | None,
+        direct_bytes: bytearray,
+        update_tds_uuid: bool,
+        state: _TelemetryScanState,
+    ) -> None:
+        """Read one characteristic phase into the scan state.
+
+        Args:
+            client: Connected Bleak client instance.
+            candidates: Characteristics to read in this phase.
+            read_char: Initially resolved read characteristic.
+            direct_bytes: Bytes already read in the direct-read step.
+            update_tds_uuid: Whether to remember a discovered TDS UUID.
+            state: Accumulated scan state.
+        """
+        for candidate in candidates:
+            if candidate == read_char and direct_bytes:
+                continue
+            cand_bytes, read_ok = await self._read_characteristic_for_scan(client, candidate)
+            if cand_bytes:
+                self._record_candidate_bytes(candidate, cand_bytes, update_tds_uuid, state)
+            elif not read_ok:
+                # A transport failure is not the same as a legitimately empty
+                # characteristic: retry the full service on the next poll so
+                # the cache is not seeded with only the successful reads.
+                state.failed_char_uuids.append(candidate.uuid)
+
+    def _commit_telemetry_cache(
+        self,
+        discovered_char_uuids: list[str],
+        full_scan: bool,
+        timed_out: bool,
+    ) -> None:
+        """Persist the telemetry-character cache after a scan.
+
+        Args:
+            discovered_char_uuids: Characteristics that returned filter telemetry.
+            full_scan: Whether the scan covered all readable characteristics.
+            timed_out: Whether the scan timed out before completion.
+        """
+        if timed_out:
+            return
+        if full_scan:
+            self._polls_since_full_scan = 0
+        for uuid in reversed(discovered_char_uuids):
+            self._remember_telemetry_char(uuid)
+
     async def _scan_candidate_data_chars(
         self,
         client: BleakClientWithServiceCache,
@@ -1724,6 +2108,12 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         update_tds_uuid: bool = True,
     ) -> tuple[bytearray | None, bytearray]:
         """Scan service characteristics and collect TDS and filter telemetry.
+
+        Characteristics that previously returned telemetry are read first and
+        are the only ones read while they keep producing data. If the cached
+        set stops producing telemetry, the full readable service is scanned
+        again and the cache is refreshed. A periodic full scan also refreshes
+        the cache to discover new characteristics.
 
         Args:
             client: Connected Bleak client instance.
@@ -1739,47 +2129,50 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         if not isinstance(services, BleakGATTServiceCollection):
             return None, bytearray()
 
-        fallback_payload = bytearray()
-        telemetry_payloads: list[bytearray] = []
-        tds_payload: bytearray | None = None
         data_chars = self._get_readable_data_characteristics(client)
+        phases, full_scan, used_cache = self._prepare_scan_phases(data_chars)
+        state = _TelemetryScanState()
+        timed_out = False
         try:
             async with asyncio.timeout_at(timeout_at):
-                for candidate in data_chars:
-                    if candidate == read_char and direct_bytes:
-                        continue
-                    cand_bytes = await self._read_characteristic_safe(client, candidate)
-                    if cand_bytes:
-                        self._log_unknown_payload_fields(cand_bytes)
-                        _LOGGER.debug(
-                            "Data characteristic %s read returned %d bytes (hex: %s, text: %r)",
-                            candidate.uuid,
-                            len(cand_bytes),
-                            cand_bytes.hex(),
-                            cand_bytes.decode("utf-8", errors="replace"),
-                        )
-                        if self._has_telemetry_payload(cand_bytes):
-                            telemetry_payloads.append(cand_bytes)
-                        if self._parse_tds_reading(cand_bytes) is not None:
-                            if update_tds_uuid:
-                                self._known_tds_char_uuid = candidate.uuid
-                                _LOGGER.debug(
-                                    "Discovered TDS sensor characteristic on %s: %s (%s ppm)",
-                                    self.masked_mac,
-                                    candidate.uuid,
-                                    self._parse_tds_reading(cand_bytes),
-                                )
-                            tds_payload = cand_bytes
-                        if not fallback_payload and not self._is_handshake_payload(cand_bytes):
-                            fallback_payload = cand_bytes
+                for phase_index, candidates in enumerate(phases):
+                    await self._read_candidate_phase(
+                        client,
+                        candidates,
+                        read_char,
+                        direct_bytes,
+                        update_tds_uuid,
+                        state,
+                    )
+                    if used_cache and phase_index == 0:
+                        if state.filter_telemetry_found:
+                            break
+                        # The cached set produced no filter telemetry; refresh
+                        # it with a full scan before giving up on this poll.
+                        self._telemetry_char_uuids.clear()
+                        full_scan = True
         except TimeoutError:
+            timed_out = True
             _LOGGER.debug(
                 "Timed out scanning data characteristics for %s; using telemetry collected so far",
                 self.masked_mac,
             )
-        if telemetry_payloads:
-            return bytearray(b"\n".join(telemetry_payloads)), fallback_payload
-        return tds_payload, fallback_payload
+        if state.failed_char_uuids and not timed_out:
+            # Do not treat a scan with read failures as a complete cache seed.
+            # Leave the cache empty so the next poll performs a true full scan
+            # and retries every characteristic, including the failed ones.
+            self._telemetry_char_uuids.clear()
+            if self._debug_log_due("telemetry_cache_incomplete"):
+                _LOGGER.debug(
+                    "Skipping telemetry-character cache update for %s after %d failed read(s)",
+                    self.masked_mac,
+                    len(state.failed_char_uuids),
+                )
+        else:
+            self._commit_telemetry_cache(state.discovered_char_uuids, full_scan, timed_out)
+        if state.telemetry_payloads:
+            return bytearray(b"\n".join(state.telemetry_payloads)), state.fallback_payload
+        return state.tds_payload, state.fallback_payload
 
     async def _try_follow_up_read(
         self,
@@ -1833,6 +2226,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         notify_target: BleakGATTCharacteristic | str,
         cmd_target: BleakGATTCharacteristic | str,
         read_target: BleakGATTCharacteristic | str,
+        *,
+        allow_early_telemetry_return: bool = True,
     ) -> tuple[bytearray | None, bytearray]:
         """Attempt active polling via notification subscription and command request.
 
@@ -1841,6 +2236,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             notify_target: Characteristic to subscribe for notifications.
             cmd_target: Characteristic to write read command to.
             read_target: Characteristic to read if ID notification arrives.
+            allow_early_telemetry_return: Whether filter-only telemetry may
+                resolve the notification wait before TDS arrives.
 
         Returns:
             Tuple of (valid_tds_bytes or None, raw_notify_bytes).
@@ -1852,7 +2249,11 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             self.masked_mac,
         )
         notify_bytes = await self._subscribe_tds_notification(
-            client, notify_target, cmd_target=cmd_target, read_target=read_target
+            client,
+            notify_target,
+            cmd_target=cmd_target,
+            read_target=read_target,
+            allow_early_telemetry_return=allow_early_telemetry_return,
         )
         if notify_bytes and self._has_telemetry_payload(notify_bytes):
             _LOGGER.debug(
@@ -1944,9 +2345,18 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 else tds_result
             )
 
-        # Step 2: Active polling via notification subscription and command request
+        # Step 2: Active polling via notification subscription and command request.
+        # Early filter-only resolution is only safe when TDS is readable and can
+        # be recovered by the later scan/follow-up read in this same poll.
+        allow_early_telemetry_return = read_char is not None and GattProperty.READ in getattr(
+            read_char, "properties", []
+        )
         polling_result, notify_bytes = await self._try_active_polling(
-            client, notify_target, cmd_target, read_target
+            client,
+            notify_target,
+            cmd_target,
+            read_target,
+            allow_early_telemetry_return=allow_early_telemetry_return,
         )
 
         # Reserve time to return notification TDS if a candidate characteristic stalls.
@@ -2051,39 +2461,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Returns:
             Decoded dictionary or None if unparseable.
         """
-        try:
-            text = raw_bytes.decode("utf-8", errors="ignore").strip()
-            if not text:
-                return None
-
-            decoder = json.JSONDecoder()
-            idx = 0
-            parsed_items: list[dict[str, object]] = []
-
-            while idx < len(text):
-                brace_pos = text.find("{", idx)
-                bracket_pos = text.find("[", idx)
-                starts = [p for p in (brace_pos, bracket_pos) if p != -1]
-                if not starts:
-                    break
-                start = min(starts)
-                try:
-                    obj, end_offset = decoder.raw_decode(text[start:])
-                    idx = start + end_offset
-                    for candidate in cls._extract_dict_candidates(obj):
-                        if cls._is_priority_tds_payload(candidate):
-                            return candidate
-                        parsed_items.append(candidate)
-                except ValueError, TypeError:
-                    idx = start + 1
-
-            for item in parsed_items:
-                if cls._has_tds_field(item):
-                    return item
-
-            return parsed_items[0] if parsed_items else None
-        except ValueError, TypeError:
-            return None
+        parsed_items = cls._extract_all_payload_dicts(raw_bytes)
+        for item in parsed_items:
+            if cls._is_priority_tds_payload(item):
+                return item
+        for item in parsed_items:
+            if cls._has_tds_field(item):
+                return item
+        return parsed_items[0] if parsed_items else None
 
     @staticmethod
     def _has_tds_field(payload: dict[str, object]) -> bool:
@@ -2132,6 +2517,23 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         return None
 
     @staticmethod
+    def _coerce_scalar(val: object) -> int | None:
+        """Coerce a scalar value to an integer, or None if invalid.
+
+        Args:
+            val: Raw scalar candidate.
+
+        Returns:
+            Parsed integer or None if invalid.
+        """
+        if isinstance(val, (int, float, str)) and not isinstance(val, bool):
+            try:
+                return int(float(val))
+            except ValueError, TypeError, OverflowError:
+                return None
+        return None
+
+    @staticmethod
     def _coerce_int(val: object) -> int | None:
         """Coerce list, string, or numeric value to an integer reading.
 
@@ -2147,12 +2549,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             parts = val.split(",")
             val = parts[0].strip() if parts else None
 
-        if isinstance(val, (int, float, str)) and not isinstance(val, bool):
-            try:
-                return int(float(val))
-            except ValueError, TypeError, OverflowError:
-                return None
-        return None
+        return KarofiDataCoordinator._coerce_scalar(val)
 
     @staticmethod
     def _is_valid_tds(tds: int | None) -> TypeGuard[int]:
@@ -2262,12 +2659,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Returns:
             Parsed integer value or None if invalid.
         """
-        if isinstance(item, (int, float, str)) and not isinstance(item, bool):
-            try:
-                return int(float(item))
-            except ValueError, TypeError, OverflowError:
-                pass
-        return None
+        return KarofiDataCoordinator._coerce_scalar(item)
 
     @classmethod
     def _coerce_int_list(
@@ -2286,7 +2678,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         if isinstance(val, list):
             raw_items = val
         elif isinstance(val, str) and "," in val:
-            raw_items = [part.strip() for part in val.split(",") if part.strip()]
+            raw_items = [part.strip() for part in val.split(",")]
+            if not preserve_none:
+                raw_items = [item for item in raw_items if item]
         else:
             return None
 
@@ -2351,12 +2745,19 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return False
         tds = self._coerce_int(self._extract_raw_val(payload))
         if not self._is_valid_tds(tds):
-            _LOGGER.warning(
-                "Received invalid TDS reading (%s ppm, raw: %s) from Karofi device %s",
-                tds,
-                raw_bytes.hex(),
-                self.masked_mac,
-            )
+            if self._warning_due("invalid_tds"):
+                _LOGGER.warning(
+                    "Received invalid TDS reading (%s ppm, raw: %s) from Karofi device %s",
+                    tds,
+                    raw_bytes.hex(),
+                    self.masked_mac,
+                )
+            else:
+                _LOGGER.debug(
+                    "Received invalid TDS reading (%s ppm) from Karofi device %s",
+                    tds,
+                    self.masked_mac,
+                )
             self.data.tds = None
             self.data.quality = WaterQuality.UNKNOWN
         else:
@@ -2415,9 +2816,11 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             telemetry_generation: Poll generation associated with this telemetry.
         """
         key = filter_index_to_key(idx)
-        fdata = self.data.filters.setdefault(key, KarofiFilterData(index=idx, key=key))
+        fdata = self.data.filters.setdefault(key, KarofiFilterData())
         if name:
             fdata.name = name
+        if remaining_hours is not None or runtime_remaining_hours is not None:
+            fdata.last_seen = dt_util.utcnow()
 
         pending_reset = self._pending_filter_resets.get(key)
         outcome = self._evaluate_pending_reset(
@@ -2552,8 +2955,102 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         pending_reset.mismatch_count = mismatch_count
         pending_reset.last_counted_generation = telemetry_generation
+        pending_reset.last_counted_missing = False
         outcome.use_pending_value = True
         return outcome
+
+    def _advance_missing_telemetry_reset(
+        self,
+        *,
+        key: str,
+        pending_reset: PendingFilterReset,
+        telemetry_generation: int | None,
+        outcome: PendingResetOutcome,
+    ) -> PendingResetOutcome:
+        """Advance a pending reset that received no calendar telemetry.
+
+        A device that never reports ``iro_lTime`` would otherwise leave the
+        pending reset unresolved forever, freezing the filter sensors at full
+        life. Fresh polls without calendar telemetry count toward the same
+        abandonment threshold as unconfirmed telemetry.
+
+        The threshold is recorded here, but abandonment is finalized only
+        after all payload dictionaries in the generation have been processed.
+        This prevents a names-only frame from abandoning a reset before a later
+        frame in the same generation supplies ``iro_lTime`` for the stage.
+
+        Args:
+            key: Filter stage key.
+            pending_reset: Pending reset state.
+            telemetry_generation: Poll generation associated with this telemetry.
+            outcome: Outcome to update.
+
+        Returns:
+            Updated pending reset outcome.
+        """
+        if (
+            telemetry_generation is None
+            or telemetry_generation == pending_reset.last_counted_generation
+        ):
+            outcome.use_pending_value = True
+            # The threshold may have been reached on an earlier frame of this
+            # generation. Keep releasing optimistic values for later frames so
+            # runtime telemetry from those frames is not held back.
+            if (
+                pending_reset.last_counted_missing
+                and pending_reset.missing_telemetry_polls >= RESET_CONFIRMATION_POLLS
+            ):
+                outcome.abandoned = True
+                outcome.use_pending_value = False
+            return outcome
+
+        pending_reset.missing_telemetry_polls = min(
+            pending_reset.missing_telemetry_polls + 1,
+            RESET_CONFIRMATION_POLLS,
+        )
+        pending_reset.last_counted_generation = telemetry_generation
+        pending_reset.last_counted_missing = True
+        if pending_reset.missing_telemetry_polls >= RESET_CONFIRMATION_POLLS:
+            # Release the optimistic values for this frame, but keep the pending
+            # reset until the generation is complete. A later frame with
+            # calendar telemetry can still undo the missing count and continue
+            # normal confirmation.
+            outcome.abandoned = True
+            outcome.use_pending_value = False
+            _LOGGER.debug(
+                "Missing calendar telemetry threshold reached for %s in generation %s; "
+                "awaiting completion of the current payload batch",
+                key,
+                telemetry_generation,
+            )
+            return outcome
+
+        outcome.use_pending_value = True
+        return outcome
+
+    def _finalize_missing_telemetry_resets(self, telemetry_generation: int | None) -> None:
+        """Abandon pending resets that had no calendar telemetry in a generation.
+
+        Args:
+            telemetry_generation: Generation whose payload dictionaries have all
+                been processed.
+        """
+        if telemetry_generation is None:
+            return
+        for key, pending_reset in list(self._pending_filter_resets.items()):
+            if (
+                pending_reset.last_counted_generation != telemetry_generation
+                or not pending_reset.last_counted_missing
+                or pending_reset.missing_telemetry_polls < RESET_CONFIRMATION_POLLS
+            ):
+                continue
+            self._clear_pending_reset(key)
+            _LOGGER.warning(
+                "Device did not report calendar telemetry for %s after %d polls; "
+                "abandoning the local reset and reverting to date-based filter life",
+                key,
+                pending_reset.missing_telemetry_polls,
+            )
 
     def _evaluate_pending_reset(
         self,
@@ -2580,9 +3077,30 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """
         is_stale = self._is_stale_reset_response(pending_reset, telemetry_generation)
         outcome = PendingResetOutcome(is_stale=is_stale, use_pending_value=is_stale)
-        if remaining_hours is None or pending_reset is None or is_stale:
+        if pending_reset is None or is_stale:
+            return outcome
+        if remaining_hours is None:
+            return self._advance_missing_telemetry_reset(
+                key=key,
+                pending_reset=pending_reset,
+                telemetry_generation=telemetry_generation,
+                outcome=outcome,
+            )
+
+        if (
+            telemetry_generation is not None
+            and telemetry_generation == pending_reset.last_counted_generation
+            and not pending_reset.last_counted_missing
+        ):
+            outcome.use_pending_value = True
             return outcome
 
+        if pending_reset.last_counted_missing:
+            # The earlier frame in this poll had no calendar telemetry, but a
+            # later frame does. Undo that false count and evaluate normally.
+            pending_reset.last_counted_generation = None
+        pending_reset.missing_telemetry_polls = 0
+        pending_reset.last_counted_missing = False
         rated_hours = self._resolve_rated_hours(fdata, lifetime_hours, pending_reset)
         if self._is_reset_confirmed(
             remaining_hours,
@@ -2633,7 +3151,6 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         ):
             fdata.lifetime_hours = lifetime_hours
             fdata.lifetime_days = max(1, round(lifetime_hours / 24.0))
-            fdata.total_hours = lifetime_hours
         elif fdata.lifetime_days is None:
             fdata.lifetime_days = self.get_filter_lifetime_days(key)
 
@@ -2647,17 +3164,18 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
     @staticmethod
     def _update_filter_percent(fdata: KarofiFilterData) -> None:
         """Recalculate the remaining percentage from current filter values."""
-        if (
-            fdata.remaining_hours is None
-            or fdata.lifetime_hours is None
-            or fdata.lifetime_hours <= 0
-        ):
+        if fdata.remaining_hours is None:
             return
+        lifetime_hours = fdata.lifetime_hours
+        if lifetime_hours is None or lifetime_hours <= 0:
+            if fdata.lifetime_days is None or fdata.lifetime_days <= 0:
+                return
+            lifetime_hours = fdata.lifetime_days * 24
         fdata.percent = max(
             0,
             min(
                 100,
-                round((fdata.remaining_hours / fdata.lifetime_hours) * 100),
+                round((fdata.remaining_hours / lifetime_hours) * 100),
             ),
         )
 
@@ -2799,13 +3317,21 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         ):
             return False
 
-        filter_count = max(
+        raw_filter_count = max(
             len(ltime_list) if ltime_list else 0,
             len(hsd_list) if hsd_list else 0,
             len(rtr_list) if rtr_list else 0,
             len(rtt_list) if rtt_list else 0,
             len(names_list) if names_list else 0,
         )
+        filter_count = min(raw_filter_count, MAX_FILTER_STAGES)
+        if raw_filter_count > MAX_FILTER_STAGES and self._warning_due("filter_stage_cap"):
+            _LOGGER.warning(
+                "Ignoring %d filter stage(s) beyond the supported maximum of %d for %s",
+                raw_filter_count - MAX_FILTER_STAGES,
+                MAX_FILTER_STAGES,
+                self.masked_mac,
+            )
         for idx in range(filter_count):
             self._update_single_filter_stage(
                 idx,
@@ -2817,6 +3343,11 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 telemetry_generation=telemetry_generation,
             )
 
+        has_dynamic_telemetry = any(value is not None for value in (ltime_list or ())) or any(
+            value is not None for value in (rtr_list or ())
+        )
+        if filter_count and has_dynamic_telemetry:
+            self.data.filters_last_seen = dt_util.utcnow()
         return True
 
     def _process_errors_from_payload(self, payload: dict[str, object]) -> bool:
@@ -2890,6 +3421,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 filters_updated = True
             if self._process_errors_from_payload(payload):
                 has_sensor_data = True
+        self._finalize_missing_telemetry_resets(telemetry_generation)
         return has_sensor_data, filters_updated
 
     def _log_unknown_payload_fields(self, raw_bytes: bytearray | bytes) -> None:
@@ -3029,12 +3561,19 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """
         if not self._is_valid_json_buffer(raw_bytes):
             self.data.connected = False
-            _LOGGER.warning(
-                "Received invalid non-JSON payload (%d bytes, raw: %s) from Karofi device %s",
-                len(raw_bytes),
-                raw_bytes.hex() if raw_bytes else "",
-                self.masked_mac,
-            )
+            if self._warning_due("invalid_payload"):
+                _LOGGER.warning(
+                    "Received invalid non-JSON payload (%d bytes, raw: %s) from Karofi device %s",
+                    len(raw_bytes),
+                    raw_bytes.hex() if raw_bytes else "",
+                    self.masked_mac,
+                )
+            else:
+                _LOGGER.debug(
+                    "Received invalid non-JSON payload (%d bytes) from Karofi device %s",
+                    len(raw_bytes),
+                    self.masked_mac,
+                )
             return
 
         self.data.connected = True
@@ -3051,11 +3590,17 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         payload_dicts = self._extract_all_payload_dicts(raw_bytes)
         if not payload_dicts:
-            _LOGGER.warning(
-                "Received malformed JSON payload (raw: %s) from Karofi device %s",
-                raw_bytes.hex(),
-                self.masked_mac,
-            )
+            if self._warning_due("malformed_payload"):
+                _LOGGER.warning(
+                    "Received malformed JSON payload (raw: %s) from Karofi device %s",
+                    raw_bytes.hex(),
+                    self.masked_mac,
+                )
+            else:
+                _LOGGER.debug(
+                    "Received malformed JSON payload from Karofi device %s",
+                    self.masked_mac,
+                )
             return
 
         reset_dates_snapshot = dict(self.data.filter_reset_dates)
@@ -3076,6 +3621,18 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
     async def _async_update_data(self) -> KarofiData:
         """Query BLE data via ESPHome or local Bluetooth proxy.
+
+        Serializes the BLE session with filter-reset commands so both cannot
+        connect to the device concurrently.
+
+        Returns:
+            Updated KarofiData object with the latest readings.
+        """
+        async with self._ble_lock:
+            return await self._async_update_data_locked()
+
+    async def _async_update_data_locked(self) -> KarofiData:
+        """Query BLE data while holding the session lock.
 
         Returns:
             Updated KarofiData object with the latest readings.

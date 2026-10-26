@@ -15,13 +15,16 @@ from custom_components.karofi.const import (
     PENDING_RESET_STORAGE_SUFFIX,
     STORAGE_KEY_PREFIX,
     STORAGE_VERSION,
+    WaterQuality,
 )
+from custom_components.karofi.models import KarofiData
 
 
 async def test_setup_and_unload_entry(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Test successful setup and unload of a config entry.
 
@@ -29,12 +32,23 @@ async def test_setup_and_unload_entry(
         hass: HomeAssistant test instance.
         mock_config_entry: Fixture providing mock config entry.
         hass_storage: Fixture providing mock storage from test harness.
+        caplog: Fixture capturing log messages.
     """
     mock_config_entry.add_to_hass(hass)
+    caplog.set_level(logging.ERROR, logger="custom_components.karofi.coordinator")
 
+    initial_data = KarofiData(
+        tds=None,
+        quality=WaterQuality.UNKNOWN,
+        connected=False,
+        last_seen=None,
+        filters_last_seen=None,
+        filter_reset_dates={},
+    )
     with patch(
         "custom_components.karofi.coordinator.KarofiDataCoordinator._async_update_data",
-        return_value=None,
+        new_callable=AsyncMock,
+        return_value=initial_data,
     ):
         result = await hass.config_entries.async_setup(mock_config_entry.entry_id)
         assert result is True
@@ -42,6 +56,7 @@ async def test_setup_and_unload_entry(
 
         assert DOMAIN in hass.data
         assert mock_config_entry.entry_id in hass.data[DOMAIN]
+        assert "Unexpected error updating listener" not in caplog.text
 
         unload_result = await hass.config_entries.async_unload(mock_config_entry.entry_id)
         assert unload_result is True

@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable
 from datetime import timedelta
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ from homeassistant.const import (
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -163,6 +165,9 @@ async def test_tds_sensor(
     _init_test_sensor(sensor, "sensor.karofi_tds", hass)
     assert sensor.translation_key == "tds"
     assert sensor.unique_id == "aa:bb:cc:11:22:33_tds"
+    assert sensor.device_info is not None
+    device_info = cast(dict[str, object], sensor.device_info)
+    assert device_info["connections"] == {(CONNECTION_BLUETOOTH, "AA:BB:CC:11:22:33")}
     assert sensor.state_class == SensorStateClass.MEASUREMENT
     assert sensor.native_unit_of_measurement == "ppm"
     assert sensor.native_value is None
@@ -275,8 +280,11 @@ async def test_filter_percent_sensor_calculations(
         mock_config_entry: Fixture providing mock config entry.
         mock_coordinator: Fixture providing KarofiDataCoordinator.
     """
+    mock_coordinator.data.connected = True
+    filter_last_seen = dt_util.utcnow()
+    mock_coordinator.data.filters_last_seen = filter_last_seen
     mock_coordinator.data.filters["filter_1"] = KarofiFilterData(
-        index=0, key="filter_1", lifetime_days=100
+        lifetime_days=100, last_seen=filter_last_seen
     )
     sensor = KarofiFilterPercentSensor(
         mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 100
@@ -333,6 +341,8 @@ async def test_filter_percent_sensor_calculations(
         "runtime_percent": 50,
         "capacity_days": 200,
         "capacity_hours": 100,
+        "last_seen": filter_last_seen.isoformat(),
+        "stale": False,
     }
 
     # 8. Calendar life is lower than runtime usage and remains effective
@@ -363,9 +373,12 @@ async def test_filter_days_remaining_sensor_calculations(
         mock_config_entry: Fixture providing mock config entry.
         mock_coordinator: Fixture providing KarofiDataCoordinator.
     """
+    filter_last_seen = dt_util.utcnow()
     mock_coordinator.data.filters["filter_4"] = KarofiFilterData(
-        index=3, key="filter_4", lifetime_days=365
+        lifetime_days=365, last_seen=filter_last_seen
     )
+    mock_coordinator.data.connected = True
+    mock_coordinator.data.filters_last_seen = filter_last_seen
     sensor = KarofiFilterDaysRemainingSensor(
         mock_coordinator, mock_config_entry, KarofiFilter.FILTER_4, 365
     )
@@ -414,7 +427,11 @@ async def test_filter_days_remaining_sensor_calculations(
     sensor._handle_coordinator_update()
     assert sensor.max_days == 500
     assert sensor.native_value == 400
-    assert sensor.extra_state_attributes == {"capacity_days": 500}
+    assert sensor.extra_state_attributes == {
+        "capacity_days": 500,
+        "last_seen": filter_last_seen.isoformat(),
+        "stale": False,
+    }
 
 
 async def test_filter_usage_hours_remaining_sensor(
@@ -429,13 +446,15 @@ async def test_filter_usage_hours_remaining_sensor(
         mock_config_entry: Fixture providing mock config entry.
         mock_coordinator: Fixture providing KarofiDataCoordinator.
     """
+    filter_last_seen = dt_util.utcnow()
     mock_coordinator.data.filters["filter_1"] = KarofiFilterData(
-        index=0,
-        key="filter_1",
         runtime_remaining_hours=1104,
         runtime_total_hours=1200,
         runtime_percent=92,
+        last_seen=filter_last_seen,
     )
+    mock_coordinator.data.connected = True
+    mock_coordinator.data.filters_last_seen = filter_last_seen
     sensor = KarofiFilterUsageHoursRemainingSensor(
         mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 180
     )
@@ -447,7 +466,11 @@ async def test_filter_usage_hours_remaining_sensor(
     assert sensor.icon == "mdi:clock-outline"
     assert sensor.unique_id == "aa:bb:cc:11:22:33_filter_1_hours"
     assert sensor.native_value == 1104
-    assert sensor.extra_state_attributes == {"capacity_hours": 1200}
+    assert sensor.extra_state_attributes == {
+        "capacity_hours": 1200,
+        "last_seen": filter_last_seen.isoformat(),
+        "stale": False,
+    }
 
     # Missing runtime telemetry exposes None without hiding the entity.
     mock_coordinator.data.filters["filter_1"].runtime_remaining_hours = None
@@ -456,7 +479,11 @@ async def test_filter_usage_hours_remaining_sensor(
     sensor._handle_coordinator_update()
     assert sensor.native_value is None
     assert sensor.available is True
-    assert sensor.extra_state_attributes == {"capacity_hours": None}
+    assert sensor.extra_state_attributes == {
+        "capacity_hours": None,
+        "last_seen": filter_last_seen.isoformat(),
+        "stale": False,
+    }
 
 
 async def test_filter_sensors_dynamic_name(
@@ -471,9 +498,7 @@ async def test_filter_sensors_dynamic_name(
         mock_config_entry: Fixture providing mock config entry.
         mock_coordinator: Fixture providing KarofiDataCoordinator.
     """
-    mock_coordinator.data.filters["filter_1"] = KarofiFilterData(
-        index=0, key="filter_1", name="Nano Silver"
-    )
+    mock_coordinator.data.filters["filter_1"] = KarofiFilterData(name="Nano Silver")
     percent_sensor = KarofiFilterPercentSensor(
         mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 180
     )
@@ -521,9 +546,7 @@ async def test_filter_sensors_dynamic_name(
     assert p2.translation_key == "filter_2_percent"
     assert d2.translation_key == "filter_2_days"
     assert h2.translation_key == "filter_2_hours"
-    mock_coordinator.data.filters["filter_2"] = KarofiFilterData(
-        index=1, key="filter_2", name="Mineral"
-    )
+    mock_coordinator.data.filters["filter_2"] = KarofiFilterData(name="Mineral")
     p2._handle_coordinator_update()
     d2._handle_coordinator_update()
     h2._handle_coordinator_update()
@@ -604,9 +627,154 @@ async def test_filter_sensors_11_12_and_dynamic_fallback(
     _init_test_sensor(s13_days, "sensor.karofi_filter_13_days", hass)
     _init_test_sensor(s13_hours, "sensor.karofi_filter_13_hours", hass)
 
-    assert s13_pct.name == "Filter 13 life"
-    assert s13_pct.translation_key is None
-    assert s13_days.name == "Filter 13 days remaining"
-    assert s13_days.translation_key is None
-    assert s13_hours.name == "Filter 13 usage hours remaining"
-    assert s13_hours.translation_key is None
+    assert s13_pct.translation_key == "filter_13_percent"
+    assert s13_days.translation_key == "filter_13_days"
+    assert s13_hours.translation_key == "filter_13_hours"
+
+    # 3. Stages beyond the supported maximum keep an explicit fallback name.
+    s17_pct = KarofiFilterPercentSensor(mock_coordinator, mock_config_entry, "filter_17", 365)
+    s17_days = KarofiFilterDaysRemainingSensor(
+        mock_coordinator, mock_config_entry, "filter_17", 365
+    )
+    s17_hours = KarofiFilterUsageHoursRemainingSensor(
+        mock_coordinator, mock_config_entry, "filter_17", 365
+    )
+    _init_test_sensor(s17_pct, "sensor.karofi_filter_17_percent", hass)
+    _init_test_sensor(s17_days, "sensor.karofi_filter_17_days", hass)
+    _init_test_sensor(s17_hours, "sensor.karofi_filter_17_hours", hass)
+    assert s17_pct.name == "Filter 17 life"
+    assert s17_days.name == "Filter 17 days remaining"
+    assert s17_hours.name == "Filter 17 usage hours remaining"
+
+
+async def test_filter_sensor_marks_stale_data_unavailable(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Mark filter sensors unavailable after the filter data becomes stale.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    mock_coordinator.data.connected = True
+    filter_last_seen = dt_util.utcnow()
+    mock_coordinator.data.filters_last_seen = filter_last_seen
+    mock_coordinator.data.filters["filter_1"] = KarofiFilterData(
+        lifetime_days=100, last_seen=filter_last_seen
+    )
+    sensor = KarofiFilterPercentSensor(
+        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 100
+    )
+    _init_test_sensor(sensor, "sensor.karofi_filter_1_pct", hass)
+    assert sensor.available is True
+
+    stale_time = dt_util.utcnow() - timedelta(hours=2)
+    mock_coordinator.data.filters_last_seen = stale_time
+    mock_coordinator.data.filters["filter_1"].last_seen = stale_time
+    mock_coordinator.data.last_seen = dt_util.utcnow()
+    sensor._handle_coordinator_update()
+
+    assert sensor.available is False
+    attributes = sensor.extra_state_attributes or {}
+    assert attributes["stale"] is True
+    assert attributes["last_seen"] == stale_time.isoformat()
+
+
+async def test_filter_sensors_require_connection_and_fresh_data(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Require both a live connection and fresh filter telemetry for availability.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    fdata = KarofiFilterData(lifetime_days=100, last_seen=dt_util.utcnow())
+    mock_coordinator.data.filters["filter_1"] = fdata
+    sensor_classes = (
+        KarofiFilterPercentSensor,
+        KarofiFilterDaysRemainingSensor,
+        KarofiFilterUsageHoursRemainingSensor,
+    )
+
+    for sensor_class in sensor_classes:
+        fdata.last_seen = dt_util.utcnow()
+        mock_coordinator.data.filters_last_seen = fdata.last_seen
+        mock_coordinator.data.connected = False
+        sensor = sensor_class(mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 100)
+        _init_test_sensor(sensor, f"sensor.karofi_filter_1_{sensor_class.__name__}", hass)
+        assert sensor.available is False
+
+        mock_coordinator.data.connected = True
+        sensor._handle_coordinator_update()
+        assert sensor.available is True
+
+        mock_coordinator.data.connected = False
+        sensor._handle_coordinator_update()
+        assert sensor.available is False
+
+        mock_coordinator.data.connected = True
+        fdata.last_seen = dt_util.utcnow() - timedelta(hours=2)
+        mock_coordinator.data.filters_last_seen = fdata.last_seen
+        sensor._handle_coordinator_update()
+        assert sensor.available is False
+
+
+async def test_filter_sensors_use_date_based_values_before_dynamic_telemetry(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Keep connected filters available before their first dynamic telemetry.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    mock_coordinator.data.connected = True
+    mock_coordinator.data.filters_last_seen = None
+    fdata = KarofiFilterData(lifetime_days=100)
+    mock_coordinator.data.filters["filter_1"] = fdata
+    mock_coordinator.data.filter_reset_dates["filter_1"] = (
+        dt_util.utcnow() - timedelta(days=50)
+    ).isoformat()
+
+    sensor = KarofiFilterPercentSensor(
+        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 100
+    )
+    _init_test_sensor(sensor, "sensor.karofi_filter_1_pct", hass)
+
+    assert sensor.available is True
+    assert sensor.native_value == 50
+    attributes = sensor.extra_state_attributes or {}
+    assert attributes["last_seen"] is None
+    assert attributes["stale"] is False
+
+    fdata.last_seen = dt_util.utcnow()
+    mock_coordinator.data.filters_last_seen = fdata.last_seen
+    sensor._handle_coordinator_update()
+    assert sensor.available is True
+    assert sensor.extra_state_attributes == {
+        "calendar_percent": 50,
+        "runtime_percent": None,
+        "capacity_days": 100,
+        "capacity_hours": None,
+        "last_seen": fdata.last_seen.isoformat(),
+        "stale": False,
+    }
+
+    stale_time = dt_util.utcnow() - timedelta(hours=2)
+    fdata.last_seen = stale_time
+    mock_coordinator.data.filters_last_seen = stale_time
+    sensor._handle_coordinator_update()
+    assert sensor.available is False
+    attributes = sensor.extra_state_attributes or {}
+    assert attributes["last_seen"] == stale_time.isoformat()
+    assert attributes["stale"] is True

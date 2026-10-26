@@ -147,6 +147,11 @@ Cảm biến số ngày còn lại vẫn dựa trên lịch. Các cảm biến c
 > [!NOTE]
 > Tỷ lệ tuổi thọ hiệu dụng hiện xem xét cả thời gian theo lịch và thời gian sử dụng thực tế. Đây là thay đổi hành vi đối với người dùng sử dụng nhiều, vì tỷ lệ có thể giảm nhanh hơn trước. Một số dòng máy không báo cáo dữ liệu sử dụng thực tế; khi đó cảm biến tuổi thọ sẽ tự động quay về tuổi thọ theo lịch mà không gây lỗi.
 
+<!-- MD028/no-blanks-blockquote: Blank line inside blockquote -->
+
+> [!NOTE]
+> Cảm biến lõi lọc hiển thị thuộc tính `last_seen` và `stale`. `last_seen` là thời điểm dữ liệu động gần nhất của lõi lọc (số giờ còn lại theo lịch hoặc theo thời gian sử dụng). Trước khi một lõi lọc gửi dữ liệu động, các cảm biến vẫn khả dụng khi máy lọc đang kết nối và sử dụng giá trị dựa trên lịch. Sau khi lõi lọc đã gửi dữ liệu động, nếu không có dữ liệu động mới trong hơn một giờ, các cảm biến tương ứng sẽ chuyển sang trạng thái không khả dụng thay vì tiếp tục hiển thị giá trị cũ. Các nút đặt lại sẽ không khả dụng khi máy lọc mất kết nối.
+
 ### Khi thay lõi lọc mới
 
 1. Truy cập trang thiết bị Karofi tại **Cài đặt** > **Thiết bị & Dịch vụ** > **Karofi**.

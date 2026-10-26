@@ -5,7 +5,6 @@ import pytest
 from custom_components.karofi.const import (
     DEFAULT_FILTER_LIFETIME_DAYS,
     FILTER_PREFIX,
-    TELEMETRY_FILTER_MARKERS,
     GattProperty,
     KarofiDevicePrefix,
     KarofiFilter,
@@ -251,6 +250,3 @@ def test_filter_stage_keys_and_conversion() -> None:
     assert is_valid_filter_key("filter_") is False
     assert is_valid_filter_key("filter_²") is False
     assert is_valid_filter_key("invalid") is False
-
-    assert b"iro_rtr" in TELEMETRY_FILTER_MARKERS
-    assert b"iro_lTime" in TELEMETRY_FILTER_MARKERS
