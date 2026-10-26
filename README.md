@@ -2,7 +2,7 @@
 
 **🇺🇸 English | [🇻🇳 Tiếng Việt](README.vi.md)**
 
-**Karofi Water Purifier** provides local Bluetooth Low Energy (BLE) integration for Karofi smart water purifiers in Home Assistant. Monitor purified water Total Dissolved Solids (TDS), track drinking water quality ratings, and monitor multi-stage filter lifespans (5 to 12+ stages) using time reported by the device, with zero cloud dependence.
+**Karofi Water Purifier** provides local Bluetooth Low Energy (BLE) integration for Karofi smart water purifiers in Home Assistant. Monitor purified water Total Dissolved Solids (TDS), track drinking water quality ratings, and monitor multi-stage filter lifespans (5 to 12+ stages) using calendar life and runtime usage reported by the device, with zero cloud dependence.
 
 ---
 
@@ -39,7 +39,7 @@
 - **Dynamic Multi-Stage Filter Tracking (5, 7, 8, 9, 10, 11, 12+ filters)**:
   - Dynamically discovers and tracks filter cartridges from device telemetry.
   - Simple, clean naming (`Filter 1`, `Filter 2`, `Filter 3`, etc.) that adapts dynamically to your actual model without misleading hardcoded cartridge types.
-- **Dual Lifespan Indicators**: Every filter stage provides both a remaining percentage sensor (0% to 100%) and a remaining days sensor for intuitive dashboard cards and automations.
+- **Triple Lifespan Indicators**: Every filter stage provides a remaining life percentage sensor (0% to 100%), a calendar days remaining sensor, and a runtime usage hours remaining sensor for intuitive dashboard cards and automations.
 - **Interactive Maintenance Controls**:
   - **One-Click Reset Buttons**: Press the reset button in Home Assistant when replacing a physical cartridge to send the reset command to the device.
 - **Clear Error Alerts**: If your purifier has a problem, a Problem sensor turns on. Open it to see the error code and a short explanation in your Home Assistant language.
@@ -62,16 +62,17 @@ This integration is designed for Karofi smart water purifiers equipped with Maki
 
 ## Entities Provided
 
-| Platform          | Identifier                                                           | Device Class / Unit | Description                                                                                            |
-| :---------------- | :------------------------------------------------------------------- | :------------------ | :----------------------------------------------------------------------------------------------------- |
-| **Sensor**        | `sensor.<device_name>_pure_water_tds` (Entity ID pattern)            | `ppm`               | Real-time pure water TDS concentration.                                                                |
-| **Sensor**        | `sensor.<device_name>_water_quality` (Entity ID pattern)             | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).                                              |
-| **Sensor**        | `sensor.<device_name>_signal_strength` (Entity ID pattern)           | `dBm`               | Bluetooth signal strength in dBm, read from device advertisements. Diagnostic sensor.                  |
-| **Sensor**        | `sensor.<device_name>_filter_<n>_life` (Entity ID pattern)           | `%`                 | Filter `<n>` remaining life percentage (dynamically added).                                            |
-| **Sensor**        | `sensor.<device_name>_filter_<n>_days_remaining` (Entity ID pattern) | `days`              | Filter `<n>` remaining days until replacement.                                                         |
-| **Binary Sensor** | `binary_sensor.<device_name>_connectivity` (Entity ID pattern)       | `connectivity`      | Bluetooth connection status with the purifier. Diagnostic sensor.                                      |
-| **Binary Sensor** | `binary_sensor.<device_name>_problem` (Entity ID pattern)            | `problem`           | Turns on when the purifier reports a problem. Its details show the error code and a short explanation. |
-| **Button**        | `button.<device_name>_reset_filter_<n>` (Entity ID pattern)          | `restore`           | Send a reset command for the specified filter stage.                                                   |
+| Platform          | Identifier                                                                  | Device Class / Unit | Description                                                                                            |
+| :---------------- | :-------------------------------------------------------------------------- | :------------------ | :----------------------------------------------------------------------------------------------------- |
+| **Sensor**        | `sensor.<device_name>_pure_water_tds` (Entity ID pattern)                   | `ppm`               | Real-time pure water TDS concentration.                                                                |
+| **Sensor**        | `sensor.<device_name>_water_quality` (Entity ID pattern)                    | `enum`              | Water quality rating (`good`, `fair`, `poor`, `unknown`).                                              |
+| **Sensor**        | `sensor.<device_name>_signal_strength` (Entity ID pattern)                  | `dBm`               | Bluetooth signal strength in dBm, read from device advertisements. Diagnostic sensor.                  |
+| **Sensor**        | `sensor.<device_name>_filter_<n>_life` (Entity ID pattern)                  | `%`                 | Filter `<n>` remaining life percentage (dynamically added).                                            |
+| **Sensor**        | `sensor.<device_name>_filter_<n>_days_remaining` (Entity ID pattern)        | `days`              | Filter `<n>` remaining calendar days until replacement.                                                |
+| **Sensor**        | `sensor.<device_name>_filter_<n>_usage_hours_remaining` (Entity ID pattern) | `hours`             | Filter `<n>` remaining runtime usage hours.                                                            |
+| **Binary Sensor** | `binary_sensor.<device_name>_connectivity` (Entity ID pattern)              | `connectivity`      | Bluetooth connection status with the purifier. Diagnostic sensor.                                      |
+| **Binary Sensor** | `binary_sensor.<device_name>_problem` (Entity ID pattern)                   | `problem`           | Turns on when the purifier reports a problem. Its details show the error code and a short explanation. |
+| **Button**        | `button.<device_name>_reset_filter_<n>` (Entity ID pattern)                 | `restore`           | Send a reset command for the specified filter stage.                                                   |
 
 ---
 
@@ -126,9 +127,25 @@ When everything is working normally, the sensor stays off. If the purifier goes 
 
 ## Filter Lifetime Management
 
-Filter timer values are in hours: remaining days are `max(0, round(iro_lTime / 24))`, and rated stage lifetime in days is `max(1, round(iro_hsd / 24))`. The remaining percentage uses `iro_lTime` and `iro_hsd`; a stored reset date is used only as a fallback before remaining-time telemetry is available.
+Filter timer values are reported in hours:
 
-$$\text{Remaining Percent} = \max\left(0, \min\left(100, \text{round}\left(\frac{\text{Remaining Hours}}{\text{Rated Lifetime Hours}} \times 100\right)\right)\right)$$
+- **Calendar remaining days** = `max(0, round(iro_lTime / 24))`
+- **Calendar capacity days** = `max(1, round(iro_hsd / 24))`
+- **Runtime remaining hours** = `iro_rtr`
+- **Runtime capacity hours** = `iro_rtt`
+
+The calendar percentage uses `iro_lTime` and `iro_hsd`; a stored reset date is used only as a fallback before remaining-time telemetry is available. The runtime percentage uses `iro_rtr` and `iro_rtt`. The life percentage is the lower of the two, so heavy usage can shorten the effective life even when calendar time remains.
+
+$$\text{Calendar Percent} = \max\left(0, \min\left(100, \text{round}\left(\frac{\text{Calendar Remaining Hours}}{\text{Calendar Rated Hours}} \times 100\right)\right)\right)$$
+
+$$\text{Runtime Percent} = \max\left(0, \min\left(100, \text{round}\left(\frac{\text{Runtime Remaining Hours}}{\text{Runtime Rated Hours}} \times 100\right)\right)\right)$$
+
+$$\text{Life Percent} = \min\left(\text{Calendar Percent}, \text{Runtime Percent}\right)$$
+
+The days remaining sensor stays calendar-based. The remaining sensors expose the rated capacities as attributes: `capacity_days` on the days sensor, `capacity_hours` on the usage hours sensor, and both capacities plus `calendar_percent` and `runtime_percent` on the life sensor.
+
+> [!NOTE]
+> The life percentage now considers both calendar life and runtime usage. This is a behavior change for heavy users, who may see the percentage drop faster than before. Some models do not report runtime telemetry; the life sensor then falls back to calendar life without errors.
 
 ### When Replacing a Filter Cartridge
 

@@ -2,7 +2,7 @@
 
 **[🇺🇸 English](README.md) | 🇻🇳 Tiếng Việt**
 
-**Karofi Water Purifier** là tiện ích tích hợp cục bộ qua Bluetooth Low Energy (BLE) dành cho các dòng máy lọc nước thông minh Karofi trong Home Assistant. Tiện ích cho phép theo dõi chỉ số chất rắn hòa tan (TDS) trong nước tinh khiết theo thời gian thực, đánh giá chất lượng nước uống, theo dõi hạn sử dụng của hệ thống đa lõi lọc (5 đến 12+ lõi) theo tỷ lệ phần trăm và số ngày còn lại, đồng thời cho phép đặt lại hoặc điều chỉnh chu kỳ thay lõi trực tiếp trên giao diện Home Assistant mà không cần kết nối đám mây hay máy chủ bên ngoài.
+**Karofi Water Purifier** là tiện ích tích hợp cục bộ qua Bluetooth Low Energy (BLE) dành cho các dòng máy lọc nước thông minh Karofi trong Home Assistant. Tiện ích cho phép theo dõi chỉ số chất rắn hòa tan (TDS) trong nước tinh khiết theo thời gian thực, đánh giá chất lượng nước uống, theo dõi hạn sử dụng của hệ thống đa lõi lọc (5 đến 12+ lõi) theo tỷ lệ phần trăm, số ngày còn lại theo lịch và số giờ sử dụng thực tế còn lại, đồng thời cho phép đặt lại hoặc điều chỉnh chu kỳ thay lõi trực tiếp trên giao diện Home Assistant mà không cần kết nối đám mây hay máy chủ bên ngoài.
 
 ---
 
@@ -39,7 +39,7 @@
 - **Theo dõi linh hoạt hệ thống nhiều lõi lọc (5, 7, 8, 9, 10, 11, 12+ lõi)**:
   - Tự động nhận diện và theo dõi số lượng lõi lọc thực tế từ dữ liệu BLE của thiết bị.
   - Tên gọi đơn giản, nhất quán (`Lõi 1`, `Lõi 2`, `Lõi 3`, ...) phù hợp cho mọi dòng máy mà không bị gán cứng sai loại lõi.
-- **Cơ chế hiển thị kép cho từng lõi**: Mỗi cấp lõi lọc cung cấp song song cảm biến tỷ lệ phần trăm còn lại (0% đến 100%) và cảm biến số ngày còn lại, giúp theo dõi trực quan trên thẻ giao diện và thiết lập tự động hóa.
+- **Ba chỉ số vòng đời cho từng lõi**: Mỗi cấp lõi lọc cung cấp cảm biến tỷ lệ phần trăm còn lại (0% đến 100%), cảm biến số ngày còn lại theo lịch và cảm biến số giờ sử dụng thực tế còn lại, giúp theo dõi trực quan trên thẻ giao diện và thiết lập tự động hóa.
 - **Thao tác bảo trì linh hoạt**:
   - **Nút đặt lại một chạm**: Khi thay lõi thực tế, nhấn nút trên Home Assistant để gửi lệnh đặt lại đến máy; số ngày còn lại sẽ cập nhật theo dữ liệu máy phản hồi.
 - **Cảnh báo lỗi dễ hiểu**: Khi máy lọc nước gặp sự cố, cảm biến Sự cố sẽ bật. Bạn mở cảm biến để xem mã lỗi và lời giải thích ngắn gọn bằng ngôn ngữ Home Assistant của bạn.
@@ -62,16 +62,17 @@ Tiện ích này tương thích với các dòng máy lọc nước thông minh 
 
 ## Danh sách thực thể (Entities)
 
-| Nền tảng (Platform) | Mã định danh                                                     | Đơn vị / Kiểu  | Mô tả                                                                                  |
-| :------------------ | :--------------------------------------------------------------- | :------------- | :------------------------------------------------------------------------------------- |
-| **Sensor**          | `sensor.<device_name>_pure_water_tds` (mẫu Entity ID)            | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                                        |
-| **Sensor**          | `sensor.<device_name>_water_quality` (mẫu Entity ID)             | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).                          |
-| **Sensor**          | `sensor.<device_name>_signal_strength` (mẫu Entity ID)           | `dBm`          | Cường độ tín hiệu Bluetooth (dBm), đọc từ quảng cáo của thiết bị. Cảm biến chẩn đoán.  |
-| **Sensor**          | `sensor.<device_name>_filter_<n>_life` (mẫu Entity ID)           | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).                              |
-| **Sensor**          | `sensor.<device_name>_filter_<n>_days_remaining` (mẫu Entity ID) | `ngày`         | Số ngày còn lại đến hạn thay Lõi `<n>`.                                                |
-| **Binary Sensor**   | `binary_sensor.<device_name>_connectivity` (mẫu Entity ID)       | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước. Cảm biến chẩn đoán.                     |
-| **Binary Sensor**   | `binary_sensor.<device_name>_problem` (mẫu Entity ID)            | `problem`      | Bật khi máy lọc nước báo sự cố. Thuộc tính hiển thị mã lỗi và lời giải thích ngắn gọn. |
-| **Button**          | `button.<device_name>_reset_filter_<n>` (mẫu Entity ID)          | `restore`      | Gửi lệnh đặt lại cho cấp lõi lọc tương ứng.                                            |
+| Nền tảng (Platform) | Mã định danh                                                            | Đơn vị / Kiểu  | Mô tả                                                                                  |
+| :------------------ | :---------------------------------------------------------------------- | :------------- | :------------------------------------------------------------------------------------- |
+| **Sensor**          | `sensor.<device_name>_pure_water_tds` (mẫu Entity ID)                   | `ppm`          | Chỉ số TDS nước tinh khiết theo thời gian thực.                                        |
+| **Sensor**          | `sensor.<device_name>_water_quality` (mẫu Entity ID)                    | `enum`         | Xếp hạng chất lượng nước (`good`, `fair`, `poor`, `unknown`).                          |
+| **Sensor**          | `sensor.<device_name>_signal_strength` (mẫu Entity ID)                  | `dBm`          | Cường độ tín hiệu Bluetooth (dBm), đọc từ quảng cáo của thiết bị. Cảm biến chẩn đoán.  |
+| **Sensor**          | `sensor.<device_name>_filter_<n>_life` (mẫu Entity ID)                  | `%`            | Phần trăm thời gian còn lại của Lõi `<n>` (thêm tự động).                              |
+| **Sensor**          | `sensor.<device_name>_filter_<n>_days_remaining` (mẫu Entity ID)        | `ngày`         | Số ngày còn lại theo lịch đến hạn thay Lõi `<n>`.                                      |
+| **Sensor**          | `sensor.<device_name>_filter_<n>_usage_hours_remaining` (mẫu Entity ID) | `giờ`          | Số giờ sử dụng thực tế còn lại của Lõi `<n>`.                                          |
+| **Binary Sensor**   | `binary_sensor.<device_name>_connectivity` (mẫu Entity ID)              | `connectivity` | Trạng thái kết nối Bluetooth với máy lọc nước. Cảm biến chẩn đoán.                     |
+| **Binary Sensor**   | `binary_sensor.<device_name>_problem` (mẫu Entity ID)                   | `problem`      | Bật khi máy lọc nước báo sự cố. Thuộc tính hiển thị mã lỗi và lời giải thích ngắn gọn. |
+| **Button**          | `button.<device_name>_reset_filter_<n>` (mẫu Entity ID)                 | `restore`      | Gửi lệnh đặt lại cho cấp lõi lọc tương ứng.                                            |
 
 ---
 
@@ -126,9 +127,25 @@ Khi mọi thứ hoạt động bình thường, cảm biến sẽ tắt. Nếu m
 
 ## Quản lý vòng đời lõi lọc
 
-Các giá trị thời gian của lõi lọc tính bằng giờ: số ngày còn lại là `max(0, round(iro_lTime / 24))`, tuổi thọ định mức của lõi tính theo ngày là `max(1, round(iro_hsd / 24))`. Tỷ lệ phần trăm sử dụng `iro_lTime` và `iro_hsd`; ngày thay lõi đã lưu chỉ dùng làm giá trị dự phòng khi chưa có dữ liệu thời gian còn lại từ thiết bị.
+Các giá trị thời gian của lõi lọc tính bằng giờ:
 
-$$\text{Tỷ lệ phần trăm còn lại} = \max\left(0, \min\left(100, \text{làm tròn}\left(\frac{\text{Số giờ còn lại}}{\text{Số giờ tuổi thọ định mức}} \times 100\right)\right)\right)$$
+- **Số ngày còn lại theo lịch** = `max(0, round(iro_lTime / 24))`
+- **Số ngày tuổi thọ theo lịch** = `max(1, round(iro_hsd / 24))`
+- **Số giờ sử dụng thực tế còn lại** = `iro_rtr`
+- **Số giờ sử dụng thực tế định mức** = `iro_rtt`
+
+Tỷ lệ phần trăm theo lịch sử dụng `iro_lTime` và `iro_hsd`; ngày thay lõi đã lưu chỉ dùng làm giá trị dự phòng khi chưa có dữ liệu thời gian còn lại từ thiết bị. Tỷ lệ phần trăm theo thời gian sử dụng thực tế sử dụng `iro_rtr` và `iro_rtt`. Tuổi thọ hiệu dụng là giá trị nhỏ hơn giữa hai tỷ lệ, vì vậy việc sử dụng nhiều có thể rút ngắn tuổi thọ hiệu dụng ngay cả khi thời gian theo lịch vẫn còn.
+
+$$\text{Tỷ lệ theo lịch} = \max\left(0, \min\left(100, \text{làm tròn}\left(\frac{\text{Số giờ còn lại theo lịch}}{\text{Số giờ tuổi thọ theo lịch}} \times 100\right)\right)\right)$$
+
+$$\text{Tỷ lệ sử dụng thực tế} = \max\left(0, \min\left(100, \text{làm tròn}\left(\frac{\text{Số giờ sử dụng còn lại}}{\text{Số giờ sử dụng định mức}} \times 100\right)\right)\right)$$
+
+$$\text{Tuổi thọ hiệu dụng} = \min\left(\text{Tỷ lệ theo lịch}, \text{Tỷ lệ sử dụng thực tế}\right)$$
+
+Cảm biến số ngày còn lại vẫn dựa trên lịch. Các cảm biến còn lại hiển thị dung lượng định mức qua thuộc tính: `capacity_days` trên cảm biến số ngày, `capacity_hours` trên cảm biến số giờ sử dụng, và cả hai dung lượng cùng `calendar_percent`, `runtime_percent` trên cảm biến tuổi thọ.
+
+> [!NOTE]
+> Tỷ lệ tuổi thọ hiệu dụng hiện xem xét cả thời gian theo lịch và thời gian sử dụng thực tế. Đây là thay đổi hành vi đối với người dùng sử dụng nhiều, vì tỷ lệ có thể giảm nhanh hơn trước. Một số dòng máy không báo cáo dữ liệu sử dụng thực tế; khi đó cảm biến tuổi thọ sẽ tự động quay về tuổi thọ theo lịch mà không gây lỗi.
 
 ### Khi thay lõi lọc mới
 

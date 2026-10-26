@@ -12,10 +12,7 @@ from custom_components.karofi.const import (
 
 def test_supported_payload_keys_classify_every_enum_value() -> None:
     """Ensure each payload key is explicitly classified as processed or unprocessed."""
-    unprocessed = {
-        MakiposPayloadKey.IRO_RTR.value,
-        MakiposPayloadKey.IRO_RTT.value,
-    }
+    unprocessed: set[str] = set()
 
     assert SUPPORTED_PAYLOAD_KEYS.isdisjoint(unprocessed)
     assert SUPPORTED_PAYLOAD_KEYS | unprocessed == {key.value for key in MakiposPayloadKey}
@@ -34,8 +31,6 @@ def test_supported_event_types_classify_every_enum_value() -> None:
 def test_supported_property_codes_classify_every_enum_value() -> None:
     """Ensure each property code is explicitly classified as processed or unprocessed."""
     unprocessed = {
-        MakiposPropertyCode.IRO_RTR.value,
-        MakiposPropertyCode.IRO_RTT.value,
         MakiposPropertyCode.IRO_RSFT.value,
     }
 
