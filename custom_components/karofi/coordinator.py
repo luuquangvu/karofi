@@ -101,16 +101,17 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             mac_address: Bluetooth MAC address of the Karofi device.
             name: Display name of the device.
         """
+        masked_mac = hide_mac(mac_address)
         super().__init__(
             hass,
             _LOGGER,
             config_entry=entry,
-            name=f"{name} ({hide_mac(mac_address)})",
+            name=f"{name} ({masked_mac})",
             update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
         )
         self.entry = entry
         self.mac_address = mac_address
-        self.masked_mac: str = hide_mac(mac_address)
+        self.masked_mac: str = masked_mac
         self.device_name = name
         self._store: Store[dict[str, str]] = Store(
             hass,
@@ -156,14 +157,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         rssi = service_info.rssi
         _LOGGER.debug(
             "Karofi advertisement seen for %s (RSSI: %s, change: %s)",
-            hide_mac(service_info.address),
+            self.masked_mac,
             rssi,
             change,
         )
         if rssi == 0:
             _LOGGER.debug(
                 "Ignoring missing RSSI for %s; retaining the last valid reading",
-                hide_mac(service_info.address),
+                self.masked_mac,
             )
             return
 
@@ -174,7 +175,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         ):
             _LOGGER.debug(
                 "Ignoring out-of-order advertisement for %s (time %.3f is older than %.3f)",
-                hide_mac(service_info.address),
+                self.masked_mac,
                 advertisement_time,
                 self._latest_advertisement_time,
             )
@@ -192,7 +193,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Args:
             service_info: Last service info for the unavailable device.
         """
-        _LOGGER.debug("Karofi advertisements expired for %s", hide_mac(service_info.address))
+        _LOGGER.debug("Karofi advertisements expired for %s", self.masked_mac)
         if self.data.signal_strength is not None:
             self.data.signal_strength = None
             self.async_update_listeners()
@@ -2716,7 +2717,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             with contextlib.suppress(RuntimeError, KeyError):
                 diag = async_address_reachability_diagnostics(
                     self.hass,
-                    normalize_mac(self.mac_address, uppercase=True),
+                    self._mac_candidates[0],
                     BluetoothReachabilityIntent.CONNECTION,
                 )
             _LOGGER.debug(

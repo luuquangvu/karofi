@@ -40,12 +40,25 @@ def test_normalize_mac_various_formats() -> None:
     assert normalize_mac("aabbcc112233") == "AA:BB:CC:11:22:33"
     assert normalize_mac("AABBCC112233", uppercase=False) == "aa:bb:cc:11:22:33"
 
+    # Dot-separated
+    assert normalize_mac("aabb.ccdd.eeff") == "AA:BB:CC:DD:EE:FF"
+
     # Whitespace padded
     assert normalize_mac("   aa:bb:cc:11:22:33   ") == "AA:BB:CC:11:22:33"
 
     # Malformed length fallback
     assert normalize_mac("invalid") == "INVALID"
     assert normalize_mac("invalid", uppercase=False) == "invalid"
+
+    # Invalid characters are not silently discarded
+    assert normalize_mac("zz:aa:bb:cc:11:22:33") == "ZZ:AA:BB:CC:11:22:33"
+    assert normalize_mac("GG:AA:BB:CC:11:22:33") == "GG:AA:BB:CC:11:22:33"
+    assert normalize_mac("aabbcc11223g") == "AABBCC11223G"
+
+    # Malformed separator placement is rejected rather than canonicalized
+    assert normalize_mac("aa:bb-cc:11:22:33") == "AA:BB-CC:11:22:33"
+    assert normalize_mac("a:a:b:b:c:c:1:1:2:2:3:3") == "A:A:B:B:C:C:1:1:2:2:3:3"
+    assert normalize_mac("aa bb cc 11 22 33") == "AA BB CC 11 22 33"
 
 
 def test_mac_addresses_match() -> None:
@@ -54,6 +67,7 @@ def test_mac_addresses_match() -> None:
     assert mac_addresses_match("AA-BB-CC-11-22-33", "aa:bb:cc:11:22:33")
     assert mac_addresses_match("aabbcc112233", "AA:BB:CC:11:22:33")
     assert mac_addresses_match("  aa-bb-cc-11-22-33  ", "AABBCC112233")
+    assert mac_addresses_match("aabb.ccdd.eeff", "AA:BB:CC:DD:EE:FF")
 
     # Mismatched addresses
     assert not mac_addresses_match("aa:bb:cc:11:22:33", "AA:BB:CC:DD:EE:FF")
@@ -62,17 +76,28 @@ def test_mac_addresses_match() -> None:
     assert not mac_addresses_match("", "")
     assert not mac_addresses_match("aa:bb:cc:11:22:33", "")
 
+    # Invalid characters are not silently discarded
+    assert not mac_addresses_match("zz:aa:bb:cc:11:22:33", "aa:bb:cc:11:22:33")
+
+    # Invalid inputs are rejected even when they are identical
+    assert not mac_addresses_match("invalid", "invalid")
+    assert not mac_addresses_match("aa:bb-cc:11:22:33", "aa:bb-cc:11:22:33")
+
 
 def test_is_valid_mac() -> None:
     """Test is_valid_mac with valid and invalid addresses."""
     assert is_valid_mac("AA:BB:CC:11:22:33")
     assert is_valid_mac("AA-BB-CC-11-22-33")
     assert is_valid_mac("aabbcc112233")
+    assert is_valid_mac("aabb.ccdd.eeff")
     assert is_valid_mac("  aa:bb:cc:11:22:33  ")
 
     assert not is_valid_mac("AA:BB:CC:11:22:3G")  # Invalid hex char
     assert not is_valid_mac("AA:BB:CC:11:22")  # Incomplete length
     assert not is_valid_mac("AA:BB:CC:11:22:33:11")  # Too long
+    assert not is_valid_mac("aa:bb-cc:11:22:33")  # Mixed separators
+    assert not is_valid_mac("a:a:b:b:c:c:1:1:2:2:3:3")  # Malformed grouping
+    assert not is_valid_mac("aa bb cc 11 22 33")  # Internal whitespace
     assert not is_valid_mac("")
 
 
@@ -151,21 +176,34 @@ def test_hide_mac() -> None:
     assert hide_mac("aabbcc112233") == "**:**:**:**:22:33"
     assert hide_mac("AABBCC112233") == "**:**:**:**:22:33"
 
+    # Dot-separated
+    assert hide_mac("aabb.ccdd.eeff") == "**:**:**:**:EE:FF"
+
     # Whitespace padded
     assert hide_mac("   aa:bb:cc:11:22:33   ") == "**:**:**:**:22:33"
 
     # Already masked
     assert hide_mac("**:**:**:**:22:33") == "**:**:**:**:22:33"
+    assert hide_mac("**:**:**:**:aa:bb") == "**:**:**:**:AA:BB"
 
     # Empty and None
     assert hide_mac("") == ""
     assert hide_mac(None) == ""
     assert hide_mac("   ") == ""
 
-    # Short and fallback strings
-    assert hide_mac("invalid_long") == "**:_LONG"
+    # Short, malformed, and non-MAC strings are fully masked
+    assert hide_mac("invalid_long") == "****"
     assert hide_mac("abc") == "****"
-    assert hide_mac("a:b:c:d:e:f") == "**:D:E:F"
+    assert hide_mac("a:b:c:d:e:f") == "****"
+    assert hide_mac("AA:BB:CC:11:22:3") == "****"
+    assert hide_mac("AA:BB:CC:11:22:3G") == "****"
+    assert hide_mac("AA:BB:CC:11:22:33:44") == "****"
+    assert hide_mac("12345678901234567") == "****"
+    assert hide_mac("aa:bb-cc:11:22:33") == "****"
+    assert hide_mac("a:a:b:b:c:c:1:1:2:2:3:3") == "****"
+    assert hide_mac("aa bb cc 11 22 33") == "****"
+    assert hide_mac("**:**:**:**:ZZ:33") == "****"
+    assert hide_mac("**secret") == "****"
 
 
 def test_filter_stage_keys_and_conversion() -> None:

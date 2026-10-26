@@ -5,57 +5,79 @@ from typing import Final
 
 from .const import FILTER_PREFIX, KarofiDevicePrefix, KarofiFilter
 
-MAC_CLEAN_PATTERN: Final = re.compile(r"[^0-9A-Fa-f]")
 MAC_VALID_PATTERN: Final = re.compile(
-    r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$|^([0-9A-Fa-f]{12})$"
+    r"^(?:"
+    r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}"
+    r"|[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5}"
+    r"|[0-9A-Fa-f]{4}(?:\.[0-9A-Fa-f]{4}){2}"
+    r"|[0-9A-Fa-f]{12}"
+    r")$"
 )
+MASKED_MAC_PATTERN: Final = re.compile(r"\*\*(?::\*\*){3}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}")
+MAC_SEPARATOR_TABLE: Final = str.maketrans("", "", ":-. \t\r\n\v\f")
 
 SUPPORTED_LOCAL_NAME_PREFIXES: Final[tuple[str, ...]] = (KarofiDevicePrefix.TCM.value,)
+
+
+def _canonical_mac(mac: str) -> str | None:
+    """Return a canonical lowercase MAC address, or None for invalid input.
+
+    Args:
+        mac: Stripped MAC address string.
+
+    Returns:
+        Colon-separated lowercase MAC address, or None if the input does not use
+        a supported MAC address format.
+    """
+    if not MAC_VALID_PATTERN.fullmatch(mac):
+        return None
+    return bytes.fromhex(mac.translate(MAC_SEPARATOR_TABLE)).hex(":")
 
 
 def normalize_mac(mac: str, *, uppercase: bool = True) -> str:
     """Normalize a MAC address string to standard colon-separated notation.
 
     Accepts formats such as 'AA:BB:CC:11:22:33', 'aa-bb-cc-11-22-33',
-    'aabbcc112233', with optional leading/trailing whitespace.
+    'aabbcc112233', 'aabb.ccdd.eeff', with optional whitespace.
+
+    Invalid or non-48-bit input is returned stripped, with only its case changed.
 
     Args:
         mac: Raw MAC address string.
         uppercase: Whether to return uppercase characters (default True).
 
     Returns:
-        Standard colon-separated 6-octet MAC address string.
+        Standard colon-separated 6-octet MAC address string, or the stripped
+        input when it cannot be normalized.
     """
-    cleaned = MAC_CLEAN_PATTERN.sub("", mac.strip())
-    if len(cleaned) == 12:
-        formatted = ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
-    else:
-        formatted = mac.strip()
+    stripped = mac.strip()
+    formatted = _canonical_mac(stripped)
+    if formatted is None:
+        formatted = stripped
     return formatted.upper() if uppercase else formatted.lower()
 
 
 def hide_mac(mac: str | None) -> str:
     """Mask a MAC address for safe logging, obscuring sensitive hardware octets.
 
-    Masks the first 4 octets of a 6-octet MAC address with asterisks while
-    preserving the trailing octets to distinguish devices in logs.
-    Accepts formats such as 'AA:BB:CC:11:22:33', 'aa-bb-cc-11-22-33',
-    'aabbcc112233', with optional leading/trailing whitespace.
+    Masks the first 4 octets of a valid 6-octet MAC address with asterisks while
+    preserving the trailing octets to distinguish devices in logs. Accepts formats
+    such as 'AA:BB:CC:11:22:33', 'aa-bb-cc-11-22-33', 'aabbcc112233', with optional
+    whitespace.
 
     Args:
         mac: Raw or formatted MAC address string, or None.
 
     Returns:
-        Masked MAC address string (e.g., '**:**:**:**:22:33'), or empty string if input is blank.
+        Masked MAC address string (e.g., '**:**:**:**:22:33'), an empty string
+        if the input is blank, or '****' when the input is not a valid MAC address.
     """
     if not mac or not (stripped := mac.strip()):
         return ""
-    if stripped.startswith("**"):
+    if stripped.startswith("**") and MASKED_MAC_PATTERN.fullmatch(stripped):
         return stripped.upper()
-    normalized = normalize_mac(stripped, uppercase=True)
-    if len(normalized) == 17:
-        return f"**:**:**:**:{normalized[-5:]}"
-    return f"**:{normalized[-5:]}" if len(normalized) > 5 else "****"
+    canonical = _canonical_mac(stripped)
+    return f"**:**:**:**:{canonical[-5:].upper()}" if canonical else "****"
 
 
 def mac_addresses_match(mac1: str, mac2: str) -> bool:
@@ -66,11 +88,13 @@ def mac_addresses_match(mac1: str, mac2: str) -> bool:
         mac2: Second MAC address.
 
     Returns:
-        True if both MAC addresses represent the same hardware address.
+        True if both MAC addresses are valid and represent the same hardware address.
     """
-    if not mac1.strip() or not mac2.strip():
+    canonical1 = _canonical_mac(mac1.strip())
+    canonical2 = _canonical_mac(mac2.strip())
+    if canonical1 is None or canonical2 is None:
         return False
-    return normalize_mac(mac1, uppercase=False) == normalize_mac(mac2, uppercase=False)
+    return canonical1 == canonical2
 
 
 def is_valid_mac(mac: str) -> bool:
@@ -82,7 +106,7 @@ def is_valid_mac(mac: str) -> bool:
     Returns:
         True if the MAC address consists of 6 valid hexadecimal octets.
     """
-    return bool(MAC_VALID_PATTERN.match(mac.strip()))
+    return bool(MAC_VALID_PATTERN.fullmatch(mac.strip()))
 
 
 def normalize_local_name(name: str | None, *, case_sensitive: bool = False) -> str:
