@@ -1,6 +1,8 @@
 """Tests for Karofi data coordinator."""
 
 import asyncio
+import logging
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,6 +28,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.karofi.const import (
     DEFAULT_FILTER_LIFETIME_DAYS,
     DEFAULT_NAME,
+    DEFAULT_SCAN_INTERVAL,
     NOTIFY_UUID_PREFIX,
     PENDING_RESET_STORAGE_SUFFIX,
     REQUEST_READ_DATA_COMMAND,
@@ -37,7 +40,11 @@ from custom_components.karofi.const import (
     WaterQuality,
     build_reset_filter_command,
 )
-from custom_components.karofi.coordinator import RESET_CONFIRMATION_POLLS, KarofiDataCoordinator
+from custom_components.karofi.coordinator import (
+    MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS,
+    RESET_CONFIRMATION_POLLS,
+    KarofiDataCoordinator,
+)
 from custom_components.karofi.models import PendingFilterReset, ResolvedGattTargets
 
 
@@ -521,12 +528,17 @@ async def test_coordinator_update_data_connection_errors(
         assert data.connected is False
 
 
-async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordinator) -> None:
-    """Test _async_handle_bluetooth_event caches advertisement RSSI.
+async def test_coordinator_bluetooth_event_logging(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test _async_handle_bluetooth_event caches advertisement RSSI without log spam.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
     """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
     mock_service_info = MagicMock(spec=BluetoothServiceInfoBleak)
     mock_service_info.address = "AA:BB:CC:11:22:33"
     mock_service_info.rssi = -60
@@ -569,6 +581,12 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         assert coordinator.data.signal_strength == -55
         mock_update_listeners.assert_not_called()
+
+    # Only one throttled diagnostic message is emitted per polling interval;
+    # per-advertisement packets, missing RSSI, and out-of-order packets stay
+    # silent.
+    assert "Karofi advertisement seen" not in caplog.text
+    assert caplog.text.count("Karofi advertisement for") == 1
 
 
 async def test_coordinator_signal_strength_publishes_on_refresh(
@@ -764,13 +782,16 @@ async def test_coordinator_notify_fallback_success(
 async def test_coordinator_notify_split_packet_reassembly(
     coordinator: KarofiDataCoordinator,
     mock_ble_device: BLEDevice,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Test reassembly of fragmented BLE notification packets.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
         mock_ble_device: Fixture providing mock BLEDevice.
+        caplog: Fixture capturing log messages.
     """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
     mock_char = MagicMock(spec=BleakGATTCharacteristic)
     mock_char.uuid = KarofiCharacteristic.TDS_SENSOR
     mock_char.properties = ["notify"]
@@ -784,7 +805,8 @@ async def test_coordinator_notify_split_packet_reassembly(
     async def _mock_start_notify_split(char: object, callback: Any) -> None:
         """Deliver split notification frames."""
         callback(char, bytearray(b'\x01{"pc":"iro_td'))
-        callback(char, bytearray(b's","d":42}\x04'))
+        callback(char, bytearray(b's","d":42,"iro_nuo'))
+        callback(char, bytearray(b'cIn":1}\x04'))
 
     mock_client.start_notify.side_effect = _mock_start_notify_split
     mock_client.stop_notify = AsyncMock()
@@ -806,6 +828,32 @@ async def test_coordinator_notify_split_packet_reassembly(
         assert data.connected is True
         mock_client.start_notify.assert_awaited_once()
         mock_client.stop_notify.assert_awaited_once()
+
+    # Unknown fields split across notification fragments are reported from the
+    # assembled frame before the earlier packets are discarded.
+    assert "iro_nuocIn=1" in caplog.text
+
+
+def test_coordinator_notify_timeout_logs_assembled_unknown_fields(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test timeout handling inspects the assembled notification frame.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    received_packets = [
+        bytearray(b'\x01{"pc":"iro_'),
+        bytearray(b'nuocIn","d":1}\x04'),
+    ]
+
+    result = coordinator._resolve_notify_timeout(received_packets)
+
+    assert result == received_packets[-1]
+    assert "pc='iro_nuocIn'" in caplog.text
 
 
 async def test_coordinator_lost_connection_logging(
@@ -1573,6 +1621,34 @@ async def test_coordinator_scan_data_characteristics_success(
     assert coordinator.get_filter_remaining_days("filter_1") == 90
 
 
+async def test_coordinator_scan_logs_unknown_payload_fields(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test characteristic scans log unsupported payload fields for model support.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    char = _mock_characteristic("0000ac05-0000-1000-8000-00805f9b34fb", ["read"])
+    mock_client = AsyncMock()
+    mock_services = MagicMock(spec=BleakGATTServiceCollection)
+    mock_service = MagicMock()
+    mock_service.characteristics = [char]
+    mock_services.get_service.return_value = mock_service
+    mock_client.services = mock_services
+    mock_client.read_gatt_char.return_value = b'{"d":1,"lid":"1","pc":"iro_nuocIn"}'
+
+    result, fallback = await coordinator._scan_candidate_data_chars(mock_client, None, bytearray())
+
+    assert result is None
+    assert fallback == bytearray(b'{"d":1,"lid":"1","pc":"iro_nuocIn"}')
+    assert "Unknown Karofi payload key/value" in caplog.text
+    assert "pc='iro_nuocIn'" in caplog.text
+
+
 async def test_coordinator_direct_tds_read_still_collects_filter_telemetry(
     coordinator: KarofiDataCoordinator,
 ) -> None:
@@ -2084,6 +2160,272 @@ def test_coordinator_process_tds_payload_malformed_and_missing_tds(
     coordinator._process_tds_payload(payload)
     assert coordinator.data.connected
     assert coordinator.data.tds is None
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_field"),
+    [
+        (b'{"d":1,"lid":"1","pc":"iro_nuocIn"}', "pc='iro_nuocIn'"),
+        (b'{"lid":"1"}', "lid='1'"),
+        (b'{"et":"XX","pc":"iro_tds","d":11}', "et='XX'"),
+        (b'{"future_sensor":42}', "future_sensor=42"),
+        (b'{"iro_rtr":[1]}', "iro_rtr=[1]"),
+        (b'{"iro_rtt":[2]}', "iro_rtt=[2]"),
+        (b'{"pc":"iro_rtr","d":[1]}', "pc='iro_rtr'"),
+        (b'{"pc":"iro_rtt","d":[2]}', "pc='iro_rtt'"),
+        (b'{"pc":"iro_rsft","d":0}', "pc='iro_rsft'"),
+    ],
+)
+def test_coordinator_logs_unknown_payload_fields_once(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+    payload: bytes,
+    expected_field: str,
+) -> None:
+    """Test unknown payload fields are logged once for model support.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+        payload: Payload containing an unsupported field.
+        expected_field: Key/value fragment expected in the debug message.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    coordinator._process_tds_payload(payload)
+    assert "Unknown Karofi payload key/value" in caplog.text
+    assert expected_field in caplog.text
+
+    caplog.clear()
+    coordinator._process_tds_payload(payload)
+    assert "Unknown Karofi payload key/value" not in caplog.text
+
+
+def test_coordinator_unknown_payload_debug_is_rate_limited(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test unknown payload diagnostics emit at most one message per poll interval.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    coordinator._process_tds_payload(b'{"first_unknown":1}')
+    assert caplog.text.count("Unknown Karofi payload key/value") == 1
+
+    # A different unknown field inside the same polling interval is queued.
+    coordinator._process_tds_payload(b'{"second_unknown":2}')
+    assert caplog.text.count("Unknown Karofi payload key/value") == 1
+    assert "second_unknown=2" not in caplog.text
+
+    # The queued field is reported after the interval even when it never
+    # appears again.
+    coordinator._debug_log_times["unknown_payload"] = time.monotonic() - DEFAULT_SCAN_INTERVAL
+    coordinator._process_tds_payload(b'{"pc":"iro_tds","d":11}')
+    assert caplog.text.count("Unknown Karofi payload key/value") == 2
+    assert "second_unknown=2" in caplog.text
+
+
+def test_coordinator_unknown_payload_log_omits_filter_names(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test unknown payload diagnostics do not include filter name values.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    coordinator._process_tds_payload(b'{"filter_names":["Private filter"],"future_sensor":42}')
+    assert "future_sensor=42" in caplog.text
+    assert "Private filter" not in caplog.text
+    assert '"filter_names"' not in caplog.text
+
+
+def test_coordinator_does_not_log_supported_payload_fields(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test supported payload keys and protocol values do not produce unknown logs.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    coordinator._process_tds_payload(b'{"et":"NP","pc":"iro_tds","d":11}')
+    coordinator._process_tds_payload(b'{"pc":"iro_lTime","d":[4320]}')
+    assert "Unknown Karofi payload key/value" not in caplog.text
+
+
+def test_coordinator_logs_non_string_discriminator_values(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test non-string property codes and event types are reported as unsupported.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    coordinator._process_tds_payload(b'{"pc":123,"et":true,"d":1}')
+    assert "pc=123" in caplog.text
+    assert "et=True" in caplog.text
+
+
+def test_coordinator_escapes_unknown_payload_key_control_characters(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test control characters in unknown JSON keys are escaped in debug logs.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    coordinator._process_tds_payload(b'{"bad\\nkey":1,"bad\\u001bkey":2}')
+    assert "bad\\nkey=1" in caplog.text
+    assert "bad\\x1bkey=2" in caplog.text
+    assert "bad\nkey" not in caplog.text
+    assert "\x1b" not in caplog.text
+
+
+def test_coordinator_unknown_payload_tracking_is_bounded(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test unknown payload tracking evicts old entries at the configured cap.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    field_ids = [f"key:field_{index}" for index in range(MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS + 10)]
+    coordinator._remember_logged_unknown_payload_fields(field_ids)
+    assert len(coordinator._logged_unknown_payload_fields) == MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS
+    assert "key:field_0" not in coordinator._logged_unknown_payload_fields
+    assert (
+        f"key:field_{MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS + 9}"
+        in coordinator._logged_unknown_payload_fields
+    )
+
+    coordinator._pending_unknown_payload_fields.update(dict.fromkeys(field_ids, "field=1"))
+    coordinator._trim_pending_unknown_payload_fields()
+    assert len(coordinator._pending_unknown_payload_fields) == MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS
+    assert "key:field_0" not in coordinator._pending_unknown_payload_fields
+
+
+async def test_coordinator_queued_unknown_payload_flushes_after_cooldown(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test queued unknown payload diagnostics flush without another payload.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    with patch("custom_components.karofi.coordinator.DEFAULT_SCAN_INTERVAL", 0.05):
+        coordinator._process_tds_payload(b'{"first_unknown":1}')
+        assert caplog.text.count("Unknown Karofi payload key/value") == 1
+
+        coordinator._process_tds_payload(b'{"second_unknown":2}')
+        assert "second_unknown=2" not in caplog.text
+
+        await asyncio.sleep(0.3)
+
+    assert caplog.text.count("Unknown Karofi payload key/value") == 2
+    assert "second_unknown=2" in caplog.text
+
+
+async def test_coordinator_shutdown_cancels_pending_unknown_payload_flush(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test shutdown cancels queued unknown payload diagnostics.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    with patch("custom_components.karofi.coordinator.DEFAULT_SCAN_INTERVAL", 0.05):
+        coordinator._process_tds_payload(b'{"first_unknown":1}')
+        coordinator._process_tds_payload(b'{"second_unknown":2}')
+        assert "second_unknown=2" not in caplog.text
+        assert coordinator._unknown_payload_flush_handle is not None
+
+        await coordinator.async_shutdown()
+        assert coordinator._unknown_payload_flush_handle is None
+        await asyncio.sleep(0.2)
+
+    assert "second_unknown=2" not in caplog.text
+
+
+async def test_coordinator_id_notify_read_logs_assembled_unknown_fields(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test the ID-triggered read path inspects assembled notification packets.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    client = AsyncMock()
+    client.read_gatt_char.return_value = b'42}{"pc":"iro_tds","d":11}'
+    received_packets = [bytearray(b'{"future_sensor":')]
+    notify_future: asyncio.Future[bytearray] = asyncio.get_running_loop().create_future()
+
+    await coordinator._async_read_char_on_id_notify(
+        client, "char_notify", received_packets, notify_future
+    )
+
+    assert notify_future.done()
+    assert "future_sensor=42" in caplog.text
+
+
+async def test_coordinator_notification_debug_is_rate_limited(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test per-notification raw packet diagnostics are rate limited.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    client = MagicMock()
+    notify_future: asyncio.Future[bytearray] = asyncio.get_running_loop().create_future()
+    received_packets: list[bytearray] = []
+    bg_tasks: set[asyncio.Task[None]] = set()
+    packet = bytearray(b'{"et":"NP"}')
+
+    coordinator._handle_notify_packet(
+        client,
+        packet,
+        "char_notify",
+        "char_read",
+        received_packets,
+        notify_future,
+        bg_tasks,
+    )
+    coordinator._handle_notify_packet(
+        client,
+        packet,
+        "char_notify",
+        "char_read",
+        received_packets,
+        notify_future,
+        bg_tasks,
+    )
+
+    assert caplog.text.count("Received BLE notification") == 1
 
 
 def test_coordinator_masked_mac(coordinator: KarofiDataCoordinator) -> None:

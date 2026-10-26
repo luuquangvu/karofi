@@ -4,7 +4,8 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Callable, Coroutine
+import time
+from collections.abc import Callable, Coroutine, Iterable
 from datetime import datetime, timedelta
 from typing import TypeGuard
 
@@ -47,6 +48,9 @@ from .const import (
     STORAGE_KEY_PREFIX,
     STORAGE_VERSION,
     SUPPLEMENTAL_TELEMETRY_TIMEOUT_SECONDS,
+    SUPPORTED_EVENT_TYPES,
+    SUPPORTED_PAYLOAD_KEYS,
+    SUPPORTED_PROPERTY_CODES,
     TDS_PAYLOAD_KEYS,
     TDS_SENTINEL_ERROR,
     TDS_THRESHOLD_FAIR,
@@ -81,6 +85,7 @@ from .util import (
 _LOGGER = logging.getLogger(__name__)
 RESET_CONFIRMATION_POLLS = 3
 RESET_COMMAND_SETTLE_SECONDS = 1.0
+MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS = 256
 
 
 class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
@@ -130,6 +135,10 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         )
         self._known_tds_char_uuid: str | None = None
         self._latest_advertisement_time: float | None = None
+        self._debug_log_times: dict[str, float] = {}
+        self._logged_unknown_payload_fields: dict[str, None] = {}
+        self._pending_unknown_payload_fields: dict[str, str] = {}
+        self._unknown_payload_flush_handle: asyncio.TimerHandle | None = None
         self._telemetry_generation = 0
         self._pending_reset_store: Store[dict[str, int | None]] = Store(
             hass,
@@ -141,6 +150,26 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             normalize_mac(mac_address, uppercase=True),
             normalize_mac(mac_address, uppercase=False),
         )
+
+    def _debug_log_due(self, category: str) -> bool:
+        """Return whether a rate-limited debug message may be emitted now.
+
+        Background Bluetooth callbacks can run far more often than the regular
+        poll. Each diagnostics category is therefore limited to at most one
+        message per ``DEFAULT_SCAN_INTERVAL`` seconds.
+
+        Args:
+            category: Cooldown bucket identifying the debug message category.
+
+        Returns:
+            True when the caller may emit the category's debug message.
+        """
+        now = time.monotonic()
+        last_logged = self._debug_log_times.get(category)
+        if last_logged is not None and now - last_logged < DEFAULT_SCAN_INTERVAL:
+            return False
+        self._debug_log_times[category] = now
+        return True
 
     @callback
     def _async_handle_bluetooth_event(
@@ -155,23 +184,15 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         every packet. The first reading is published immediately to make the
         sensor available; later readings are coalesced into the coordinator's
         regular refresh, which runs every ``DEFAULT_SCAN_INTERVAL`` seconds.
+        Advertisement diagnostics are likewise limited to one message per
+        polling interval.
 
         Args:
             service_info: Scanner report containing the device's RSSI in dBm.
             change: Type of change event.
         """
         rssi = service_info.rssi
-        _LOGGER.debug(
-            "Karofi advertisement seen for %s (RSSI: %s, change: %s)",
-            self.masked_mac,
-            rssi,
-            change,
-        )
         if rssi == 0:
-            _LOGGER.debug(
-                "Ignoring missing RSSI for %s; retaining the last valid reading",
-                self.masked_mac,
-            )
             return
 
         advertisement_time = service_info.time
@@ -179,12 +200,6 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             self._latest_advertisement_time is not None
             and advertisement_time < self._latest_advertisement_time
         ):
-            _LOGGER.debug(
-                "Ignoring out-of-order advertisement for %s (time %.3f is older than %.3f)",
-                self.masked_mac,
-                advertisement_time,
-                self._latest_advertisement_time,
-            )
             return
 
         self._latest_advertisement_time = advertisement_time
@@ -195,6 +210,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             # sensor becomes available without waiting for the next poll.
             self.async_update_listeners()
 
+        if _LOGGER.isEnabledFor(logging.DEBUG) and self._debug_log_due("advertisement"):
+            _LOGGER.debug(
+                "Karofi advertisement for %s: RSSI %s dBm (change: %s)",
+                self.masked_mac,
+                rssi,
+                change,
+            )
+
     @callback
     def _async_handle_bluetooth_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
         """Clear RSSI when advertisements for the device expire.
@@ -202,7 +225,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Args:
             service_info: Last service info for the unavailable device.
         """
-        _LOGGER.debug("Karofi advertisements expired for %s", self.masked_mac)
+        if _LOGGER.isEnabledFor(logging.DEBUG) and self._debug_log_due("advertisement"):
+            _LOGGER.debug("Karofi advertisements expired for %s", self.masked_mac)
         if self.data.signal_strength is not None:
             self.data.signal_strength = None
             # Expiry is a one-off transition, so publish it immediately.
@@ -319,6 +343,14 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     description,
                     hide_mac(address),
                 )
+
+    async def async_shutdown(self) -> None:
+        """Cancel pending diagnostics and shut down the coordinator."""
+        if self._unknown_payload_flush_handle is not None:
+            self._unknown_payload_flush_handle.cancel()
+            self._unknown_payload_flush_handle = None
+        self._pending_unknown_payload_fields.clear()
+        await super().async_shutdown()
 
     async def async_setup(self) -> None:
         """Restore filter tracking state and register Bluetooth signal tracking.
@@ -1316,6 +1348,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 return
             res_bytes = bytearray(res)
             received_packets.append(res_bytes)
+            self._log_unknown_payload_fields(res_bytes)
             _LOGGER.debug(
                 "Read char %s after ID notify (%d bytes, hex: %s, text: %r)",
                 getattr(char_target, "uuid", char_target),
@@ -1324,6 +1357,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 res_bytes.decode("utf-8", errors="replace"),
             )
             if self._parse_tds_reading(res_bytes) is not None:
+                self._log_assembled_notification_fields(received_packets)
                 self._known_tds_char_uuid = getattr(char_target, "uuid", str(char_target))
                 if not notify_future.done():
                     notify_future.set_result(res_bytes)
@@ -1352,15 +1386,18 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             bg_tasks: Active background task set tracking spawned tasks.
         """
         received_packets.append(data)
-        _LOGGER.debug(
-            "Received BLE notification on %s from device %s: %d bytes (hex: %s, text: %r)",
-            getattr(target, "uuid", target),
-            self.masked_mac,
-            len(data),
-            data.hex(),
-            data.decode("utf-8", errors="replace"),
-        )
+        self._log_unknown_payload_fields(data)
+        if _LOGGER.isEnabledFor(logging.DEBUG) and self._debug_log_due("notification"):
+            _LOGGER.debug(
+                "Received BLE notification on %s from device %s: %d bytes (hex: %s, text: %r)",
+                getattr(target, "uuid", target),
+                self.masked_mac,
+                len(data),
+                data.hex(),
+                data.decode("utf-8", errors="replace"),
+            )
         if match := self._find_tds_reading_in_packets(received_packets):
+            self._log_assembled_notification_fields(received_packets)
             if not notify_future.done():
                 notify_future.set_result(match)
             return
@@ -1374,6 +1411,15 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 client, char, received_packets, notify_future
             ),
         )
+
+    def _log_assembled_notification_fields(self, received_packets: list[bytearray]) -> None:
+        """Log unknown fields from the assembled notification stream.
+
+        Args:
+            received_packets: Packets received for the current notification.
+        """
+        if received_packets:
+            self._log_unknown_payload_fields(b"".join(received_packets))
 
     @staticmethod
     async def _stop_notify_safe(
@@ -1420,6 +1466,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             "Timed out (3.5s) waiting for TDS notification from Karofi device %s",
             self.masked_mac,
         )
+        self._log_assembled_notification_fields(received_packets)
         if match := self._find_tds_in_packets(received_packets):
             return match
         return received_packets[-1] if received_packets else bytearray()
@@ -1550,6 +1597,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return None, bytearray()
         direct_bytes = await self._read_characteristic_safe(client, read_target)
         if direct_bytes:
+            self._log_unknown_payload_fields(direct_bytes)
             _LOGGER.debug(
                 "Direct read from %s returned %d bytes (hex: %s, text: %r)",
                 getattr(read_target, "uuid", read_target),
@@ -1603,6 +1651,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                         continue
                     cand_bytes = await self._read_characteristic_safe(client, candidate)
                     if cand_bytes:
+                        self._log_unknown_payload_fields(cand_bytes)
                         _LOGGER.debug(
                             "Data characteristic %s read returned %d bytes (hex: %s, text: %r)",
                             candidate.uuid,
@@ -1665,6 +1714,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 )
                 return None, fallback_payload
             if post_cmd_bytes:
+                self._log_unknown_payload_fields(post_cmd_bytes)
                 _LOGGER.debug(
                     "Follow-up read of %s after polling returned %d bytes (hex: %s, text: %r)",
                     getattr(read_target, "uuid", read_target),
@@ -2655,6 +2705,130 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 has_sensor_data = True
         return has_sensor_data, filters_updated
 
+    def _log_unknown_payload_fields(self, raw_bytes: bytearray | bytes) -> None:
+        """Log unsupported payload keys and protocol values once for model support.
+
+        Newer Karofi models may report fields that this integration does not
+        parse yet. Unknown fields are logged at most once per polling interval,
+        and each field is reported only once within a bounded history, so users
+        can capture a debug log without flooding it on every characteristic read.
+        Fields discovered during the cooldown are queued and flushed when the
+        cooldown expires.
+
+        Args:
+            raw_bytes: Payload bytes read from a characteristic or notification.
+        """
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+
+        unknown_fields: dict[str, str] = {}
+        for payload in self._extract_all_payload_dicts(raw_bytes):
+            for key, value in payload.items():
+                escaped_key = self._escape_log_identifier(key)
+                field_id = f"key:{escaped_key}"
+                if (
+                    key not in SUPPORTED_PAYLOAD_KEYS
+                    and field_id not in self._logged_unknown_payload_fields
+                ):
+                    unknown_fields[field_id] = f"{escaped_key}={value!r}"
+
+            property_code = payload.get(MakiposPayloadKey.PROPERTY_CODE)
+            if MakiposPayloadKey.PROPERTY_CODE in payload and (
+                not isinstance(property_code, str) or property_code not in SUPPORTED_PROPERTY_CODES
+            ):
+                field_id = f"property_code:{property_code!r}"
+                if field_id not in self._logged_unknown_payload_fields:
+                    unknown_fields[field_id] = (
+                        f"{MakiposPayloadKey.PROPERTY_CODE}={property_code!r}"
+                    )
+
+            event_type = payload.get(MakiposPayloadKey.EVENT_TYPE)
+            if MakiposPayloadKey.EVENT_TYPE in payload and (
+                not isinstance(event_type, str) or event_type not in SUPPORTED_EVENT_TYPES
+            ):
+                field_id = f"event_type:{event_type!r}"
+                if field_id not in self._logged_unknown_payload_fields:
+                    unknown_fields[field_id] = f"{MakiposPayloadKey.EVENT_TYPE}={event_type!r}"
+
+        self._pending_unknown_payload_fields.update(unknown_fields)
+        self._trim_pending_unknown_payload_fields()
+        self._flush_pending_unknown_payload_fields()
+
+    def _flush_pending_unknown_payload_fields(self) -> None:
+        """Emit queued unknown-payload diagnostics when the cooldown has elapsed."""
+        if not self._pending_unknown_payload_fields:
+            return
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            self._pending_unknown_payload_fields.clear()
+            return
+        if not self._debug_log_due("unknown_payload"):
+            self._schedule_unknown_payload_flush()
+            return
+
+        if self._unknown_payload_flush_handle is not None:
+            self._unknown_payload_flush_handle.cancel()
+            self._unknown_payload_flush_handle = None
+
+        pending_fields = self._pending_unknown_payload_fields
+        self._pending_unknown_payload_fields = {}
+        self._remember_logged_unknown_payload_fields(pending_fields)
+        _LOGGER.debug(
+            "Unknown Karofi payload key/value from device %s: %s; "
+            "please share this debug log to help add support for newer models",
+            self.masked_mac,
+            ", ".join(pending_fields.values()),
+        )
+
+    def _schedule_unknown_payload_flush(self) -> None:
+        """Schedule a delayed flush for diagnostics queued during the cooldown."""
+        if self._unknown_payload_flush_handle is not None:
+            return
+        last_logged = self._debug_log_times.get("unknown_payload")
+        if last_logged is None:
+            delay = 0.0
+        else:
+            elapsed = time.monotonic() - last_logged
+            delay = max(0.0, DEFAULT_SCAN_INTERVAL - elapsed) + 0.01
+        self._unknown_payload_flush_handle = self.hass.loop.call_later(
+            delay, self._handle_unknown_payload_flush
+        )
+
+    def _handle_unknown_payload_flush(self) -> None:
+        """Flush queued unknown-payload diagnostics after the cooldown."""
+        self._unknown_payload_flush_handle = None
+        self._flush_pending_unknown_payload_fields()
+
+    def _remember_logged_unknown_payload_fields(self, field_ids: Iterable[str]) -> None:
+        """Record reported field IDs while keeping the tracking history bounded.
+
+        Args:
+            field_ids: Field identifiers that have been reported.
+        """
+        for field_id in field_ids:
+            self._logged_unknown_payload_fields.pop(field_id, None)
+            self._logged_unknown_payload_fields[field_id] = None
+        while len(self._logged_unknown_payload_fields) > MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS:
+            self._logged_unknown_payload_fields.pop(next(iter(self._logged_unknown_payload_fields)))
+
+    def _trim_pending_unknown_payload_fields(self) -> None:
+        """Drop the oldest queued diagnostics beyond the tracking cap."""
+        while len(self._pending_unknown_payload_fields) > MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS:
+            self._pending_unknown_payload_fields.pop(
+                next(iter(self._pending_unknown_payload_fields))
+            )
+
+    @staticmethod
+    def _escape_log_identifier(value: str) -> str:
+        """Escape control characters in an untrusted identifier for logging.
+
+        Args:
+            value: Untrusted identifier text.
+
+        Returns:
+            ASCII-safe text with control characters escaped.
+        """
+        return value.encode("unicode_escape").decode("ascii")
+
     def _process_tds_payload(
         self,
         raw_bytes: bytearray | bytes,
@@ -2678,6 +2852,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
 
         self.data.connected = True
         self.data.last_seen = dt_util.utcnow()
+        self._log_unknown_payload_fields(raw_bytes)
 
         if self._is_handshake_payload(raw_bytes):
             _LOGGER.debug(

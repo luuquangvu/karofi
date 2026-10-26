@@ -57,6 +57,42 @@ class MakiposPropertyCode(StrEnum):
     IRO_RSFT = "iro_rsft"
 
 
+# Only identifiers consumed by the coordinator belong in these sets. Recognized
+# but unprocessed protocol fields remain reportable by unknown-payload logging.
+SUPPORTED_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        MakiposPayloadKey.PROPERTY_CODE.value,
+        MakiposPayloadKey.EVENT_TYPE.value,
+        MakiposPayloadKey.DATA.value,
+        MakiposPayloadKey.ID.value,
+        MakiposPayloadKey.IRO_TDS.value,
+        MakiposPayloadKey.IRO_LTIME.value,
+        MakiposPayloadKey.IRO_HSD.value,
+        MakiposPayloadKey.IRO_ERRS.value,
+        MakiposPayloadKey.IRO_NAMES.value,
+        MakiposPayloadKey.FILTER_NAMES.value,
+        MakiposPayloadKey.NAMES.value,
+        MakiposPayloadKey.TDS.value,
+        MakiposPayloadKey.PURE_INDEX.value,
+        MakiposPayloadKey.PI.value,
+    }
+)
+SUPPORTED_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        MakiposEventType.NP.value,
+        MakiposEventType.CP.value,
+    }
+)
+SUPPORTED_PROPERTY_CODES: Final[frozenset[str]] = frozenset(
+    {
+        MakiposPropertyCode.IRO_TDS.value,
+        MakiposPropertyCode.IRO_LTIME.value,
+        MakiposPropertyCode.IRO_HSD.value,
+        MakiposPropertyCode.IRO_ERRS.value,
+    }
+)
+
+
 TDS_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
     MakiposPayloadKey.IRO_TDS,
     MakiposPayloadKey.TDS,
