@@ -530,6 +530,7 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
     mock_service_info = MagicMock(spec=BluetoothServiceInfoBleak)
     mock_service_info.address = "AA:BB:CC:11:22:33"
     mock_service_info.rssi = -60
+    mock_service_info.time = 100.0
     with patch.object(coordinator, "async_update_listeners") as mock_update_listeners:
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         assert coordinator.data.signal_strength == -60
@@ -542,6 +543,7 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
 
         # A new RSSI reading is propagated to entities.
         mock_service_info.rssi = -71
+        mock_service_info.time = 200.0
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         assert coordinator.data.signal_strength == -71
         mock_update_listeners.assert_called_once()
@@ -549,9 +551,23 @@ async def test_coordinator_bluetooth_event_logging(coordinator: KarofiDataCoordi
         # A zero RSSI means the scanner had no reading; keep the last valid value.
         mock_update_listeners.reset_mock()
         mock_service_info.rssi = 0
+        mock_service_info.time = 300.0
         coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
         assert coordinator.data.signal_strength == -71
         mock_update_listeners.assert_not_called()
+
+        # A delayed advertisement must not replace a newer accepted reading.
+        mock_service_info.rssi = -55
+        mock_service_info.time = 150.0
+        coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
+        assert coordinator.data.signal_strength == -71
+        mock_update_listeners.assert_not_called()
+
+        # A newer advertisement is still accepted.
+        mock_service_info.time = 250.0
+        coordinator._async_handle_bluetooth_event(mock_service_info, BluetoothChange.ADVERTISEMENT)
+        assert coordinator.data.signal_strength == -55
+        mock_update_listeners.assert_called_once()
 
 
 @pytest.mark.usefixtures("enable_bluetooth")

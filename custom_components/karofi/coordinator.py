@@ -128,6 +128,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             signal_strength=None,
         )
         self._known_tds_char_uuid: str | None = None
+        self._latest_advertisement_time: float | None = None
         self._telemetry_generation = 0
         self._pending_reset_store: Store[dict[str, int | None]] = Store(
             hass,
@@ -166,6 +167,20 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             )
             return
 
+        advertisement_time = service_info.time
+        if (
+            self._latest_advertisement_time is not None
+            and advertisement_time < self._latest_advertisement_time
+        ):
+            _LOGGER.debug(
+                "Ignoring out-of-order advertisement for %s (time %.3f is older than %.3f)",
+                hide_mac(service_info.address),
+                advertisement_time,
+                self._latest_advertisement_time,
+            )
+            return
+
+        self._latest_advertisement_time = advertisement_time
         if self.data.signal_strength != rssi:
             self.data.signal_strength = rssi
             self.async_update_listeners()
