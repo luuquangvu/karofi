@@ -73,11 +73,17 @@
       "filter_1_days": {
         "name": "Filter 1 days remaining"
       },
+      "filter_1_hours": {
+        "name": "Filter 1 usage hours remaining"
+      },
       "filter_2_percent": {
         "name": "Filter 2 life"
       },
       "filter_2_days": {
         "name": "Filter 2 days remaining"
+      },
+      "filter_2_hours": {
+        "name": "Filter 2 usage hours remaining"
       },
       "filter_3_percent": {
         "name": "Filter 3 life"
@@ -85,11 +91,17 @@
       "filter_3_days": {
         "name": "Filter 3 days remaining"
       },
+      "filter_3_hours": {
+        "name": "Filter 3 usage hours remaining"
+      },
       "filter_4_percent": {
         "name": "Filter 4 life"
       },
       "filter_4_days": {
         "name": "Filter 4 days remaining"
+      },
+      "filter_4_hours": {
+        "name": "Filter 4 usage hours remaining"
       },
       "filter_5_percent": {
         "name": "Filter 5 life"
@@ -97,11 +109,17 @@
       "filter_5_days": {
         "name": "Filter 5 days remaining"
       },
+      "filter_5_hours": {
+        "name": "Filter 5 usage hours remaining"
+      },
       "filter_6_percent": {
         "name": "Filter 6 life"
       },
       "filter_6_days": {
         "name": "Filter 6 days remaining"
+      },
+      "filter_6_hours": {
+        "name": "Filter 6 usage hours remaining"
       },
       "filter_7_percent": {
         "name": "Filter 7 life"
@@ -109,11 +127,17 @@
       "filter_7_days": {
         "name": "Filter 7 days remaining"
       },
+      "filter_7_hours": {
+        "name": "Filter 7 usage hours remaining"
+      },
       "filter_8_percent": {
         "name": "Filter 8 life"
       },
       "filter_8_days": {
         "name": "Filter 8 days remaining"
+      },
+      "filter_8_hours": {
+        "name": "Filter 8 usage hours remaining"
       },
       "filter_9_percent": {
         "name": "Filter 9 life"
@@ -121,11 +145,17 @@
       "filter_9_days": {
         "name": "Filter 9 days remaining"
       },
+      "filter_9_hours": {
+        "name": "Filter 9 usage hours remaining"
+      },
       "filter_10_percent": {
         "name": "Filter 10 life"
       },
       "filter_10_days": {
         "name": "Filter 10 days remaining"
+      },
+      "filter_10_hours": {
+        "name": "Filter 10 usage hours remaining"
       },
       "filter_11_percent": {
         "name": "Filter 11 life"
@@ -133,11 +163,17 @@
       "filter_11_days": {
         "name": "Filter 11 days remaining"
       },
+      "filter_11_hours": {
+        "name": "Filter 11 usage hours remaining"
+      },
       "filter_12_percent": {
         "name": "Filter 12 life"
       },
       "filter_12_days": {
         "name": "Filter 12 days remaining"
+      },
+      "filter_12_hours": {
+        "name": "Filter 12 usage hours remaining"
       }
     },
     "button": {

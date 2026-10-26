@@ -535,19 +535,19 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         used_days = (dt_util.utcnow() - dt_util.as_utc(start_date)).days
         return max(0, min(lifetime, lifetime - used_days))
 
-    def get_filter_percent(
+    def get_filter_calendar_percent(
         self,
         filter_stage: KarofiFilter | str,
         max_days: int | None = None,
     ) -> int:
-        """Calculate remaining percentage of filter lifespan.
+        """Calculate remaining calendar-lifetime percentage of a filter.
 
         Args:
             filter_stage: Filter identifier or KarofiFilter enum.
             max_days: Optional rated lifespan in days overriding defaults.
 
         Returns:
-            Remaining life percentage (0-100).
+            Remaining calendar life percentage (0-100).
         """
         key = filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
         if (
@@ -564,6 +564,79 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return 0
         remaining = self.get_filter_remaining_days(key, max_days=lifetime)
         return max(0, min(100, round(remaining / lifetime * 100)))
+
+    def get_filter_percent(
+        self,
+        filter_stage: KarofiFilter | str,
+        max_days: int | None = None,
+    ) -> int:
+        """Calculate the effective remaining percentage of a filter.
+
+        The effective value is the lower of the calendar-lifetime percentage and
+        the runtime-usage percentage. Runtime telemetry is optional, so filters
+        without it keep using calendar life alone.
+
+        Args:
+            filter_stage: Filter identifier or KarofiFilter enum.
+            max_days: Optional rated lifespan in days overriding defaults.
+
+        Returns:
+            Effective remaining life percentage (0-100).
+        """
+        key = filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
+        calendar_percent = self.get_filter_calendar_percent(filter_stage, max_days)
+
+        # During a pending reset the calendar value is optimistic and runtime
+        # telemetry may still be stale. Keep the effective value on the calendar
+        # path until the pending reset clears or is abandoned.
+        if key in self._pending_filter_resets:
+            return calendar_percent
+
+        runtime_percent = self.get_filter_runtime_percent(key)
+        if runtime_percent is None:
+            return calendar_percent
+        return min(calendar_percent, runtime_percent)
+
+    def get_filter_runtime_percent(self, filter_stage: KarofiFilter | str) -> int | None:
+        """Get the remaining runtime-usage percentage of a filter.
+
+        Args:
+            filter_stage: Filter identifier or KarofiFilter enum.
+
+        Returns:
+            Remaining runtime percentage (0-100), or None when unavailable.
+        """
+        key = filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
+        fdata = self.data.filters.get(key)
+        if fdata is None or fdata.runtime_percent is None:
+            return None
+        return max(0, min(100, fdata.runtime_percent))
+
+    def get_filter_runtime_remaining_hours(self, filter_stage: KarofiFilter | str) -> int | None:
+        """Get the remaining runtime hours reported for a filter.
+
+        Args:
+            filter_stage: Filter identifier or KarofiFilter enum.
+
+        Returns:
+            Remaining runtime hours, or None when unavailable.
+        """
+        key = filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
+        fdata = self.data.filters.get(key)
+        return fdata.runtime_remaining_hours if fdata is not None else None
+
+    def get_filter_runtime_total_hours(self, filter_stage: KarofiFilter | str) -> int | None:
+        """Get the rated runtime hours reported for a filter.
+
+        Args:
+            filter_stage: Filter identifier or KarofiFilter enum.
+
+        Returns:
+            Rated runtime hours, or None when unavailable.
+        """
+        key = filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
+        fdata = self.data.filters.get(key)
+        return fdata.runtime_total_hours if fdata is not None else None
 
     async def _async_send_reset_command(self, filter_index: int) -> bool:
         """Send the BLE hardware reset command to the device.
@@ -726,10 +799,12 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         else:
             baseline_hours = fdata.remaining_hours if fdata is not None else None
         self._apply_filter_installation_date(filter_key, dt_util.utcnow())
+        runtime_reset_applied = self._apply_runtime_reset(filter_key)
         self._pending_filter_resets[filter_key] = PendingFilterReset(
             generation=self._telemetry_generation,
             lifetime_hours=lifetime_hours,
             baseline_hours=baseline_hours,
+            runtime_reset_applied=runtime_reset_applied,
         )
         await self._pending_reset_store.async_save(self._get_pending_reset_storage())
         await self._async_save_filter_tracking()
@@ -772,6 +847,30 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             fdata.percent = pct
             fdata.remaining_hours = rem_hours
             fdata.telemetry_synced = False
+
+    def _apply_runtime_reset(self, filter_key: str) -> bool:
+        """Optimistically restore runtime capacity after a successful reset.
+
+        The vendor app sends a single cartridge-reset command and trusts the
+        device to reset both the calendar and runtime counters. When the rated
+        runtime capacity is known, mirror that expectation locally until fresh
+        telemetry arrives.
+
+        Args:
+            filter_key: Filter stage key that was reset.
+
+        Returns:
+            True when an optimistic runtime value was applied, False otherwise.
+        """
+        fdata = self.data.filters.get(filter_key)
+        if fdata is None:
+            return False
+        total = fdata.runtime_total_hours
+        if total is None or total <= 0:
+            return False
+        fdata.runtime_remaining_hours = total
+        fdata.runtime_percent = 100
+        return True
 
     def _log_discovered_services(self, client: BleakClientWithServiceCache) -> None:
         """Log discovered GATT services and characteristics for debugging.
@@ -2296,18 +2395,23 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         lifetime_hours: int | None,
         name: str | None = None,
         *,
+        runtime_remaining_hours: int | None = None,
+        runtime_total_hours: int | None = None,
         telemetry_generation: int | None = None,
     ) -> None:
         """Update telemetry, lifetime, and optional name for a single filter stage.
 
         The device reports the remaining filter time via ``iro_lTime`` and the rated
-        lifetime via ``iro_hsd``. Both values are in hours.
+        lifetime via ``iro_hsd``. Both values are in hours. Runtime-usage telemetry
+        (``iro_rtr`` / ``iro_rtt``) is optional and tracked separately.
 
         Args:
             idx: 0-based filter stage index.
             remaining_hours: Remaining filter hours or None.
             lifetime_hours: Rated filter lifetime in hours or None.
             name: Optional dynamic filter name from device payload.
+            runtime_remaining_hours: Remaining runtime hours or None.
+            runtime_total_hours: Rated runtime hours or None.
             telemetry_generation: Poll generation associated with this telemetry.
         """
         key = filter_index_to_key(idx)
@@ -2335,6 +2439,23 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             self._update_filter_remaining(fdata, remaining_hours)
         if not outcome.is_stale:
             self._update_filter_percent(fdata)
+        # Hold the optimistic runtime reset value for the whole confirmation
+        # window. Devices may take several polls to reset runtime counters even
+        # though a fresh poll already carries generation > pending generation.
+        hold_runtime_reset = (
+            pending_reset is not None
+            and pending_reset.runtime_reset_applied
+            and not outcome.resolved
+            and not outcome.abandoned
+        )
+        if not hold_runtime_reset:
+            self._update_filter_runtime(
+                fdata,
+                runtime_remaining_hours,
+                runtime_total_hours,
+                pending_reset,
+                telemetry_generation,
+            )
         self._ensure_filter_reset_date(key, fdata)
 
     @staticmethod
@@ -2540,6 +2661,50 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             ),
         )
 
+    @staticmethod
+    def _update_filter_runtime(
+        fdata: KarofiFilterData,
+        runtime_remaining_hours: int | None,
+        runtime_total_hours: int | None,
+        pending_reset: PendingFilterReset | None,
+        telemetry_generation: int | None,
+    ) -> None:
+        """Update runtime-usage telemetry for a filter stage.
+
+        Missing values keep the previously known runtime counters. A missing or
+        non-positive rated runtime makes the runtime percentage unavailable.
+
+        Args:
+            fdata: Filter telemetry record to update.
+            runtime_remaining_hours: Remaining runtime hours or None.
+            runtime_total_hours: Rated runtime hours or None.
+            pending_reset: Pending reset state or None.
+            telemetry_generation: Poll generation associated with this telemetry.
+        """
+        # Ignore pre-reset runtime telemetry until a newer generation arrives.
+        if (
+            pending_reset is not None
+            and telemetry_generation is not None
+            and telemetry_generation <= pending_reset.generation
+        ):
+            return
+
+        if runtime_remaining_hours is not None:
+            fdata.runtime_remaining_hours = max(0, runtime_remaining_hours)
+        if runtime_total_hours is not None:
+            fdata.runtime_total_hours = max(0, runtime_total_hours)
+
+        remaining = fdata.runtime_remaining_hours
+        total = fdata.runtime_total_hours
+        if remaining is None or total is None or total <= 0:
+            fdata.runtime_percent = None
+            return
+
+        fdata.runtime_percent = max(
+            0,
+            min(100, round(remaining / total * 100)),
+        )
+
     def _ensure_filter_reset_date(self, key: str, fdata: KarofiFilterData) -> None:
         """Infer a missing reset date from remaining filter life."""
         if key in self.data.filter_reset_dates or fdata.remaining_days is None:
@@ -2590,7 +2755,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         payload: dict[str, object],
         telemetry_generation: int | None = None,
     ) -> bool:
-        """Process filter telemetry (lTime, hsd) and names from payload dictionary.
+        """Process filter telemetry (calendar, runtime, names) from a payload.
 
         Args:
             payload: Parsed JSON payload dictionary.
@@ -2611,14 +2776,34 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             ),
             preserve_none=True,
         )
+        rtr_list = self._coerce_int_list(
+            self._get_payload_property_val(
+                payload, MakiposPropertyCode.IRO_RTR, MakiposPayloadKey.IRO_RTR
+            ),
+            preserve_none=True,
+        )
+        rtt_list = self._coerce_int_list(
+            self._get_payload_property_val(
+                payload, MakiposPropertyCode.IRO_RTT, MakiposPayloadKey.IRO_RTT
+            ),
+            preserve_none=True,
+        )
         names_list = self._extract_names_list(payload)
 
-        if ltime_list is None and hsd_list is None and names_list is None:
+        if (
+            ltime_list is None
+            and hsd_list is None
+            and rtr_list is None
+            and rtt_list is None
+            and names_list is None
+        ):
             return False
 
         filter_count = max(
             len(ltime_list) if ltime_list else 0,
             len(hsd_list) if hsd_list else 0,
+            len(rtr_list) if rtr_list else 0,
+            len(rtt_list) if rtt_list else 0,
             len(names_list) if names_list else 0,
         )
         for idx in range(filter_count):
@@ -2627,6 +2812,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 self._get_list_element(ltime_list, idx),
                 self._get_list_element(hsd_list, idx),
                 self._get_list_element(names_list, idx),
+                runtime_remaining_hours=self._get_list_element(rtr_list, idx),
+                runtime_total_hours=self._get_list_element(rtt_list, idx),
                 telemetry_generation=telemetry_generation,
             )
 

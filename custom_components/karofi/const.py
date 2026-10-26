@@ -66,7 +66,9 @@ SUPPORTED_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
         MakiposPayloadKey.DATA.value,
         MakiposPayloadKey.ID.value,
         MakiposPayloadKey.IRO_TDS.value,
+        MakiposPayloadKey.IRO_RTR.value,
         MakiposPayloadKey.IRO_LTIME.value,
+        MakiposPayloadKey.IRO_RTT.value,
         MakiposPayloadKey.IRO_HSD.value,
         MakiposPayloadKey.IRO_ERRS.value,
         MakiposPayloadKey.IRO_NAMES.value,
@@ -86,7 +88,9 @@ SUPPORTED_EVENT_TYPES: Final[frozenset[str]] = frozenset(
 SUPPORTED_PROPERTY_CODES: Final[frozenset[str]] = frozenset(
     {
         MakiposPropertyCode.IRO_TDS.value,
+        MakiposPropertyCode.IRO_RTR.value,
         MakiposPropertyCode.IRO_LTIME.value,
+        MakiposPropertyCode.IRO_RTT.value,
         MakiposPropertyCode.IRO_HSD.value,
         MakiposPropertyCode.IRO_ERRS.value,
     }
@@ -201,6 +205,7 @@ class KarofiIcon(StrEnum):
     QUALITY = "mdi:water-check"
     FILTER = "mdi:filter-outline"
     CALENDAR = "mdi:calendar-clock"
+    CLOCK = "mdi:clock-outline"
     RESTORE = "mdi:restore"
     SIGNAL = "mdi:signal"
 

@@ -28,6 +28,7 @@ from custom_components.karofi.models import KarofiFilterData
 from custom_components.karofi.sensor import (
     KarofiFilterDaysRemainingSensor,
     KarofiFilterPercentSensor,
+    KarofiFilterUsageHoursRemainingSensor,
     KarofiQualitySensor,
     KarofiSignalStrengthSensor,
     KarofiTDSSensor,
@@ -110,8 +111,40 @@ async def test_sensor_async_setup_entry(
     mock_coordinator.data.filter_reset_dates["filter_2"] = "2026-01-01T00:00:00"
     mock_coordinator.async_update_listeners()
 
-    # 3 base sensors + 4 filter sensors (2 per filter)
-    assert len(added_entities) == 7
+    # 3 base sensors + 6 filter sensors (3 per filter)
+    assert len(added_entities) == 9
+
+
+async def test_sensor_async_setup_entry_with_known_filters(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test the initial filter sensor registration path includes usage hours.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    mock_coordinator.data.filter_reset_dates["filter_1"] = "2026-01-01T00:00:00"
+    added_entities: list[Entity] = []
+
+    def mock_add_entities(new_entities: Iterable[Entity], update_before_add: bool = False) -> None:
+        """Mock callback to collect added entities.
+
+        Args:
+            new_entities: Iterable of entities to add.
+            update_before_add: Whether to update entities before adding.
+        """
+        added_entities.extend(new_entities)
+
+    await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+
+    assert len(added_entities) == 6
+    assert isinstance(added_entities[3], KarofiFilterPercentSensor)
+    assert isinstance(added_entities[4], KarofiFilterDaysRemainingSensor)
+    assert isinstance(added_entities[5], KarofiFilterUsageHoursRemainingSensor)
 
 
 async def test_tds_sensor(
@@ -288,6 +321,35 @@ async def test_filter_percent_sensor_calculations(
     assert sensor.max_days == 200
     assert sensor.native_value == 90
 
+    # 7. Runtime telemetry is lower than calendar life and becomes effective
+    fdata = mock_coordinator.data.filters["filter_1"]
+    fdata.runtime_remaining_hours = 50
+    fdata.runtime_total_hours = 100
+    fdata.runtime_percent = 50
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 50
+    assert sensor.extra_state_attributes == {
+        "calendar_percent": 90,
+        "runtime_percent": 50,
+        "capacity_days": 200,
+        "capacity_hours": 100,
+    }
+
+    # 8. Calendar life is lower than runtime usage and remains effective
+    fdata.runtime_percent = 95
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 90
+
+    # 9. Missing runtime telemetry falls back to calendar life
+    fdata.runtime_remaining_hours = None
+    fdata.runtime_total_hours = None
+    fdata.runtime_percent = None
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 90
+    attributes = sensor.extra_state_attributes or {}
+    assert attributes["runtime_percent"] is None
+    assert attributes["capacity_hours"] is None
+
 
 async def test_filter_days_remaining_sensor_calculations(
     hass: HomeAssistant,
@@ -352,6 +414,49 @@ async def test_filter_days_remaining_sensor_calculations(
     sensor._handle_coordinator_update()
     assert sensor.max_days == 500
     assert sensor.native_value == 400
+    assert sensor.extra_state_attributes == {"capacity_days": 500}
+
+
+async def test_filter_usage_hours_remaining_sensor(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Test KarofiFilterUsageHoursRemainingSensor attributes and updates.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    mock_coordinator.data.filters["filter_1"] = KarofiFilterData(
+        index=0,
+        key="filter_1",
+        runtime_remaining_hours=1104,
+        runtime_total_hours=1200,
+        runtime_percent=92,
+    )
+    sensor = KarofiFilterUsageHoursRemainingSensor(
+        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 180
+    )
+    _init_test_sensor(sensor, "sensor.karofi_filter_1_hours", hass)
+
+    assert sensor.translation_key == "filter_1_hours"
+    assert sensor.native_unit_of_measurement == UnitOfTime.HOURS
+    assert sensor.state_class == SensorStateClass.MEASUREMENT
+    assert sensor.icon == "mdi:clock-outline"
+    assert sensor.unique_id == "aa:bb:cc:11:22:33_filter_1_hours"
+    assert sensor.native_value == 1104
+    assert sensor.extra_state_attributes == {"capacity_hours": 1200}
+
+    # Missing runtime telemetry exposes None without hiding the entity.
+    mock_coordinator.data.filters["filter_1"].runtime_remaining_hours = None
+    mock_coordinator.data.filters["filter_1"].runtime_total_hours = None
+    mock_coordinator.data.filters["filter_1"].runtime_percent = None
+    sensor._handle_coordinator_update()
+    assert sensor.native_value is None
+    assert sensor.available is True
+    assert sensor.extra_state_attributes == {"capacity_hours": None}
 
 
 async def test_filter_sensors_dynamic_name(
@@ -375,42 +480,59 @@ async def test_filter_sensors_dynamic_name(
     days_sensor = KarofiFilterDaysRemainingSensor(
         mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 180
     )
+    hours_sensor = KarofiFilterUsageHoursRemainingSensor(
+        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 180
+    )
     _init_test_sensor(percent_sensor, "sensor.karofi_filter_1_percent", hass)
     _init_test_sensor(days_sensor, "sensor.karofi_filter_1_days", hass)
+    _init_test_sensor(hours_sensor, "sensor.karofi_filter_1_hours", hass)
 
     assert percent_sensor.name == "Nano Silver life"
     assert percent_sensor.translation_key is None
     assert days_sensor.name == "Nano Silver days remaining"
     assert days_sensor.translation_key is None
+    assert hours_sensor.name == "Nano Silver usage hours remaining"
+    assert hours_sensor.translation_key is None
 
     # Simulate dynamic name update
     mock_coordinator.data.filters["filter_1"].name = "OCB-GAC"
     percent_sensor._handle_coordinator_update()
     days_sensor._handle_coordinator_update()
+    hours_sensor._handle_coordinator_update()
 
     assert percent_sensor.name == "OCB-GAC life"
     assert percent_sensor.translation_key is None
     assert days_sensor.name == "OCB-GAC days remaining"
     assert days_sensor.translation_key is None
+    assert hours_sensor.name == "OCB-GAC usage hours remaining"
+    assert hours_sensor.translation_key is None
 
     # Entity initialized with default translation key updates name when custom name arrives
     p2 = KarofiFilterPercentSensor(mock_coordinator, mock_config_entry, KarofiFilter.FILTER_2, 365)
     d2 = KarofiFilterDaysRemainingSensor(
         mock_coordinator, mock_config_entry, KarofiFilter.FILTER_2, 365
     )
+    h2 = KarofiFilterUsageHoursRemainingSensor(
+        mock_coordinator, mock_config_entry, KarofiFilter.FILTER_2, 365
+    )
     _init_test_sensor(p2, "sensor.karofi_filter_2_percent", hass)
     _init_test_sensor(d2, "sensor.karofi_filter_2_days", hass)
+    _init_test_sensor(h2, "sensor.karofi_filter_2_hours", hass)
     assert p2.translation_key == "filter_2_percent"
     assert d2.translation_key == "filter_2_days"
+    assert h2.translation_key == "filter_2_hours"
     mock_coordinator.data.filters["filter_2"] = KarofiFilterData(
         index=1, key="filter_2", name="Mineral"
     )
     p2._handle_coordinator_update()
     d2._handle_coordinator_update()
+    h2._handle_coordinator_update()
     assert p2.name == "Mineral life"
     assert p2.translation_key is None
     assert d2.name == "Mineral days remaining"
     assert d2.translation_key is None
+    assert h2.name == "Mineral usage hours remaining"
+    assert h2.translation_key is None
 
 
 async def test_base_entity_async_update(
@@ -454,21 +576,37 @@ async def test_filter_sensors_11_12_and_dynamic_fallback(
     # 1. Filter 11 & 12 (standard translation keys)
     s11 = KarofiFilterPercentSensor(mock_coordinator, mock_config_entry, "filter_11", 365)
     s12 = KarofiFilterDaysRemainingSensor(mock_coordinator, mock_config_entry, "filter_12", 365)
+    h11 = KarofiFilterUsageHoursRemainingSensor(
+        mock_coordinator, mock_config_entry, "filter_11", 365
+    )
+    h12 = KarofiFilterUsageHoursRemainingSensor(
+        mock_coordinator, mock_config_entry, "filter_12", 365
+    )
     _init_test_sensor(s11, "sensor.karofi_filter_11_percent", hass)
     _init_test_sensor(s12, "sensor.karofi_filter_12_days", hass)
+    _init_test_sensor(h11, "sensor.karofi_filter_11_hours", hass)
+    _init_test_sensor(h12, "sensor.karofi_filter_12_hours", hass)
 
     assert s11.translation_key == "filter_11_percent"
     assert s12.translation_key == "filter_12_days"
+    assert h11.translation_key == "filter_11_hours"
+    assert h12.translation_key == "filter_12_hours"
 
     # 2. Filter 13 (beyond 12 stages, dynamic fallback)
     s13_pct = KarofiFilterPercentSensor(mock_coordinator, mock_config_entry, "filter_13", 365)
     s13_days = KarofiFilterDaysRemainingSensor(
         mock_coordinator, mock_config_entry, "filter_13", 365
     )
+    s13_hours = KarofiFilterUsageHoursRemainingSensor(
+        mock_coordinator, mock_config_entry, "filter_13", 365
+    )
     _init_test_sensor(s13_pct, "sensor.karofi_filter_13_percent", hass)
     _init_test_sensor(s13_days, "sensor.karofi_filter_13_days", hass)
+    _init_test_sensor(s13_hours, "sensor.karofi_filter_13_hours", hass)
 
     assert s13_pct.name == "Filter 13 life"
     assert s13_pct.translation_key is None
     assert s13_days.name == "Filter 13 days remaining"
     assert s13_days.translation_key is None
+    assert s13_hours.name == "Filter 13 usage hours remaining"
+    assert s13_hours.translation_key is None

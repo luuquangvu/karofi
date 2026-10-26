@@ -45,7 +45,11 @@ from custom_components.karofi.coordinator import (
     RESET_CONFIRMATION_POLLS,
     KarofiDataCoordinator,
 )
-from custom_components.karofi.models import PendingFilterReset, ResolvedGattTargets
+from custom_components.karofi.models import (
+    KarofiFilterData,
+    PendingFilterReset,
+    ResolvedGattTargets,
+)
 
 
 @pytest.fixture
@@ -2169,10 +2173,6 @@ def test_coordinator_process_tds_payload_malformed_and_missing_tds(
         (b'{"lid":"1"}', "lid='1'"),
         (b'{"et":"XX","pc":"iro_tds","d":11}', "et='XX'"),
         (b'{"future_sensor":42}', "future_sensor=42"),
-        (b'{"iro_rtr":[1]}', "iro_rtr=[1]"),
-        (b'{"iro_rtt":[2]}', "iro_rtt=[2]"),
-        (b'{"pc":"iro_rtr","d":[1]}', "pc='iro_rtr'"),
-        (b'{"pc":"iro_rtt","d":[2]}', "pc='iro_rtt'"),
         (b'{"pc":"iro_rsft","d":0}', "pc='iro_rsft'"),
     ],
 )
@@ -2257,6 +2257,9 @@ def test_coordinator_does_not_log_supported_payload_fields(
     caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
     coordinator._process_tds_payload(b'{"et":"NP","pc":"iro_tds","d":11}')
     coordinator._process_tds_payload(b'{"pc":"iro_lTime","d":[4320]}')
+    coordinator._process_tds_payload(b'{"iro_rtr":[1104],"iro_rtt":[1200]}')
+    coordinator._process_tds_payload(b'{"pc":"iro_rtr","d":[1104]}')
+    coordinator._process_tds_payload(b'{"pc":"iro_rtt","d":[1200]}')
     assert "Unknown Karofi payload key/value" not in caplog.text
 
 
@@ -2475,6 +2478,12 @@ def test_coordinator_process_tds_payload_dynamic_filters_and_names(
     assert coordinator.get_filter_name("filter_7") == "Nano Silver"
     assert coordinator.get_filter_remaining_days("filter_2") == 360  # 8640 hours / 24
     assert coordinator.get_filter_lifetime_days("filter_2") == 360  # 8640 hours / 24
+    assert coordinator.data.filters["filter_1"].runtime_remaining_hours == 1200
+    assert coordinator.data.filters["filter_1"].runtime_total_hours == 1200
+    assert coordinator.data.filters["filter_1"].runtime_percent == 100
+    assert coordinator.data.filters["filter_5"].runtime_remaining_hours == 6000
+    assert coordinator.data.filters["filter_5"].runtime_total_hours == 6000
+    assert coordinator.data.filters["filter_5"].runtime_percent == 100
 
 
 def test_coordinator_process_payloads_preserves_first_tds_reading(
@@ -2935,14 +2944,396 @@ def test_coordinator_filter_days_follow_remaining_and_rated_hours(
 
     assert coordinator.data.filters["filter_1"].remaining_hours == 8624
     assert coordinator.data.filters["filter_1"].lifetime_hours == 8640
+    assert coordinator.data.filters["filter_1"].runtime_remaining_hours == 1200
+    assert coordinator.data.filters["filter_1"].runtime_total_hours == 1200
+    assert coordinator.data.filters["filter_1"].runtime_percent == 100
     assert coordinator.get_filter_remaining_days("filter_1") == 359
     assert coordinator.get_filter_lifetime_days("filter_1") == 360
     assert coordinator.data.filters["filter_1"].percent == 100
 
     assert coordinator.data.filters["filter_4"].remaining_hours == 25904
     assert coordinator.data.filters["filter_4"].lifetime_hours == 25920
+    assert coordinator.data.filters["filter_4"].runtime_remaining_hours == 3600
+    assert coordinator.data.filters["filter_4"].runtime_total_hours == 3600
+    assert coordinator.data.filters["filter_4"].runtime_percent == 100
     assert coordinator.get_filter_remaining_days("filter_4") == 1079
     assert coordinator.get_filter_lifetime_days("filter_4") == 1080
+
+
+def test_coordinator_runtime_parsing_from_direct_keys(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Parse runtime remaining and rated hours from direct payload keys.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"iro_rtr":[1104],"iro_rtt":[1200]}')
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.runtime_remaining_hours == 1104
+    assert fdata.runtime_total_hours == 1200
+    assert fdata.runtime_percent == 92
+    assert coordinator.get_filter_runtime_remaining_hours("filter_1") == 1104
+    assert coordinator.get_filter_runtime_total_hours("filter_1") == 1200
+    assert coordinator.get_filter_runtime_percent("filter_1") == 92
+
+
+def test_coordinator_runtime_parsing_from_property_codes(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Parse runtime telemetry from property-code frames.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"pc":"iro_rtr","d":[1104,600]}\n{"pc":"iro_rtt","d":[1200,1200]}'
+    )
+
+    assert coordinator.data.filters["filter_1"].runtime_remaining_hours == 1104
+    assert coordinator.data.filters["filter_1"].runtime_total_hours == 1200
+    assert coordinator.data.filters["filter_1"].runtime_percent == 92
+    assert coordinator.data.filters["filter_2"].runtime_remaining_hours == 600
+    assert coordinator.data.filters["filter_2"].runtime_total_hours == 1200
+    assert coordinator.data.filters["filter_2"].runtime_percent == 50
+
+
+def test_coordinator_runtime_only_payload_creates_filters(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Create filters when a payload contains only runtime telemetry.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"iro_rtr":[1104],"iro_rtt":[1200]}')
+
+    assert coordinator.get_known_filter_keys() == ["filter_1"]
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.remaining_days is None
+    assert fdata.telemetry_synced is False
+    # Calendar fallback is full life, so runtime usage becomes the effective life.
+    assert coordinator.get_filter_percent("filter_1") == 92
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_remaining_hours", "expected_total_hours"),
+    [
+        (b'{"iro_rtr":[1104]}', 1104, None),
+        (b'{"iro_rtt":[1200]}', None, 1200),
+    ],
+    ids=["remaining-only", "total-only"],
+)
+def test_coordinator_runtime_missing_side_leaves_percent_unavailable(
+    coordinator: KarofiDataCoordinator,
+    payload: bytes,
+    expected_remaining_hours: int | None,
+    expected_total_hours: int | None,
+) -> None:
+    """Store available runtime values while leaving the percentage unavailable.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        payload: Runtime payload containing only one side of the pair.
+        expected_remaining_hours: Expected remaining runtime hours.
+        expected_total_hours: Expected rated runtime hours.
+    """
+    coordinator._process_tds_payload(payload)
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.runtime_remaining_hours == expected_remaining_hours
+    assert fdata.runtime_total_hours == expected_total_hours
+    assert fdata.runtime_percent is None
+    assert coordinator.get_filter_runtime_percent("filter_1") is None
+
+
+def test_coordinator_runtime_zero_total_leaves_percent_unavailable(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Treat a zero rated runtime as unavailable capacity.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"iro_rtr":[600],"iro_rtt":[0]}')
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.runtime_remaining_hours == 600
+    assert fdata.runtime_total_hours == 0
+    assert fdata.runtime_percent is None
+
+
+def test_coordinator_runtime_values_are_clamped(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Clamp negative runtime counters and percentages above 100.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"iro_rtr":[-5],"iro_rtt":[-10]}')
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.runtime_remaining_hours == 0
+    assert fdata.runtime_total_hours == 0
+    assert fdata.runtime_percent is None
+
+    coordinator._process_tds_payload(b'{"iro_rtr":[1300],"iro_rtt":[1200]}')
+    assert fdata.runtime_remaining_hours == 1300
+    assert fdata.runtime_total_hours == 1200
+    assert fdata.runtime_percent == 100
+
+
+@pytest.mark.parametrize(
+    ("calendar_percent", "runtime_percent", "expected_percent"),
+    [(80, 50, 50), (30, 90, 30)],
+    ids=["runtime-lower", "calendar-lower"],
+)
+def test_coordinator_effective_life_uses_lower_percentage(
+    coordinator: KarofiDataCoordinator,
+    calendar_percent: int,
+    runtime_percent: int,
+    expected_percent: int,
+) -> None:
+    """Return the lower of calendar and runtime percentages.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        calendar_percent: Stored calendar percentage.
+        runtime_percent: Stored runtime percentage.
+        expected_percent: Expected effective percentage.
+    """
+    coordinator.data.filters["filter_1"] = KarofiFilterData(
+        index=0,
+        key="filter_1",
+        lifetime_days=100,
+        percent=calendar_percent,
+        telemetry_synced=True,
+        runtime_percent=runtime_percent,
+    )
+
+    assert coordinator.get_filter_calendar_percent("filter_1") == calendar_percent
+    assert coordinator.get_filter_runtime_percent("filter_1") == runtime_percent
+    assert coordinator.get_filter_percent("filter_1") == expected_percent
+
+
+def test_coordinator_effective_life_falls_back_to_calendar(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Use calendar life when runtime telemetry is unavailable.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator.data.filters["filter_1"] = KarofiFilterData(
+        index=0,
+        key="filter_1",
+        lifetime_days=100,
+        percent=80,
+        telemetry_synced=True,
+    )
+
+    assert coordinator.get_filter_runtime_percent("filter_1") is None
+    assert coordinator.get_filter_percent("filter_1") == 80
+
+
+def test_coordinator_effective_life_uses_calendar_during_pending_reset(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Keep the effective life on the calendar path while a reset is pending.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator.data.filters["filter_1"] = KarofiFilterData(
+        index=0,
+        key="filter_1",
+        lifetime_days=100,
+        percent=80,
+        telemetry_synced=True,
+        runtime_percent=50,
+    )
+    coordinator._pending_filter_resets["filter_1"] = PendingFilterReset(generation=0)
+
+    assert coordinator.get_filter_percent("filter_1") == 80
+
+
+def test_coordinator_runtime_getters_handle_unknown_and_out_of_range(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Return None for unknown filters and clamp stored runtime percentages.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    assert coordinator.get_filter_runtime_remaining_hours("filter_99") is None
+    assert coordinator.get_filter_runtime_total_hours("filter_99") is None
+    assert coordinator.get_filter_runtime_percent("filter_99") is None
+
+    coordinator.data.filters["filter_1"] = KarofiFilterData(
+        index=0,
+        key="filter_1",
+        runtime_remaining_hours=1300,
+        runtime_total_hours=1200,
+        runtime_percent=150,
+    )
+    assert coordinator.get_filter_runtime_percent("filter_1") == 100
+
+    coordinator.data.filters["filter_1"].runtime_percent = -10
+    assert coordinator.get_filter_runtime_percent("filter_1") == 0
+
+
+def test_coordinator_update_filter_runtime_ignores_stale_generation(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Ignore runtime telemetry whose generation predates the pending reset.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    fdata = KarofiFilterData(
+        index=0,
+        key="filter_1",
+        runtime_remaining_hours=1200,
+        runtime_total_hours=1200,
+        runtime_percent=100,
+    )
+    pending_reset = PendingFilterReset(generation=5)
+
+    KarofiDataCoordinator._update_filter_runtime(fdata, 600, 1200, pending_reset, 5)
+    assert fdata.runtime_remaining_hours == 1200
+    assert fdata.runtime_percent == 100
+
+    KarofiDataCoordinator._update_filter_runtime(fdata, 600, 1200, pending_reset, 6)
+    assert fdata.runtime_remaining_hours == 600
+    assert fdata.runtime_percent == 50
+
+
+async def test_coordinator_reset_optimistically_restores_runtime_with_known_capacity(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Reset runtime remaining and percentage when capacity is known.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[4320],"iro_hsd":[8640],"iro_rtr":[600],"iro_rtt":[1200]}',
+        telemetry_generation=1,
+    )
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.runtime_remaining_hours == 600
+    assert fdata.runtime_percent == 50
+
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    assert fdata.runtime_remaining_hours == 1200
+    assert fdata.runtime_total_hours == 1200
+    assert fdata.runtime_percent == 100
+    assert coordinator._pending_filter_resets["filter_1"].runtime_reset_applied is True
+
+
+async def test_coordinator_reset_with_unknown_runtime_capacity_populates_from_telemetry(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Leave unknown runtime capacity untouched until telemetry arrives.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[4320],"iro_hsd":[8640]}',
+        telemetry_generation=1,
+    )
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.runtime_remaining_hours is None
+    assert fdata.runtime_total_hours is None
+    assert fdata.runtime_percent is None
+    assert coordinator._pending_filter_resets["filter_1"].runtime_reset_applied is False
+
+    coordinator._update_single_filter_stage(
+        0,
+        4320,
+        8640,
+        runtime_remaining_hours=600,
+        runtime_total_hours=1200,
+        telemetry_generation=2,
+    )
+
+    assert fdata.runtime_remaining_hours == 600
+    assert fdata.runtime_total_hours == 1200
+    assert fdata.runtime_percent == 50
+
+
+async def test_coordinator_reset_holds_optimistic_runtime_until_confirmation(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Do not let fresh-generation stale counters lower the optimistic runtime.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[4320],"iro_hsd":[8640],"iro_rtr":[600],"iro_rtt":[1200]}',
+        telemetry_generation=1,
+    )
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[600],"iro_hsd":[8640],"iro_rtr":[600],"iro_rtt":[1200]}',
+        telemetry_generation=2,
+    )
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert "filter_1" in coordinator._pending_filter_resets
+    assert fdata.runtime_remaining_hours == 1200
+    assert fdata.runtime_percent == 100
+    assert coordinator.get_filter_percent("filter_1") == 100
+
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[8640],"iro_hsd":[8640],"iro_rtr":[600],"iro_rtt":[1200]}',
+        telemetry_generation=3,
+    )
+
+    assert "filter_1" not in coordinator._pending_filter_resets
+    assert fdata.runtime_remaining_hours == 600
+    assert fdata.runtime_percent == 50
+    assert coordinator.get_filter_percent("filter_1") == 50
+
+
+async def test_coordinator_reset_abandonment_accepts_fresh_runtime_telemetry(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Accept device runtime telemetry after a pending reset is abandoned.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[4320],"iro_hsd":[8640],"iro_rtr":[600],"iro_rtt":[1200]}',
+        telemetry_generation=1,
+    )
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    for generation in range(1, RESET_CONFIRMATION_POLLS + 1):
+        coordinator._process_tds_payload(
+            b'{"iro_lTime":[600],"iro_hsd":[8640],"iro_rtr":[600],"iro_rtt":[1200]}',
+            telemetry_generation=generation,
+        )
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert "filter_1" not in coordinator._pending_filter_resets
+    assert fdata.runtime_remaining_hours == 600
+    assert fdata.runtime_percent == 50
+    assert fdata.percent == 7
+    assert coordinator.get_filter_percent("filter_1") == 7
 
 
 async def test_coordinator_try_active_polling_accepts_filter_only_telemetry(

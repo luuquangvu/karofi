@@ -45,6 +45,9 @@ async def async_setup_entry(
         max_days = coordinator.get_filter_lifetime_days(filter_key)
         entities.append(KarofiFilterPercentSensor(coordinator, entry, filter_key, max_days))
         entities.append(KarofiFilterDaysRemainingSensor(coordinator, entry, filter_key, max_days))
+        entities.append(
+            KarofiFilterUsageHoursRemainingSensor(coordinator, entry, filter_key, max_days)
+        )
 
     async_add_entities(entities)
 
@@ -61,6 +64,9 @@ async def async_setup_entry(
             new_entities.append(KarofiFilterPercentSensor(coordinator, entry, filter_key, max_days))
             new_entities.append(
                 KarofiFilterDaysRemainingSensor(coordinator, entry, filter_key, max_days)
+            )
+            new_entities.append(
+                KarofiFilterUsageHoursRemainingSensor(coordinator, entry, filter_key, max_days)
             )
         if new_entities:
             async_add_entities(new_entities)
@@ -205,6 +211,22 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
             self._attr_name = f"Filter {idx + 1} life"
         self._attr_unique_id = f"{self._mac}_{self.filter_key}_pct"
         self._attr_native_value = self._calculate_percent()
+        self._attr_extra_state_attributes = self._calculate_attributes()
+
+    def _calculate_attributes(self) -> dict[str, int | None]:
+        """Return the calendar/runtime components and capacities behind the state.
+
+        Returns:
+            Extra state attributes describing both lifespan sources.
+        """
+        return {
+            "calendar_percent": self.coordinator.get_filter_calendar_percent(
+                self.filter_key, self.max_days
+            ),
+            "runtime_percent": self.coordinator.get_filter_runtime_percent(self.filter_key),
+            "capacity_days": self.max_days,
+            "capacity_hours": self.coordinator.get_filter_runtime_total_hours(self.filter_key),
+        }
 
     def _calculate_percent(self) -> int:
         """Calculate filter remaining percentage.
@@ -222,6 +244,7 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
             self._attr_translation_key = None
         self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
         self._attr_native_value = self._calculate_percent()
+        self._attr_extra_state_attributes = self._calculate_attributes()
         super()._handle_coordinator_update()
 
 
@@ -261,6 +284,15 @@ class KarofiFilterDaysRemainingSensor(KarofiBaseEntity, SensorEntity):
             self._attr_name = f"Filter {idx + 1} days remaining"
         self._attr_unique_id = f"{self._mac}_{self.filter_key}_days"
         self._attr_native_value = self._calculate_days()
+        self._attr_extra_state_attributes = self._calculate_attributes()
+
+    def _calculate_attributes(self) -> dict[str, int]:
+        """Return the rated calendar lifespan behind the remaining days.
+
+        Returns:
+            Extra state attributes with the calendar capacity.
+        """
+        return {"capacity_days": self.max_days}
 
     def _calculate_days(self) -> int:
         """Calculate remaining days before replacement.
@@ -278,4 +310,71 @@ class KarofiFilterDaysRemainingSensor(KarofiBaseEntity, SensorEntity):
             self._attr_translation_key = None
         self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
         self._attr_native_value = self._calculate_days()
+        self._attr_extra_state_attributes = self._calculate_attributes()
+        super()._handle_coordinator_update()
+
+
+class KarofiFilterUsageHoursRemainingSensor(KarofiBaseEntity, SensorEntity):
+    """Sensor showing remaining runtime usage hours of filter lifespan."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.HOURS
+    _attr_icon = KarofiIcon.CLOCK
+
+    def __init__(
+        self,
+        coordinator: KarofiDataCoordinator,
+        entry: ConfigEntry,
+        filter_stage: KarofiFilter | str,
+        max_days: int,
+    ) -> None:
+        """Initialize the filter usage hours remaining sensor.
+
+        Args:
+            coordinator: Coordinator providing data.
+            entry: Configuration entry.
+            filter_stage: Filter stage identifier or enum.
+            max_days: Rated calendar lifespan in days.
+        """
+        super().__init__(coordinator, entry)
+        self.filter_key: str = (
+            filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
+        )
+        self.max_days = max_days
+        if custom_name := self.coordinator.get_filter_name(self.filter_key):
+            self._attr_name = f"{custom_name} usage hours remaining"
+        elif self.filter_key in FILTER_STAGE_KEYS:
+            self._attr_translation_key = f"{self.filter_key}_hours"
+        else:
+            idx = filter_key_to_index(self.filter_key)
+            self._attr_name = f"Filter {idx + 1} usage hours remaining"
+        self._attr_unique_id = f"{self._mac}_{self.filter_key}_hours"
+        self._attr_native_value = self._calculate_hours()
+        self._attr_extra_state_attributes = self._calculate_attributes()
+
+    def _calculate_attributes(self) -> dict[str, int | None]:
+        """Return the rated runtime capacity behind the remaining hours.
+
+        Returns:
+            Extra state attributes with the runtime capacity.
+        """
+        return {"capacity_hours": self.coordinator.get_filter_runtime_total_hours(self.filter_key)}
+
+    def _calculate_hours(self) -> int | None:
+        """Return the remaining runtime hours reported by the device.
+
+        Returns:
+            Remaining runtime hours, or None when runtime telemetry is unavailable.
+        """
+        return self.coordinator.get_filter_runtime_remaining_hours(self.filter_key)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if custom_name := self.coordinator.get_filter_name(self.filter_key):
+            self._attr_name = f"{custom_name} usage hours remaining"
+            self._attr_translation_key = None
+        self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
+        self._attr_native_value = self._calculate_hours()
+        self._attr_extra_state_attributes = self._calculate_attributes()
         super()._handle_coordinator_update()

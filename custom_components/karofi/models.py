@@ -17,6 +17,7 @@ class PendingFilterReset:
     last_counted_generation: int | None = None
     lifetime_hours: int | None = None
     baseline_hours: int | None = None
+    runtime_reset_applied: bool = False
 
 
 @dataclass
@@ -53,6 +54,9 @@ class KarofiFilterData:
     remaining_days: int | None = None
     lifetime_days: int | None = None
     percent: int | None = None
+    runtime_remaining_hours: int | None = None
+    runtime_total_hours: int | None = None
+    runtime_percent: int | None = None
     reset_date: str | None = None
     telemetry_synced: bool = False
 
