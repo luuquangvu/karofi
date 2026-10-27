@@ -3,7 +3,7 @@
 import re
 from typing import Final
 
-from .const import FILTER_PREFIX, KarofiDevicePrefix, KarofiFilter
+from .const import FILTER_PREFIX, MAX_FILTER_STAGES, KarofiDevicePrefix, KarofiFilter
 
 MAC_VALID_PATTERN: Final = re.compile(
     r"^(?:"
@@ -164,6 +164,9 @@ def is_karofi_local_name(name: str | None) -> bool:
 
 
 FILTER_STAGE_KEYS: Final[tuple[str, ...]] = tuple(stage.value for stage in KarofiFilter)
+TRANSLATED_FILTER_STAGE_KEYS: Final[frozenset[str]] = frozenset(
+    f"{FILTER_PREFIX}{index}" for index in range(1, MAX_FILTER_STAGES + 1)
+)
 
 
 def filter_index_to_key(index: int) -> str:

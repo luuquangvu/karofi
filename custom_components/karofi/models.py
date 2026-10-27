@@ -14,7 +14,9 @@ class PendingFilterReset:
 
     generation: int
     mismatch_count: int = 0
+    missing_telemetry_polls: int = 0
     last_counted_generation: int | None = None
+    last_counted_missing: bool = False
     lifetime_hours: int | None = None
     baseline_hours: int | None = None
     runtime_reset_applied: bool = False
@@ -45,20 +47,17 @@ class ResolvedGattTargets:
 class KarofiFilterData:
     """Class representing individual filter stage telemetry and status."""
 
-    index: int
-    key: str
     name: str | None = None
     remaining_hours: int | None = None
     lifetime_hours: int | None = None
-    total_hours: int | None = None
     remaining_days: int | None = None
     lifetime_days: int | None = None
     percent: int | None = None
     runtime_remaining_hours: int | None = None
     runtime_total_hours: int | None = None
     runtime_percent: int | None = None
-    reset_date: str | None = None
     telemetry_synced: bool = False
+    last_seen: datetime | None = None
 
 
 @dataclass
@@ -69,6 +68,7 @@ class KarofiData:
     quality: WaterQuality | str
     connected: bool
     last_seen: datetime | None
+    filters_last_seen: datetime | None
     filter_reset_dates: dict[str, str]
     filters: dict[str, KarofiFilterData] = field(default_factory=dict)
     errors: list[int] = field(default_factory=list)

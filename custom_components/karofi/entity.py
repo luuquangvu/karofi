@@ -2,8 +2,7 @@
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_MAC, CONF_NAME
-from homeassistant.core import callback
-from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
 from homeassistant.helpers.update_coordinator import BaseCoordinatorEntity
 
 from .const import DEFAULT_MANUFACTURER, DEFAULT_MODEL, DEFAULT_NAME, DOMAIN
@@ -26,19 +25,18 @@ class KarofiBaseEntity(BaseCoordinatorEntity[KarofiDataCoordinator]):
         super().__init__(coordinator)
         self._entry = entry
         self._mac: str = normalize_mac(str(entry.data[CONF_MAC]), uppercase=False)
+        # Home Assistant only normalizes CONNECTION_NETWORK_MAC in the device
+        # registry. Bluetooth connections must use the scanner address format,
+        # which is uppercase for BLE MAC addresses.
+        self._bluetooth_address: str = normalize_mac(str(entry.data[CONF_MAC]), uppercase=True)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._mac)},
             name=entry.data.get(CONF_NAME, DEFAULT_NAME),
             manufacturer=DEFAULT_MANUFACTURER,
             model=DEFAULT_MODEL,
-            connections={(CONNECTION_NETWORK_MAC, self._mac)},
+            connections={(CONNECTION_BLUETOOTH, self._bluetooth_address)},
         )
         self._attr_available = coordinator.last_update_success
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        super()._handle_coordinator_update()
 
     async def async_update(self) -> None:
         """Update the entity via the data coordinator.

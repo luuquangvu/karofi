@@ -8,7 +8,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN, KarofiFilter, KarofiIcon
 from .coordinator import KarofiDataCoordinator
 from .entity import KarofiBaseEntity
-from .util import FILTER_STAGE_KEYS, filter_key_to_index
+from .util import TRANSLATED_FILTER_STAGE_KEYS, filter_key_to_index
 
 
 async def async_setup_entry(
@@ -76,13 +76,13 @@ class KarofiResetFilterButton(KarofiBaseEntity, ButtonEntity):
         )
         if custom_name := self.coordinator.get_filter_name(self.filter_key):
             self._attr_name = f"Reset {custom_name}"
-        elif self.filter_key in FILTER_STAGE_KEYS:
+        elif self.filter_key in TRANSLATED_FILTER_STAGE_KEYS:
             self._attr_translation_key = f"reset_{self.filter_key}"
         else:
             idx = filter_key_to_index(self.filter_key)
             self._attr_name = f"Reset filter {idx + 1}"
         self._attr_unique_id = f"{self._mac}_btn_reset_{self.filter_key}"
-        self._attr_available = True
+        self._attr_available = coordinator.data.connected
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -90,6 +90,7 @@ class KarofiResetFilterButton(KarofiBaseEntity, ButtonEntity):
         if custom_name := self.coordinator.get_filter_name(self.filter_key):
             self._attr_name = f"Reset {custom_name}"
             self._attr_translation_key = None
+        self._attr_available = self.coordinator.data.connected
         super()._handle_coordinator_update()
 
     async def async_press(self) -> None:

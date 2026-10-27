@@ -97,12 +97,14 @@ async def test_button_async_setup_entry(
 
 
 async def test_button_press_resets_filter(
+    hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_coordinator: KarofiDataCoordinator,
 ) -> None:
     """Test pressing the reset button triggers coordinator.async_reset_filter.
 
     Args:
+        hass: HomeAssistant test instance.
         mock_config_entry: Fixture providing mock config entry.
         mock_coordinator: Fixture providing KarofiDataCoordinator.
     """
@@ -111,14 +113,21 @@ async def test_button_press_resets_filter(
         mock_config_entry,
         KarofiFilter.FILTER_1,
     )
+    _init_test_button(button, "button.karofi_btn_reset_filter_1", hass)
     assert button.unique_id == "aa:bb:cc:11:22:33_btn_reset_filter_1"
     assert button.translation_key == "reset_filter_1"
     assert button.icon == "mdi:restore"
+    assert button.available is False
+
+    # Becomes available when the device is connected.
+    mock_coordinator.data.connected = True
+    button._handle_coordinator_update()
     assert button.available is True
 
-    # Remains available even if coordinator update failed
-    mock_coordinator.last_update_success = False
-    assert button.available is True
+    # Unavailable again when the device disconnects.
+    mock_coordinator.data.connected = False
+    button._handle_coordinator_update()
+    assert button.available is False
 
     with patch.object(mock_coordinator, "async_reset_filter", AsyncMock()) as mock_reset:
         await button.async_press()
@@ -137,9 +146,7 @@ async def test_button_dynamic_name(
         mock_config_entry: Fixture providing mock config entry.
         mock_coordinator: Fixture providing KarofiDataCoordinator.
     """
-    mock_coordinator.data.filters["filter_1"] = KarofiFilterData(
-        index=0, key="filter_1", name="Pre-Carbon Filter"
-    )
+    mock_coordinator.data.filters["filter_1"] = KarofiFilterData(name="Pre-Carbon Filter")
     button = KarofiResetFilterButton(
         mock_coordinator,
         mock_config_entry,
@@ -159,9 +166,7 @@ async def test_button_dynamic_name(
     b2 = KarofiResetFilterButton(mock_coordinator, mock_config_entry, KarofiFilter.FILTER_2)
     _init_test_button(b2, "button.karofi_btn_reset_filter_2", hass)
     assert b2.translation_key == "reset_filter_2"
-    mock_coordinator.data.filters["filter_2"] = KarofiFilterData(
-        index=1, key="filter_2", name="Mineral Filter"
-    )
+    mock_coordinator.data.filters["filter_2"] = KarofiFilterData(name="Mineral Filter")
     b2._handle_coordinator_update()
     assert b2.name == "Reset Mineral Filter"
     assert b2.translation_key is None
@@ -189,5 +194,9 @@ async def test_button_11_12_and_dynamic_fallback(
 
     b13 = KarofiResetFilterButton(mock_coordinator, mock_config_entry, "filter_13")
     _init_test_button(b13, "button.karofi_btn_reset_filter_13", hass)
-    assert b13.name == "Reset filter 13"
-    assert b13.translation_key is None
+    assert b13.translation_key == "reset_filter_13"
+
+    b17 = KarofiResetFilterButton(mock_coordinator, mock_config_entry, "filter_17")
+    _init_test_button(b17, "button.karofi_btn_reset_filter_17", hass)
+    assert b17.name == "Reset filter 17"
+    assert b17.translation_key is None

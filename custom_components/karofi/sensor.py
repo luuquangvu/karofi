@@ -14,7 +14,52 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN, UNIT_PPM, KarofiFilter, KarofiIcon, WaterQuality
 from .coordinator import KarofiDataCoordinator
 from .entity import KarofiBaseEntity
-from .util import FILTER_STAGE_KEYS, filter_key_to_index
+from .util import TRANSLATED_FILTER_STAGE_KEYS, filter_key_to_index
+
+
+def _staleness_attributes(
+    coordinator: KarofiDataCoordinator,
+    filter_key: str,
+) -> dict[str, object]:
+    """Return diagnostic attributes describing filter-data freshness.
+
+    Args:
+        coordinator: Coordinator providing data and last-seen state.
+        filter_key: Filter stage key whose freshness is reported.
+
+    Returns:
+        Attributes with the ISO timestamp of the filter stage's last dynamic
+        telemetry and a stale flag.
+    """
+    fdata = coordinator.data.filters.get(filter_key)
+    last_seen = fdata.last_seen if fdata is not None else None
+    return {
+        "last_seen": last_seen.isoformat() if last_seen else None,
+        "stale": last_seen is not None and coordinator.is_filter_data_stale(filter_key),
+    }
+
+
+def _is_filter_data_available(
+    coordinator: KarofiDataCoordinator,
+    filter_key: str,
+) -> bool:
+    """Return whether filter sensors should be available.
+
+    Args:
+        coordinator: Coordinator providing data and last-seen state.
+        filter_key: Filter stage key being checked.
+
+    Returns:
+        True while the purifier is connected and either the stage has no
+        dynamic telemetry yet (date-based values are valid) or its dynamic
+        telemetry is still fresh.
+    """
+    if not coordinator.data.connected:
+        return False
+    fdata = coordinator.data.filters.get(filter_key)
+    if fdata is None or fdata.last_seen is None:
+        return True
+    return not coordinator.is_filter_data_stale(filter_key)
 
 
 async def async_setup_entry(
@@ -204,16 +249,17 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
         self.max_days = max_days
         if custom_name := self.coordinator.get_filter_name(self.filter_key):
             self._attr_name = f"{custom_name} life"
-        elif self.filter_key in FILTER_STAGE_KEYS:
+        elif self.filter_key in TRANSLATED_FILTER_STAGE_KEYS:
             self._attr_translation_key = f"{self.filter_key}_percent"
         else:
             idx = filter_key_to_index(self.filter_key)
             self._attr_name = f"Filter {idx + 1} life"
         self._attr_unique_id = f"{self._mac}_{self.filter_key}_pct"
+        self._attr_available = _is_filter_data_available(coordinator, self.filter_key)
         self._attr_native_value = self._calculate_percent()
         self._attr_extra_state_attributes = self._calculate_attributes()
 
-    def _calculate_attributes(self) -> dict[str, int | None]:
+    def _calculate_attributes(self) -> dict[str, object]:
         """Return the calendar/runtime components and capacities behind the state.
 
         Returns:
@@ -226,6 +272,7 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
             "runtime_percent": self.coordinator.get_filter_runtime_percent(self.filter_key),
             "capacity_days": self.max_days,
             "capacity_hours": self.coordinator.get_filter_runtime_total_hours(self.filter_key),
+            **_staleness_attributes(self.coordinator, self.filter_key),
         }
 
     def _calculate_percent(self) -> int:
@@ -243,6 +290,7 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
             self._attr_name = f"{custom_name} life"
             self._attr_translation_key = None
         self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
+        self._attr_available = _is_filter_data_available(self.coordinator, self.filter_key)
         self._attr_native_value = self._calculate_percent()
         self._attr_extra_state_attributes = self._calculate_attributes()
         super()._handle_coordinator_update()
@@ -277,22 +325,26 @@ class KarofiFilterDaysRemainingSensor(KarofiBaseEntity, SensorEntity):
         self.max_days = max_days
         if custom_name := self.coordinator.get_filter_name(self.filter_key):
             self._attr_name = f"{custom_name} days remaining"
-        elif self.filter_key in FILTER_STAGE_KEYS:
+        elif self.filter_key in TRANSLATED_FILTER_STAGE_KEYS:
             self._attr_translation_key = f"{self.filter_key}_days"
         else:
             idx = filter_key_to_index(self.filter_key)
             self._attr_name = f"Filter {idx + 1} days remaining"
         self._attr_unique_id = f"{self._mac}_{self.filter_key}_days"
+        self._attr_available = _is_filter_data_available(coordinator, self.filter_key)
         self._attr_native_value = self._calculate_days()
         self._attr_extra_state_attributes = self._calculate_attributes()
 
-    def _calculate_attributes(self) -> dict[str, int]:
+    def _calculate_attributes(self) -> dict[str, object]:
         """Return the rated calendar lifespan behind the remaining days.
 
         Returns:
             Extra state attributes with the calendar capacity.
         """
-        return {"capacity_days": self.max_days}
+        return {
+            "capacity_days": self.max_days,
+            **_staleness_attributes(self.coordinator, self.filter_key),
+        }
 
     def _calculate_days(self) -> int:
         """Calculate remaining days before replacement.
@@ -309,6 +361,7 @@ class KarofiFilterDaysRemainingSensor(KarofiBaseEntity, SensorEntity):
             self._attr_name = f"{custom_name} days remaining"
             self._attr_translation_key = None
         self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
+        self._attr_available = _is_filter_data_available(self.coordinator, self.filter_key)
         self._attr_native_value = self._calculate_days()
         self._attr_extra_state_attributes = self._calculate_attributes()
         super()._handle_coordinator_update()
@@ -343,22 +396,26 @@ class KarofiFilterUsageHoursRemainingSensor(KarofiBaseEntity, SensorEntity):
         self.max_days = max_days
         if custom_name := self.coordinator.get_filter_name(self.filter_key):
             self._attr_name = f"{custom_name} usage hours remaining"
-        elif self.filter_key in FILTER_STAGE_KEYS:
+        elif self.filter_key in TRANSLATED_FILTER_STAGE_KEYS:
             self._attr_translation_key = f"{self.filter_key}_hours"
         else:
             idx = filter_key_to_index(self.filter_key)
             self._attr_name = f"Filter {idx + 1} usage hours remaining"
         self._attr_unique_id = f"{self._mac}_{self.filter_key}_hours"
+        self._attr_available = _is_filter_data_available(coordinator, self.filter_key)
         self._attr_native_value = self._calculate_hours()
         self._attr_extra_state_attributes = self._calculate_attributes()
 
-    def _calculate_attributes(self) -> dict[str, int | None]:
+    def _calculate_attributes(self) -> dict[str, object]:
         """Return the rated runtime capacity behind the remaining hours.
 
         Returns:
             Extra state attributes with the runtime capacity.
         """
-        return {"capacity_hours": self.coordinator.get_filter_runtime_total_hours(self.filter_key)}
+        return {
+            "capacity_hours": self.coordinator.get_filter_runtime_total_hours(self.filter_key),
+            **_staleness_attributes(self.coordinator, self.filter_key),
+        }
 
     def _calculate_hours(self) -> int | None:
         """Return the remaining runtime hours reported by the device.
@@ -375,6 +432,7 @@ class KarofiFilterUsageHoursRemainingSensor(KarofiBaseEntity, SensorEntity):
             self._attr_name = f"{custom_name} usage hours remaining"
             self._attr_translation_key = None
         self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
+        self._attr_available = _is_filter_data_available(self.coordinator, self.filter_key)
         self._attr_native_value = self._calculate_hours()
         self._attr_extra_state_attributes = self._calculate_attributes()
         super()._handle_coordinator_update()

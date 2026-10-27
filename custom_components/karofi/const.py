@@ -117,11 +117,6 @@ TELEMETRY_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
     MakiposPayloadKey.NAMES,
 )
 
-TELEMETRY_FILTER_MARKERS: Final[tuple[bytes, ...]] = (
-    MakiposPayloadKey.IRO_RTR.encode(),
-    MakiposPayloadKey.IRO_LTIME.encode(),
-)
-
 # Polling and command payloads (Makipos / Karofi protocol)
 REQUEST_READ_DATA_COMMAND: Final = (
     f'{{"{MakiposPayloadKey.EVENT_TYPE}":"{MakiposEventType.NP}"}}'.encode()
@@ -266,6 +261,12 @@ BLE_TIMEOUT_SECONDS: Final = 25
 BLE_COMMAND_CHUNK_SIZE: Final = 19
 SUPPLEMENTAL_TELEMETRY_TIMEOUT_SECONDS: Final = 10
 DIRECT_TDS_RETURN_RESERVE_SECONDS: Final = 2
+NOTIFICATION_WAIT_SECONDS: Final = 3.5
+NOTIFICATION_TELEMETRY_GRACE_SECONDS: Final = 0.5
+MAX_TELEMETRY_CACHE_ENTRIES: Final = 8
+FILTER_DATA_STALE_AFTER_SECONDS: Final = 3600
+WARNING_LOG_INTERVAL_SECONDS: Final = 3600
+FULL_TELEMETRY_SCAN_INTERVAL: Final = 60
 
 
 # Config flow options
@@ -274,6 +275,7 @@ MANUAL_MAC_LABEL: Final = "Enter MAC address manually..."
 
 # Filter stage prefix and identifiers
 FILTER_PREFIX: Final = "filter_"
+MAX_FILTER_STAGES: Final = 16
 
 
 class KarofiFilter(StrEnum):
@@ -291,6 +293,10 @@ class KarofiFilter(StrEnum):
     FILTER_10 = "filter_10"
     FILTER_11 = "filter_11"
     FILTER_12 = "filter_12"
+    FILTER_13 = "filter_13"
+    FILTER_14 = "filter_14"
+    FILTER_15 = "filter_15"
+    FILTER_16 = "filter_16"
 
 
 # Default filter lifetime configurations (in days) when not provided by telemetry
@@ -307,4 +313,8 @@ DEFAULT_FILTER_LIFETIME_DAYS: Final[dict[str, int]] = {
     KarofiFilter.FILTER_10: 365,
     KarofiFilter.FILTER_11: 365,
     KarofiFilter.FILTER_12: 365,
+    KarofiFilter.FILTER_13: 365,
+    KarofiFilter.FILTER_14: 365,
+    KarofiFilter.FILTER_15: 365,
+    KarofiFilter.FILTER_16: 365,
 }

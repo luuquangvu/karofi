@@ -147,6 +147,11 @@ The days remaining sensor stays calendar-based. The remaining sensors expose the
 > [!NOTE]
 > The life percentage now considers both calendar life and runtime usage. This is a behavior change for heavy users, who may see the percentage drop faster than before. Some models do not report runtime telemetry; the life sensor then falls back to calendar life without errors.
 
+<!-- MD028/no-blanks-blockquote: Blank line inside blockquote -->
+
+> [!NOTE]
+> Filter sensors expose `last_seen` and `stale` attributes. `last_seen` is the timestamp of the filter stage's last dynamic telemetry (remaining calendar or runtime hours). Until a stage has reported dynamic telemetry, connected sensors remain available using date-based values. Once a stage has reported dynamic telemetry, if no new dynamic telemetry arrives for more than one hour, its sensors become unavailable instead of showing indefinitely stale values. Reset buttons are unavailable while the purifier is disconnected.
+
 ### When Replacing a Filter Cartridge
 
 1. Navigate to the Karofi device page in **Settings** > **Devices & Services** > **Karofi**.

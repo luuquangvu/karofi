@@ -29,6 +29,10 @@ from custom_components.karofi.const import (
     DEFAULT_FILTER_LIFETIME_DAYS,
     DEFAULT_NAME,
     DEFAULT_SCAN_INTERVAL,
+    FULL_TELEMETRY_SCAN_INTERVAL,
+    MAX_FILTER_STAGES,
+    NOTIFICATION_TELEMETRY_GRACE_SECONDS,
+    NOTIFICATION_WAIT_SECONDS,
     NOTIFY_UUID_PREFIX,
     PENDING_RESET_STORAGE_SUFFIX,
     REQUEST_READ_DATA_COMMAND,
@@ -44,8 +48,10 @@ from custom_components.karofi.coordinator import (
     MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS,
     RESET_CONFIRMATION_POLLS,
     KarofiDataCoordinator,
+    _NotificationWaitState,
 )
 from custom_components.karofi.models import (
+    KarofiData,
     KarofiFilterData,
     PendingFilterReset,
     ResolvedGattTargets,
@@ -1830,16 +1836,16 @@ async def test_coordinator_characteristic_scan_timeout_returns_partial_telemetry
 
     async def _read_characteristic(
         _client: object, characteristic: BleakGATTCharacteristic
-    ) -> bytearray:
+    ) -> tuple[bytearray, bool]:
         """Return filter data once, then wait long enough to trigger scan timeout."""
         if characteristic == first_char:
-            return filter_payload
+            return filter_payload, True
         await asyncio.sleep(1)
-        return bytearray()
+        return bytearray(), True
 
     with patch.object(
         coordinator,
-        "_read_characteristic_safe",
+        "_read_characteristic_for_scan",
         side_effect=_read_characteristic,
     ):
         telemetry, _ = await coordinator._scan_candidate_data_chars(
@@ -2383,13 +2389,40 @@ async def test_coordinator_id_notify_read_logs_assembled_unknown_fields(
     client.read_gatt_char.return_value = b'42}{"pc":"iro_tds","d":11}'
     received_packets = [bytearray(b'{"future_sensor":')]
     notify_future: asyncio.Future[bytearray] = asyncio.get_running_loop().create_future()
+    wait_state = _NotificationWaitState(notify_future=notify_future)
 
     await coordinator._async_read_char_on_id_notify(
-        client, "char_notify", received_packets, notify_future
+        client, "char_notify", received_packets, notify_future, wait_state
     )
 
     assert notify_future.done()
+    assert notify_future.result() == bytearray(b'42}{"pc":"iro_tds","d":11}')
     assert "future_sensor=42" in caplog.text
+
+
+async def test_coordinator_id_notify_read_preserves_buffered_telemetry(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Include buffered filter telemetry when an ID read completes with TDS.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    telemetry_packet = bytearray(b'{"et":"NP","iro_rtr":[1200],"iro_lTime":[4320]}')
+    tds_packet = bytearray(b'{"pc":"iro_tds","d":11}')
+    client = AsyncMock()
+    client.read_gatt_char.return_value = tds_packet
+    notify_future: asyncio.Future[bytearray] = asyncio.get_running_loop().create_future()
+    wait_state = _NotificationWaitState(notify_future=notify_future, telemetry=telemetry_packet)
+
+    await coordinator._async_read_char_on_id_notify(
+        client, "char_notify", [], notify_future, wait_state
+    )
+
+    assert notify_future.done()
+    result = notify_future.result()
+    assert coordinator._has_filter_telemetry_payload(result)
+    assert coordinator._parse_tds_reading(result) == 11
 
 
 async def test_coordinator_notification_debug_is_rate_limited(
@@ -2405,6 +2438,7 @@ async def test_coordinator_notification_debug_is_rate_limited(
     caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
     client = MagicMock()
     notify_future: asyncio.Future[bytearray] = asyncio.get_running_loop().create_future()
+    wait_state = _NotificationWaitState(notify_future=notify_future)
     received_packets: list[bytearray] = []
     bg_tasks: set[asyncio.Task[None]] = set()
     packet = bytearray(b'{"et":"NP"}')
@@ -2417,6 +2451,7 @@ async def test_coordinator_notification_debug_is_rate_limited(
         received_packets,
         notify_future,
         bg_tasks,
+        wait_state,
     )
     coordinator._handle_notify_packet(
         client,
@@ -2426,6 +2461,7 @@ async def test_coordinator_notification_debug_is_rate_limited(
         received_packets,
         notify_future,
         bg_tasks,
+        wait_state,
     )
 
     assert caplog.text.count("Received BLE notification") == 1
@@ -2652,20 +2688,8 @@ def test_coordinator_resolve_initial_dates_legacy_keys_filtered(
         "filter_mineral": "2026-01-01T00:00:00",
         "unsupported_key": "2026-01-01T00:00:00",
     }
-    coordinator.hass.config_entries.async_update_entry(
-        coordinator.entry,
-        options={
-            "initial_filter_reset_dates": {
-                "filter_ro": "2026-01-01T00:00:00",
-                "filter_2": "2026-02-01T00:00:00",
-            }
-        },
-    )
     resolved, needs_save = coordinator._resolve_initial_dates(stored)
-    assert resolved == {
-        "filter_1": "2026-01-01T00:00:00",
-        "filter_2": "2026-02-01T00:00:00",
-    }
+    assert resolved == {"filter_1": "2026-01-01T00:00:00"}
     assert "filter_ro" not in resolved
     assert "filter_mineral" not in resolved
     assert "unsupported_key" not in resolved
@@ -3105,8 +3129,6 @@ def test_coordinator_effective_life_uses_lower_percentage(
         expected_percent: Expected effective percentage.
     """
     coordinator.data.filters["filter_1"] = KarofiFilterData(
-        index=0,
-        key="filter_1",
         lifetime_days=100,
         percent=calendar_percent,
         telemetry_synced=True,
@@ -3127,8 +3149,6 @@ def test_coordinator_effective_life_falls_back_to_calendar(
         coordinator: Fixture providing KarofiDataCoordinator.
     """
     coordinator.data.filters["filter_1"] = KarofiFilterData(
-        index=0,
-        key="filter_1",
         lifetime_days=100,
         percent=80,
         telemetry_synced=True,
@@ -3147,8 +3167,6 @@ def test_coordinator_effective_life_uses_calendar_during_pending_reset(
         coordinator: Fixture providing KarofiDataCoordinator.
     """
     coordinator.data.filters["filter_1"] = KarofiFilterData(
-        index=0,
-        key="filter_1",
         lifetime_days=100,
         percent=80,
         telemetry_synced=True,
@@ -3172,8 +3190,6 @@ def test_coordinator_runtime_getters_handle_unknown_and_out_of_range(
     assert coordinator.get_filter_runtime_percent("filter_99") is None
 
     coordinator.data.filters["filter_1"] = KarofiFilterData(
-        index=0,
-        key="filter_1",
         runtime_remaining_hours=1300,
         runtime_total_hours=1200,
         runtime_percent=150,
@@ -3193,8 +3209,6 @@ def test_coordinator_update_filter_runtime_ignores_stale_generation(
         coordinator: Fixture providing KarofiDataCoordinator.
     """
     fdata = KarofiFilterData(
-        index=0,
-        key="filter_1",
         runtime_remaining_hours=1200,
         runtime_total_hours=1200,
         runtime_percent=100,
@@ -3358,45 +3372,831 @@ async def test_coordinator_try_active_polling_accepts_filter_only_telemetry(
         assert raw == filter_only_payload
 
 
-async def test_coordinator_handle_notify_packet_resolves_only_on_tds(
+async def test_coordinator_handle_notify_packet_grace_window(
     coordinator: KarofiDataCoordinator,
 ) -> None:
-    """Test _handle_notify_packet does not resolve future on filter-only telemetry but does on TDS.
+    """Keep listening briefly for TDS after filter telemetry, then fall back.
 
     Args:
         coordinator: Fixture providing KarofiDataCoordinator.
     """
     client = MagicMock()
     loop = asyncio.get_running_loop()
-    notify_future: asyncio.Future[bytearray] = loop.create_future()
-    received_packets: list[bytearray] = []
     bg_tasks: set[asyncio.Task[None]] = set()
 
-    # 1. Filter-only packet does not resolve future
+    # 1. Filter-only telemetry opens a grace window instead of resolving.
     filter_packet = bytearray(b'{"et":"NP","iro_rtr":[1200],"iro_lTime":[4320]}')
+    filter_future: asyncio.Future[bytearray] = loop.create_future()
+    filter_state = _NotificationWaitState(notify_future=filter_future)
+    filter_packets: list[bytearray] = []
     coordinator._handle_notify_packet(
         client,
         filter_packet,
         "char_notify",
         "char_read",
-        received_packets,
-        notify_future,
+        filter_packets,
+        filter_future,
         bg_tasks,
+        filter_state,
     )
-    assert not notify_future.done()
-    assert len(received_packets) == 1
+    assert not filter_future.done()
+    assert filter_state.telemetry == filter_packet
+    assert filter_state.timer is not None
 
-    # 2. Packet with TDS resolves future early
+    # 2. A TDS frame inside the grace window wins and cancels the timer.
     tds_packet = bytearray(b'{"tds":45}')
     coordinator._handle_notify_packet(
         client,
         tds_packet,
         "char_notify",
         "char_read",
+        filter_packets,
+        filter_future,
+        bg_tasks,
+        filter_state,
+    )
+    assert filter_future.done()
+    assert filter_future.result() == filter_packet + tds_packet
+    assert filter_state.timer is None
+
+    # 3. With no TDS, the grace timer resolves with the filter telemetry.
+    fallback_future: asyncio.Future[bytearray] = loop.create_future()
+    fallback_state = _NotificationWaitState(notify_future=fallback_future)
+    fallback_packets: list[bytearray] = []
+    coordinator._handle_notify_packet(
+        client,
+        filter_packet,
+        "char_notify",
+        "char_read",
+        fallback_packets,
+        fallback_future,
+        bg_tasks,
+        fallback_state,
+    )
+    assert not fallback_future.done()
+    await asyncio.sleep(NOTIFICATION_TELEMETRY_GRACE_SECONDS + 0.05)
+    assert fallback_future.done()
+    assert fallback_future.result() == filter_packet
+    assert fallback_state.timer is None
+
+
+async def test_coordinator_reset_without_calendar_telemetry_abandons_and_ages(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Abandon a reset that never receives calendar telemetry and age the values.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_rtr":[1104],"iro_rtt":[1200]}',
+        telemetry_generation=1,
+    )
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    for generation in range(2, 2 + RESET_CONFIRMATION_POLLS):
+        coordinator._process_tds_payload(
+            b'{"iro_rtr":[1104],"iro_rtt":[1200]}',
+            telemetry_generation=generation,
+        )
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert "filter_1" not in coordinator._pending_filter_resets
+    assert fdata.runtime_remaining_hours == 1104
+    assert fdata.runtime_percent == 92
+    assert "did not report calendar telemetry" in caplog.text
+
+    future = dt_util.utcnow() + timedelta(days=30)
+    with patch("custom_components.karofi.coordinator.dt_util.utcnow", return_value=future):
+        assert coordinator.get_filter_remaining_days("filter_1") == 150
+        assert coordinator.get_filter_percent("filter_1") == 83
+
+
+async def test_coordinator_pending_reset_value_ages_from_reset_date(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Age the optimistic pending value from the stored reset date.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_rtr":[1104],"iro_rtt":[1200]}',
+        telemetry_generation=1,
+    )
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    future = dt_util.utcnow() + timedelta(days=30)
+    with patch("custom_components.karofi.coordinator.dt_util.utcnow", return_value=future):
+        assert "filter_1" in coordinator._pending_filter_resets
+        assert coordinator.get_filter_remaining_days("filter_1") == 150
+
+
+async def test_coordinator_ltime_only_reset_recomputes_percent(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Recompute percent from lifetime days when only iro_lTime is reported.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"iro_lTime":[4000]}', telemetry_generation=1)
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    for generation in range(2, 6):
+        coordinator._process_tds_payload(
+            b'{"iro_lTime":[2150]}',
+            telemetry_generation=generation,
+        )
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert "filter_1" not in coordinator._pending_filter_resets
+    assert fdata.remaining_hours == 2150
+    assert fdata.lifetime_hours is None
+    assert fdata.lifetime_days == 180
+    assert fdata.remaining_days == 90
+    assert fdata.percent == 50
+    assert coordinator.get_filter_percent("filter_1") == 50
+
+
+def test_coordinator_comma_list_preserves_empty_positions(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Preserve positional filter data when a comma list contains empty slots.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    assert coordinator._coerce_int_list("8640,,4320", preserve_none=True) == [
+        8640,
+        None,
+        4320,
+    ]
+    assert coordinator._coerce_int_list("8640,,4320") == [8640, 4320]
+
+    coordinator._process_tds_payload(b'{"iro_lTime":"8640,,4320","iro_hsd":"8640,8640,8640"}')
+    assert coordinator.data.filters["filter_1"].remaining_hours == 8640
+    assert coordinator.data.filters["filter_2"].remaining_hours is None
+    assert coordinator.data.filters["filter_3"].remaining_hours == 4320
+
+
+def test_coordinator_caps_unknown_filter_stage_counts(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cap dynamic filter discovery at the supported maximum.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.WARNING, logger="custom_components.karofi.coordinator")
+    values = ",".join("4320" for _ in range(200))
+    coordinator._process_tds_payload(f'{{"iro_lTime":"{values}"}}'.encode())
+
+    assert len(coordinator.get_known_filter_keys()) == MAX_FILTER_STAGES
+    assert caplog.text.count("beyond the supported maximum") == 1
+
+    # Stored data beyond the cap must not create additional entities.
+    coordinator.data.filters["filter_99"] = KarofiFilterData()
+    coordinator.data.filter_reset_dates["filter_100"] = "2026-01-01T00:00:00+00:00"
+    assert len(coordinator.get_known_filter_keys()) == MAX_FILTER_STAGES
+
+
+async def test_coordinator_serializes_poll_and_reset_sessions(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Ensure a reset waits for an in-flight poll to finish.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    poll_started = asyncio.Event()
+    release_poll = asyncio.Event()
+    reset_started = asyncio.Event()
+    order: list[str] = []
+
+    async def _fake_poll() -> KarofiData:
+        """Simulate a slow poll holding the BLE session."""
+        poll_started.set()
+        await release_poll.wait()
+        order.append("poll")
+        return coordinator.data
+
+    async def _fake_reset(_filter_index: int) -> bool:
+        """Simulate a reset once it acquires the BLE session."""
+        reset_started.set()
+        order.append("reset")
+        return True
+
+    with (
+        patch.object(coordinator, "_async_update_data_locked", new=_fake_poll),
+        patch.object(coordinator, "_async_send_reset_command_locked", new=_fake_reset),
+    ):
+        poll_task = asyncio.create_task(coordinator._async_update_data())
+        await poll_started.wait()
+        reset_task = asyncio.create_task(coordinator._async_send_reset_command(0))
+        await asyncio.sleep(0)
+        assert not reset_started.is_set()
+
+        release_poll.set()
+        await poll_task
+        await reset_task
+
+    assert order == ["poll", "reset"]
+
+
+def test_coordinator_invalid_payload_warning_is_rate_limited(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Emit only one warning across repeated identical invalid payloads.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.WARNING, logger="custom_components.karofi.coordinator")
+    for _ in range(5):
+        coordinator._process_tds_payload(b"\x01\x02\x03")
+
+    warnings = [
+        record
+        for record in caplog.records
+        if "Received invalid non-JSON payload" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+
+
+async def test_coordinator_scan_uses_cached_telemetry_characteristics(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Read only cached telemetry characteristics on later scans.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    tds_char = _mock_characteristic("0000ac03-0000-1000-8000-00805f9b34fb", ["read"])
+    ltime_char = _mock_characteristic("0000ac04-0000-1000-8000-00805f9b34fb", ["read"])
+    hsd_char = _mock_characteristic("0000ac05-0000-1000-8000-00805f9b34fb", ["read"])
+    status_char = _mock_characteristic("0000ac06-0000-1000-8000-00805f9b34fb", ["read"])
+    mock_service = MagicMock()
+    mock_service.characteristics = [tds_char, ltime_char, hsd_char, status_char]
+    mock_services = MagicMock(spec=BleakGATTServiceCollection)
+    mock_services.get_service.return_value = mock_service
+    mock_client = AsyncMock()
+    mock_client.services = mock_services
+
+    read_calls: list[str] = []
+
+    async def _read(
+        _client: object, characteristic: BleakGATTCharacteristic
+    ) -> tuple[bytearray, bool]:
+        """Return characteristic-specific payloads and record reads."""
+        read_calls.append(characteristic.uuid)
+        if characteristic is tds_char:
+            return bytearray(b'{"pc":"iro_tds","d":42}'), True
+        if characteristic is ltime_char:
+            return bytearray(b'{"pc":"iro_lTime","d":[2160,4320]}'), True
+        if characteristic is hsd_char:
+            return bytearray(b'{"pc":"iro_hsd","d":[4320,8640]}'), True
+        return bytearray(b"status"), True
+
+    with patch.object(coordinator, "_read_characteristic_for_scan", side_effect=_read):
+        first, _ = await coordinator._scan_candidate_data_chars(mock_client, None, bytearray())
+        first_calls = list(read_calls)
+        read_calls.clear()
+        second, _ = await coordinator._scan_candidate_data_chars(mock_client, None, bytearray())
+        second_calls = list(read_calls)
+        read_calls.clear()
+        coordinator._telemetry_char_uuids = ["0000dead-0000-1000-8000-00805f9b34fb"]
+        third, _ = await coordinator._scan_candidate_data_chars(mock_client, None, bytearray())
+        coordinator._polls_since_full_scan = FULL_TELEMETRY_SCAN_INTERVAL
+        read_calls.clear()
+        fourth, _ = await coordinator._scan_candidate_data_chars(mock_client, None, bytearray())
+
+    assert first is not None
+    assert second is not None
+    assert third is not None
+    assert fourth is not None
+    assert len(first_calls) == 4
+    assert set(second_calls) == {tds_char.uuid, ltime_char.uuid, hsd_char.uuid}
+    assert status_char.uuid not in second_calls
+    assert set(read_calls) == {
+        tds_char.uuid,
+        ltime_char.uuid,
+        hsd_char.uuid,
+        status_char.uuid,
+    }
+    assert coordinator._polls_since_full_scan == 0
+
+
+async def test_coordinator_scan_retries_characteristic_after_failed_read(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Do not seed a partial cache when a characteristic read fails.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    tds_char = _mock_characteristic("0000ac03-0000-1000-8000-00805f9b34fb", ["read"])
+    ltime_char = _mock_characteristic("0000ac04-0000-1000-8000-00805f9b34fb", ["read"])
+    hsd_char = _mock_characteristic("0000ac05-0000-1000-8000-00805f9b34fb", ["read"])
+    mock_service = MagicMock()
+    mock_service.characteristics = [tds_char, ltime_char, hsd_char]
+    mock_services = MagicMock(spec=BleakGATTServiceCollection)
+    mock_services.get_service.return_value = mock_service
+    mock_client = AsyncMock()
+    mock_client.services = mock_services
+
+    fail_ltime = True
+    read_calls: list[str] = []
+
+    async def _read(
+        _client: object, characteristic: BleakGATTCharacteristic
+    ) -> tuple[bytearray, bool]:
+        """Return characteristic-specific payloads and record reads."""
+        read_calls.append(characteristic.uuid)
+        if characteristic is tds_char:
+            return bytearray(b'{"pc":"iro_tds","d":42}'), True
+        if characteristic is ltime_char:
+            if fail_ltime:
+                return bytearray(), False
+            return bytearray(b'{"pc":"iro_lTime","d":[2160]}'), True
+        return bytearray(b'{"pc":"iro_hsd","d":[4320]}'), True
+
+    with patch.object(coordinator, "_read_characteristic_for_scan", side_effect=_read):
+        first, _ = await coordinator._scan_candidate_data_chars(mock_client, None, bytearray())
+        assert first is not None
+        assert coordinator._telemetry_char_uuids == []
+
+        fail_ltime = False
+        read_calls.clear()
+        second, _ = await coordinator._scan_candidate_data_chars(mock_client, None, bytearray())
+        assert second is not None
+        assert ltime_char.uuid in read_calls
+        assert set(coordinator._telemetry_char_uuids) >= {ltime_char.uuid, hsd_char.uuid}
+
+        # A failure in a cached characteristic must invalidate the cache so the
+        # next poll performs a true full scan.
+        fail_ltime = True
+        read_calls.clear()
+        await coordinator._scan_candidate_data_chars(mock_client, None, bytearray())
+        assert ltime_char.uuid in read_calls
+        assert coordinator._telemetry_char_uuids == []
+
+        fail_ltime = False
+        read_calls.clear()
+        await coordinator._scan_candidate_data_chars(mock_client, None, bytearray())
+        assert ltime_char.uuid in read_calls
+        assert set(coordinator._telemetry_char_uuids) >= {ltime_char.uuid, hsd_char.uuid}
+
+
+async def test_coordinator_reset_command_device_unreachable(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Return False and avoid BLE work when the reset device is unreachable.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    caplog.set_level(logging.DEBUG, logger="custom_components.karofi.coordinator")
+    with patch.object(coordinator, "_get_ble_device", return_value=None):
+        assert await coordinator._async_send_reset_command(0) is False
+    assert "device not reachable" in caplog.text
+
+
+async def test_coordinator_reset_command_transport_error(
+    coordinator: KarofiDataCoordinator,
+    mock_ble_device: BLEDevice,
+) -> None:
+    """Return False when the reset connection raises a transport error.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        mock_ble_device: Fixture providing mock BLEDevice.
+    """
+    with (
+        patch.object(coordinator, "_get_ble_device", return_value=mock_ble_device),
+        patch(
+            "custom_components.karofi.coordinator.establish_connection",
+            AsyncMock(side_effect=BleakError("connection failed")),
+        ),
+    ):
+        assert await coordinator._async_send_reset_command(0) is False
+
+
+async def test_coordinator_missing_frame_does_not_count_when_ltime_arrives_same_poll(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Do not count a missing-telemetry frame when ltime arrives later in the poll.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_rtr":[1104],"iro_rtt":[1200]}',
+        telemetry_generation=1,
+    )
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    coordinator._process_tds_payload(
+        b'{"names":["Sediment"]}\n{"iro_lTime":[3600],"iro_hsd":[4320]}',
+        telemetry_generation=2,
+    )
+
+    pending = coordinator._pending_filter_resets["filter_1"]
+    assert pending.missing_telemetry_polls == 0
+    assert pending.mismatch_count == 1
+    assert pending.last_counted_missing is False
+
+
+async def test_coordinator_missing_threshold_defers_to_later_ltime_same_poll(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Do not abandon on a names frame when ltime follows in the same generation.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_rtr":[1104],"iro_rtt":[1200]}',
+        telemetry_generation=1,
+    )
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    caplog.set_level(logging.WARNING, logger="custom_components.karofi.coordinator")
+    for generation in (2, 3):
+        coordinator._process_tds_payload(
+            b'{"names":["Sediment"]}',
+            telemetry_generation=generation,
+        )
+    assert coordinator._pending_filter_resets["filter_1"].missing_telemetry_polls == 2
+
+    coordinator._process_tds_payload(
+        b'{"names":["Sediment"]}\n{"iro_lTime":[3600],"iro_hsd":[4320]}',
+        telemetry_generation=4,
+    )
+
+    pending = coordinator._pending_filter_resets["filter_1"]
+    assert pending.missing_telemetry_polls == 0
+    assert pending.mismatch_count == 1
+    assert pending.last_counted_missing is False
+    assert "did not report calendar telemetry" not in caplog.text
+
+
+async def test_coordinator_missing_threshold_applies_later_runtime_same_poll(
+    coordinator: KarofiDataCoordinator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Apply later runtime telemetry and abandon after the generation completes.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        caplog: Fixture capturing log messages.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_rtr":[1104],"iro_rtt":[1200]}',
+        telemetry_generation=1,
+    )
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    caplog.set_level(logging.WARNING, logger="custom_components.karofi.coordinator")
+    for generation in (2, 3):
+        coordinator._process_tds_payload(
+            b'{"names":["Sediment"]}',
+            telemetry_generation=generation,
+        )
+
+    coordinator._process_tds_payload(
+        b'{"names":["Sediment"]}\n{"iro_rtr":[1104],"iro_rtt":[1200]}',
+        telemetry_generation=4,
+    )
+
+    assert "filter_1" not in coordinator._pending_filter_resets
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.runtime_remaining_hours == 1104
+    assert fdata.runtime_percent == 92
+    assert "did not report calendar telemetry" in caplog.text
+
+
+async def test_coordinator_missing_threshold_preserves_later_confirmation_same_poll(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Confirm a reset when ltime arrives after the missing threshold in one generation.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_rtr":[1104],"iro_rtt":[1200]}',
+        telemetry_generation=1,
+    )
+    with patch.object(coordinator, "_async_send_reset_command", AsyncMock(return_value=True)):
+        await coordinator.async_reset_filter("filter_1")
+
+    for generation in (2, 3):
+        coordinator._process_tds_payload(
+            b'{"names":["Sediment"]}',
+            telemetry_generation=generation,
+        )
+
+    coordinator._process_tds_payload(
+        b'{"names":["Sediment"]}\n{"iro_lTime":[4320],"iro_hsd":[4320]}',
+        telemetry_generation=4,
+    )
+
+    assert "filter_1" not in coordinator._pending_filter_resets
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.remaining_hours == 4320
+    assert fdata.telemetry_synced is True
+
+
+async def test_coordinator_subscribe_filter_only_uses_grace_window(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Return filter telemetry after the grace window without waiting for TDS.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    filter_packet = bytearray(b'{"et":"NP","iro_rtr":[1200],"iro_lTime":[4320]}')
+    client = AsyncMock()
+    client.stop_notify = AsyncMock()
+
+    async def _start_notify(_char: object, callback: Any) -> None:
+        """Deliver one filter-only notification."""
+        callback(_char, filter_packet)
+
+    client.start_notify.side_effect = _start_notify
+
+    with patch.object(coordinator, "_send_read_request", AsyncMock()):
+        started = time.monotonic()
+        result = await coordinator._subscribe_tds_notification(client, "char_notify")
+        elapsed = time.monotonic() - started
+
+    assert result == filter_packet
+    assert elapsed < NOTIFICATION_WAIT_SECONDS
+    client.stop_notify.assert_awaited_once()
+
+
+async def test_coordinator_grace_window_waits_for_tds_when_disabled(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Wait for TDS without starting the grace timer when early return is disabled.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    loop = asyncio.get_running_loop()
+    notify_future: asyncio.Future[bytearray] = loop.create_future()
+    wait_state = _NotificationWaitState(
+        notify_future=notify_future,
+        allow_early_telemetry_return=False,
+    )
+    filter_packet = bytearray(b'{"et":"NP","iro_rtr":[1200],"iro_lTime":[4320]}')
+    tds_packet = bytearray(b'{"pc":"iro_tds","d":42}')
+    received_packets: list[bytearray] = []
+    bg_tasks: set[asyncio.Task[None]] = set()
+
+    coordinator._handle_notify_packet(
+        MagicMock(),
+        filter_packet,
+        "char_notify",
+        "char_read",
         received_packets,
         notify_future,
         bg_tasks,
+        wait_state,
     )
-    assert notify_future.done()
-    assert notify_future.result() == filter_packet + tds_packet
-    assert len(received_packets) == 2
+    assert notify_future.done() is False
+    assert wait_state.timer is None
+    assert wait_state.telemetry == filter_packet
+
+    coordinator._handle_notify_packet(
+        MagicMock(),
+        tds_packet,
+        "char_notify",
+        "char_read",
+        received_packets,
+        notify_future,
+        bg_tasks,
+        wait_state,
+    )
+    assert notify_future.done() is True
+    result = notify_future.result()
+    assert coordinator._parse_tds_reading(result) == 42
+    assert coordinator._has_filter_telemetry_payload(result)
+
+
+async def test_coordinator_notification_only_tds_survives_grace_window(
+    coordinator: KarofiDataCoordinator,
+    hass: HomeAssistant,
+) -> None:
+    """Capture a late TDS notification when no readable TDS path exists.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        hass: HomeAssistant test instance.
+    """
+    notify_char = MagicMock(spec=BleakGATTCharacteristic)
+    notify_char.uuid = KarofiCharacteristic.NOTIFY
+    notify_char.properties = ["notify"]
+    filter_packet = bytearray(b'{"et":"NP","iro_rtr":[1200],"iro_lTime":[4320]}')
+    tds_packet = bytearray(b'{"pc":"iro_tds","d":42}')
+
+    mock_service = MagicMock()
+    mock_service.characteristics = [notify_char]
+    mock_services = MagicMock(spec=BleakGATTServiceCollection)
+    mock_services.get_service.return_value = mock_service
+
+    client = AsyncMock()
+    client.services = mock_services
+    client.stop_notify = AsyncMock()
+    client.write_gatt_char = AsyncMock()
+
+    async def _start_notify(_char: object, callback: Any) -> None:
+        """Deliver filter telemetry first and TDS after the grace window."""
+        hass.loop.call_soon(callback, notify_char, filter_packet)
+        hass.loop.call_later(
+            NOTIFICATION_TELEMETRY_GRACE_SECONDS + 0.2,
+            callback,
+            notify_char,
+            tds_packet,
+        )
+
+    client.start_notify.side_effect = _start_notify
+
+    with (
+        patch.object(
+            coordinator,
+            "_resolve_io_targets",
+            return_value=ResolvedGattTargets(
+                read_target=notify_char,
+                notify_target=notify_char,
+                command_target=notify_char,
+                read_characteristic=None,
+                can_read=False,
+            ),
+        ),
+        patch.object(coordinator, "_send_read_request", AsyncMock()),
+    ):
+        result = await coordinator._read_tds_characteristic(client)
+
+    assert coordinator._parse_tds_reading(result) == 42
+
+
+async def test_coordinator_grace_window_waits_for_pending_id_read(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Do not cancel an ID-triggered read that may still supply TDS.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    packet = bytearray(b'{"id":"ac04","iro_rtr":[1200],"iro_lTime":[4320]}')
+    client = AsyncMock()
+    client.stop_notify = AsyncMock()
+    delivered = False
+
+    async def _start_notify(_char: object, callback: Any) -> None:
+        """Deliver the ID/filter notification once."""
+        nonlocal delivered
+        if delivered:
+            return
+        delivered = True
+        callback(_char, packet)
+
+    client.start_notify.side_effect = _start_notify
+
+    async def _slow_tds_read(_char: object) -> bytearray:
+        """Return TDS after the initial grace decision point."""
+        await asyncio.sleep(NOTIFICATION_TELEMETRY_GRACE_SECONDS + 0.1)
+        return bytearray(b'{"pc":"iro_tds","d":42}')
+
+    client.read_gatt_char.side_effect = _slow_tds_read
+
+    with patch.object(coordinator, "_send_read_request", AsyncMock()):
+        result = await coordinator._subscribe_tds_notification(client, "char_notify")
+
+    assert coordinator._parse_tds_reading(result) == 42
+
+
+async def test_coordinator_filter_telemetry_still_schedules_id_read(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Schedule ID-pointer reads while filter telemetry is in its grace window.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    client = MagicMock()
+    loop = asyncio.get_running_loop()
+    packet = bytearray(b'{"id":"12ac","iro_rtr":[1200],"iro_lTime":[4320]}')
+    notify_future: asyncio.Future[bytearray] = loop.create_future()
+    wait_state = _NotificationWaitState(notify_future=notify_future)
+    received_packets: list[bytearray] = []
+    bg_tasks: set[asyncio.Task[None]] = set()
+
+    with patch.object(coordinator, "_check_and_schedule_id_read") as schedule_read:
+        coordinator._handle_notify_packet(
+            client,
+            packet,
+            "char_notify",
+            "char_read",
+            received_packets,
+            notify_future,
+            bg_tasks,
+            wait_state,
+        )
+
+    assert not notify_future.done()
+    assert wait_state.telemetry == packet
+    schedule_read.assert_called_once()
+    assert schedule_read.call_args.args[1] == packet
+    if wait_state.timer is not None:
+        wait_state.timer.cancel()
+        wait_state.timer = None
+
+
+def test_coordinator_filter_staleness_tracks_dynamic_filter_payloads(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Use dynamic filter telemetry timestamps rather than any-JSON last_seen.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"tds":42}')
+    assert coordinator.data.last_seen is not None
+    assert coordinator.data.filters_last_seen is None
+
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[4320],"iro_hsd":[4320],"iro_rtr":[1200],"iro_rtt":[1200]}'
+    )
+    fdata = coordinator.data.filters["filter_1"]
+    assert coordinator.data.filters_last_seen is not None
+    assert fdata.last_seen is not None
+    assert coordinator.is_filter_data_stale() is False
+    assert coordinator.is_filter_data_stale("filter_1") is False
+
+    # A fresh TDS payload must not refresh filter-data freshness.
+    filter_last_seen = fdata.last_seen
+    coordinator._process_tds_payload(b'{"tds":43}')
+    assert coordinator.data.last_seen is not None
+    assert fdata.last_seen == filter_last_seen
+
+    # Stale filter timestamps mark both the global and per-filter state stale.
+    stale_time = dt_util.utcnow() - timedelta(hours=2)
+    coordinator.data.filters_last_seen = stale_time
+    fdata.last_seen = stale_time
+    assert coordinator.is_filter_data_stale() is True
+    assert coordinator.is_filter_data_stale("filter_1") is True
+
+    # A filter record with no dynamic telemetry of this session is stale even
+    # when the connection is currently healthy.
+    coordinator.data.filters_last_seen = None
+    fdata.last_seen = None
+    coordinator.data.connected = True
+    assert coordinator.is_filter_data_stale() is True
+    assert coordinator.is_filter_data_stale("filter_1") is True
+
+
+def test_coordinator_filter_staleness_ignores_static_ratings_per_filter(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Do not treat rated or named filter fields as fresh dynamic telemetry.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(
+        b'{"iro_hsd":[4320],"iro_rtt":[1200],"filter_names":["Sediment"]}'
+    )
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.name == "Sediment"
+    assert fdata.last_seen is None
+    assert coordinator.data.filters_last_seen is None
+    assert coordinator.is_filter_data_stale("filter_1") is True
+
+    # filter_1 receives dynamic values; filter_2 receives only static ratings.
+    coordinator._process_tds_payload(
+        b'{"iro_lTime":[4320],"iro_hsd":[4320,4320],"iro_rtr":[1200],"iro_rtt":[1200,1200]}'
+    )
+    assert coordinator.data.filters_last_seen is not None
+    assert coordinator.data.filters["filter_1"].last_seen is not None
+    assert coordinator.data.filters["filter_2"].last_seen is None
+    assert coordinator.is_filter_data_stale("filter_1") is False
+    assert coordinator.is_filter_data_stale("filter_2") is True

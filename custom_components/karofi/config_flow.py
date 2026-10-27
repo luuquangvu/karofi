@@ -10,6 +10,11 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
 )
 from homeassistant.const import CONF_MAC, CONF_NAME
+from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+)
 
 from .const import (
     DEFAULT_NAME,
@@ -17,7 +22,6 @@ from .const import (
     MANUAL_MAC_CHOICE,
     MANUAL_MAC_LABEL,
     KarofiCharacteristic,
-    KarofiShortUUID,
 )
 from .util import (
     is_karofi_local_name,
@@ -98,19 +102,42 @@ class KarofiConfigFlow(ConfigFlow, domain=DOMAIN):
             if fmt in configured_macs:
                 continue
             is_karofi = is_karofi_local_name(dev.name) or any(
-                uuid.lower()
-                in (
-                    KarofiCharacteristic.SERVICE.lower(),
-                    KarofiShortUUID.SERVICE.lower(),
-                )
-                for uuid in dev.service_uuids
+                uuid.lower() == KarofiCharacteristic.SERVICE.lower() for uuid in dev.service_uuids
             )
             if not is_karofi:
                 continue
             cleaned_dev_name = normalize_local_name(dev.name, case_sensitive=True)
-            label = f"{cleaned_dev_name or 'Unknown'} ({fmt})"
+            label = f"{cleaned_dev_name} ({fmt})" if cleaned_dev_name else fmt
             device_choices[fmt] = label
         return device_choices
+
+    async def _async_create_entry_from_input(
+        self,
+        raw_mac: str,
+        raw_name: object,
+    ) -> ConfigFlowResult:
+        """Normalize input and create the Karofi config entry.
+
+        Args:
+            raw_mac: User-provided or selected MAC address.
+            raw_name: Optional user-provided display name.
+
+        Returns:
+            Config entry creation result.
+        """
+        formatted_mac = normalize_mac(raw_mac, uppercase=False)
+        await self.async_set_unique_id(formatted_mac)
+        self._abort_if_unique_id_configured()
+
+        user_name = normalize_local_name(
+            str(raw_name) if raw_name is not None else None,
+            case_sensitive=True,
+        )
+        name = user_name or f"Karofi ({formatted_mac[-5:]})"
+        return self.async_create_entry(
+            title=name,
+            data={CONF_MAC: formatted_mac, CONF_NAME: name},
+        )
 
     async def async_step_user(
         self,
@@ -124,45 +151,37 @@ class KarofiConfigFlow(ConfigFlow, domain=DOMAIN):
         Returns:
             Flow result creating entry or displaying device selection.
         """
-        errors: dict[str, str] = {}
-
         if user_input is not None:
             mac_input = str(user_input[CONF_MAC]).strip()
             if mac_input == MANUAL_MAC_CHOICE:
                 return await self.async_step_manual()
-
-            if not is_valid_mac(mac_input):
-                errors[CONF_MAC] = "invalid_mac"
-            else:
-                formatted_mac = normalize_mac(mac_input, uppercase=False)
-                await self.async_set_unique_id(formatted_mac)
-                self._abort_if_unique_id_configured()
-
-                raw_name = user_input.get(CONF_NAME)
-                user_name = normalize_local_name(
-                    str(raw_name) if raw_name is not None else None,
-                    case_sensitive=True,
-                )
-                name = user_name or f"Karofi ({formatted_mac[-5:]})"
-                return self.async_create_entry(
-                    title=name,
-                    data={CONF_MAC: formatted_mac, CONF_NAME: name},
-                )
+            return await self._async_create_entry_from_input(
+                mac_input,
+                user_input.get(CONF_NAME),
+            )
 
         device_choices = self._discover_device_choices()
         if not device_choices:
             return await self.async_step_manual()
 
-        device_choices[MANUAL_MAC_CHOICE] = MANUAL_MAC_LABEL
+        options = [
+            SelectOptionDict(value=mac, label=label) for mac, label in device_choices.items()
+        ]
+        options.append(SelectOptionDict(value=MANUAL_MAC_CHOICE, label=MANUAL_MAC_LABEL))
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_MAC): vol.In(device_choices),
+                vol.Required(CONF_MAC): SelectSelector(
+                    SelectSelectorConfig(
+                        options=options,
+                        translation_key="device_selection",
+                    )
+                ),
                 vol.Optional(CONF_NAME, default=DEFAULT_NAME): str,
             }
         )
 
-        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+        return self.async_show_form(step_id="user", data_schema=schema)
 
     async def async_step_manual(
         self,
@@ -183,19 +202,9 @@ class KarofiConfigFlow(ConfigFlow, domain=DOMAIN):
             if not is_valid_mac(raw_mac):
                 errors[CONF_MAC] = "invalid_mac"
             else:
-                formatted_mac = normalize_mac(raw_mac, uppercase=False)
-                await self.async_set_unique_id(formatted_mac)
-                self._abort_if_unique_id_configured()
-
-                raw_name = user_input.get(CONF_NAME)
-                user_name = normalize_local_name(
-                    str(raw_name) if raw_name is not None else None,
-                    case_sensitive=True,
-                )
-                name = user_name or f"Karofi ({formatted_mac[-5:]})"
-                return self.async_create_entry(
-                    title=name,
-                    data={CONF_MAC: formatted_mac, CONF_NAME: name},
+                return await self._async_create_entry_from_input(
+                    raw_mac,
+                    user_input.get(CONF_NAME),
                 )
 
         schema = vol.Schema(
