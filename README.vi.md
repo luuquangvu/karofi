@@ -150,7 +150,7 @@ Cảm biến số ngày còn lại vẫn dựa trên lịch. Các cảm biến c
 <!-- MD028/no-blanks-blockquote: Blank line inside blockquote -->
 
 > [!NOTE]
-> Cảm biến lõi lọc hiển thị thuộc tính `last_seen` và `stale`. `last_seen` là thời điểm dữ liệu động gần nhất của lõi lọc (số giờ còn lại theo lịch hoặc theo thời gian sử dụng). Trước khi một lõi lọc gửi dữ liệu động, các cảm biến vẫn khả dụng khi máy lọc đang kết nối và sử dụng giá trị dựa trên lịch. Sau khi lõi lọc đã gửi dữ liệu động, nếu không có dữ liệu động mới trong hơn một giờ, các cảm biến tương ứng sẽ chuyển sang trạng thái không khả dụng thay vì tiếp tục hiển thị giá trị cũ. Các nút đặt lại sẽ không khả dụng khi máy lọc mất kết nối.
+> Cảm biến lõi lọc hiển thị thuộc tính `last_seen` và `stale`. `last_seen` là thời điểm dữ liệu động gần nhất của lõi lọc (số giờ còn lại theo lịch hoặc theo thời gian sử dụng). Trước khi một lõi lọc gửi dữ liệu động, các cảm biến vẫn khả dụng khi máy lọc đang kết nối; chỉ cảm biến tuổi thọ và số ngày còn lại sử dụng giá trị dựa trên lịch, còn cảm biến số giờ sử dụng có thể chưa có giá trị cho đến khi nhận được dữ liệu sử dụng thực tế. Sau khi lõi lọc đã gửi dữ liệu động, nếu không có dữ liệu động mới trong hơn một giờ, các cảm biến tương ứng sẽ chuyển sang trạng thái không khả dụng thay vì tiếp tục hiển thị giá trị cũ. Các nút đặt lại sẽ không khả dụng khi máy lọc mất kết nối.
 
 ### Khi thay lõi lọc mới
 

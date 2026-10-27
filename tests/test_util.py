@@ -208,23 +208,23 @@ def test_hide_mac() -> None:
 def test_filter_stage_keys_and_conversion() -> None:
     """Test filter stage keys, index mapping, and dynamic fallback beyond 12 stages."""
     assert FILTER_PREFIX == "filter_"
-    assert len(FILTER_STAGE_KEYS) == 12
+    assert len(FILTER_STAGE_KEYS) == 16
     assert FILTER_STAGE_KEYS[0] == "filter_1"
-    assert FILTER_STAGE_KEYS[10] == "filter_11"
     assert FILTER_STAGE_KEYS[11] == "filter_12"
-    assert KarofiFilter.FILTER_11 == "filter_11"
+    assert FILTER_STAGE_KEYS[15] == "filter_16"
     assert KarofiFilter.FILTER_12 == "filter_12"
+    assert KarofiFilter.FILTER_16 == "filter_16"
     assert DEFAULT_FILTER_LIFETIME_DAYS["filter_11"] == 365
-    assert DEFAULT_FILTER_LIFETIME_DAYS["filter_12"] == 365
+    assert DEFAULT_FILTER_LIFETIME_DAYS["filter_16"] == 365
 
     # Test index to key
-    for idx in range(12):
+    for idx in range(16):
         assert filter_index_to_key(idx) == f"filter_{idx + 1}"
-    assert filter_index_to_key(12) == "filter_13"
-    assert filter_index_to_key(14) == "filter_15"
+    assert filter_index_to_key(11) == "filter_12"
+    assert filter_index_to_key(15) == "filter_16"
 
     # Test key to index
-    for idx in range(12):
+    for idx in range(16):
         assert filter_key_to_index(f"filter_{idx + 1}") == idx
     assert filter_key_to_index("filter_13") == 12
     assert filter_key_to_index("filter_20") == 19

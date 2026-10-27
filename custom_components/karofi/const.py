@@ -293,6 +293,10 @@ class KarofiFilter(StrEnum):
     FILTER_10 = "filter_10"
     FILTER_11 = "filter_11"
     FILTER_12 = "filter_12"
+    FILTER_13 = "filter_13"
+    FILTER_14 = "filter_14"
+    FILTER_15 = "filter_15"
+    FILTER_16 = "filter_16"
 
 
 # Default filter lifetime configurations (in days) when not provided by telemetry
@@ -309,4 +313,8 @@ DEFAULT_FILTER_LIFETIME_DAYS: Final[dict[str, int]] = {
     KarofiFilter.FILTER_10: 365,
     KarofiFilter.FILTER_11: 365,
     KarofiFilter.FILTER_12: 365,
+    KarofiFilter.FILTER_13: 365,
+    KarofiFilter.FILTER_14: 365,
+    KarofiFilter.FILTER_15: 365,
+    KarofiFilter.FILTER_16: 365,
 }
