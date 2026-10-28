@@ -9,6 +9,7 @@
       "local_name": "TCM-*"
     }
   ],
+  "categories": ["water.water_treatment"],
   "codeowners": ["@luuquangvu"],
   "config_flow": true,
   "dependencies": ["bluetooth"],
