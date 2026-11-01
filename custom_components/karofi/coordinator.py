@@ -36,6 +36,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    ALKALINE_LEVEL_PAYLOAD_KEYS,
     BLE_COMMAND_CHUNK_SIZE,
     BLE_CONNECT_ATTEMPTS,
     BLE_TIMEOUT_SECONDS,
@@ -44,8 +45,11 @@ from .const import (
     DIRECT_TDS_RETURN_RESERVE_SECONDS,
     FILTER_DATA_STALE_AFTER_SECONDS,
     FULL_TELEMETRY_SCAN_INTERVAL,
+    HYDROGEN_PAYLOAD_KEYS,
+    MAX_ALKALINE_LEVEL,
     MAX_FILTER_STAGES,
     MAX_TELEMETRY_CACHE_ENTRIES,
+    MAX_VALID_HYDROGEN_PPB,
     MAX_VALID_TDS,
     NOTIFICATION_TELEMETRY_GRACE_SECONDS,
     NOTIFICATION_WAIT_SECONDS,
@@ -64,6 +68,7 @@ from .const import (
     TDS_THRESHOLD_GOOD,
     TELEMETRY_PAYLOAD_KEYS,
     WARNING_LOG_INTERVAL_SECONDS,
+    WATER_MODE_PAYLOAD_KEYS,
     GattProperty,
     KarofiCharacteristic,
     KarofiFilter,
@@ -71,6 +76,7 @@ from .const import (
     MakiposEventType,
     MakiposPayloadKey,
     MakiposPropertyCode,
+    WaterMode,
     WaterQuality,
     build_reset_filter_command,
 )
@@ -164,6 +170,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             filters={},
             errors=[],
             signal_strength=None,
+            hydrogen_ppb=None,
+            alkaline_level=None,
+            water_mode=WaterMode.UNKNOWN,
         )
         self._known_tds_char_uuid: str | None = None
         self._telemetry_char_uuids: list[str] = []
@@ -2552,6 +2561,39 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         return KarofiDataCoordinator._coerce_scalar(val)
 
     @staticmethod
+    def _coerce_integral_int(val: object) -> int | None:
+        """Coerce a list, string, or numeric value to an integral reading.
+
+        Fractional values are rejected instead of truncated so malformed
+        telemetry such as ``-0.5`` cannot be accepted as ``0``.
+
+        Args:
+            val: Raw value candidate to parse as integer.
+
+        Returns:
+            Parsed integer or None if the value is invalid or fractional.
+        """
+        if isinstance(val, list):
+            val = val[0] if val else None
+        elif isinstance(val, str) and "," in val:
+            parts = val.split(",")
+            val = parts[0].strip() if parts else None
+
+        if isinstance(val, bool):
+            return None
+        if isinstance(val, int):
+            return val
+        if isinstance(val, float):
+            return int(val) if val.is_integer() else None
+        if isinstance(val, str):
+            try:
+                numeric = float(val)
+            except ValueError, TypeError, OverflowError:
+                return None
+            return int(numeric) if numeric.is_integer() else None
+        return None
+
+    @staticmethod
     def _is_valid_tds(tds: int | None) -> TypeGuard[int]:
         """Check if parsed TDS integer reading falls within valid limits.
 
@@ -2713,6 +2755,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             MakiposPropertyCode.IRO_RTT,
             MakiposPropertyCode.IRO_HSD,
             MakiposPropertyCode.IRO_ERRS,
+            *HYDROGEN_PAYLOAD_KEYS,
+            *ALKALINE_LEVEL_PAYLOAD_KEYS,
+            *WATER_MODE_PAYLOAD_KEYS,
         ):
             return True
         return any(
@@ -2724,6 +2769,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 MakiposPayloadKey.IRO_HSD,
                 MakiposPayloadKey.IRO_ERRS,
                 MakiposPayloadKey.IRO_NAMES,
+                *HYDROGEN_PAYLOAD_KEYS,
+                *ALKALINE_LEVEL_PAYLOAD_KEYS,
+                *WATER_MODE_PAYLOAD_KEYS,
                 MakiposPayloadKey.FILTER_NAMES,
                 MakiposPayloadKey.NAMES,
             )
@@ -3371,6 +3419,125 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         return False
 
     @staticmethod
+    def _extract_named_value(payload: dict[str, object], keys: tuple[str, ...]) -> object | None:
+        """Extract a value reported either through ``pc``/``d`` or a direct key.
+
+        Args:
+            payload: Parsed JSON payload dictionary.
+            keys: Accepted property codes / direct payload keys.
+
+        Returns:
+            Raw value when one of the accepted identifiers is present.
+        """
+        property_code = payload.get(MakiposPayloadKey.PROPERTY_CODE)
+        if (
+            isinstance(property_code, str)
+            and property_code in keys
+            and MakiposPayloadKey.DATA in payload
+        ):
+            return payload.get(MakiposPayloadKey.DATA)
+        return next((payload.get(key) for key in keys if key in payload), None)
+
+    @staticmethod
+    def _parse_water_mode(raw_value: object) -> tuple[int | None, WaterMode] | None:
+        """Parse a water-mode / alkaline-level value.
+
+        Numeric levels are interpreted as ``0 = pure``, ``1..5 = alkaline`` and
+        higher values as an extended water mode. Textual modes are accepted for
+        firmware that reports names instead of levels.
+
+        Args:
+            raw_value: Raw value from the device payload.
+
+        Returns:
+            Tuple of (alkaline level or None, water mode), or None if invalid.
+        """
+        if isinstance(raw_value, str):
+            normalized = raw_value.strip().lower().replace("-", "_").replace(" ", "_")
+            text_modes = {
+                "pure": WaterMode.PURE,
+                "pure_water": WaterMode.PURE,
+                "alkaline": WaterMode.ALKALINE,
+                "alkaline_water": WaterMode.ALKALINE,
+                "hydrogen": WaterMode.HYDROGEN,
+                "alkaline_hydro_ion": WaterMode.HYDROGEN,
+                # Model-specific label used by the S695 variant.
+                "alkaline_hydro_ions695": WaterMode.HYDROGEN,
+                "skin_care": WaterMode.SKIN_CARE,
+                "skin_lotion": WaterMode.SKIN_CARE,
+                "hot": WaterMode.HOT,
+                "hot_water": WaterMode.HOT,
+                "cold": WaterMode.COLD,
+                "cool_water": WaterMode.COLD,
+                "cold_water": WaterMode.AMBIENT,
+                "soda_water": WaterMode.SODA,
+            }
+            if normalized in text_modes:
+                level = 0 if text_modes[normalized] is WaterMode.PURE else None
+                return level, text_modes[normalized]
+
+        level = KarofiDataCoordinator._coerce_integral_int(raw_value)
+        if level is None or not 0 <= level <= MAX_ALKALINE_LEVEL:
+            return None
+        if level == 0:
+            return level, WaterMode.PURE
+        if level <= 5:
+            return level, WaterMode.ALKALINE
+        return level, WaterMode.OTHER
+
+    def _process_water_metrics_from_payload(self, payload: dict[str, object]) -> bool:
+        """Process hydrogen concentration and water-mode telemetry.
+
+        Args:
+            payload: Parsed JSON payload dictionary.
+
+        Returns:
+            True if a hydrogen or water-mode value was updated.
+        """
+        updated = False
+
+        hydrogen_raw = self._extract_named_value(payload, HYDROGEN_PAYLOAD_KEYS)
+        if hydrogen_raw is not None:
+            hydrogen_ppb = self._coerce_integral_int(hydrogen_raw)
+            if hydrogen_ppb is not None and 0 <= hydrogen_ppb <= MAX_VALID_HYDROGEN_PPB:
+                self.data.hydrogen_ppb = hydrogen_ppb
+                updated = True
+
+        level_raw = self._extract_named_value(payload, ALKALINE_LEVEL_PAYLOAD_KEYS)
+        mode_raw = self._extract_named_value(payload, WATER_MODE_PAYLOAD_KEYS)
+        parsed_level = self._parse_water_mode(level_raw) if level_raw is not None else None
+        parsed_mode = self._parse_water_mode(mode_raw) if mode_raw is not None else None
+
+        if parsed_level is not None:
+            level, derived_mode = parsed_level
+            if level is not None:
+                self.data.alkaline_level = level
+            level_derived_mode_active = self.data.water_mode in (
+                WaterMode.PURE,
+                WaterMode.PURE.value,
+                WaterMode.ALKALINE,
+                WaterMode.ALKALINE.value,
+                WaterMode.OTHER,
+                WaterMode.OTHER.value,
+                WaterMode.UNKNOWN,
+                WaterMode.UNKNOWN.value,
+            )
+            if parsed_mode is None and (level == 0 or level_derived_mode_active):
+                self.data.water_mode = derived_mode
+                self.data.supported_water_modes.add(derived_mode)
+            updated = True
+
+        if parsed_mode is not None:
+            level, water_mode = parsed_mode
+            if parsed_level is None and level is not None:
+                self.data.alkaline_level = level
+            self.data.water_mode = water_mode
+            self.data.supported_water_modes.add(water_mode)
+            updated = True
+
+        return updated
+
+    @staticmethod
     def _is_valid_json_buffer(raw_bytes: bytearray | bytes) -> bool:
         """Check if buffer is non-empty and contains JSON braces or brackets.
 
@@ -3420,6 +3587,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 has_sensor_data = True
                 filters_updated = True
             if self._process_errors_from_payload(payload):
+                has_sensor_data = True
+            if self._process_water_metrics_from_payload(payload):
                 has_sensor_data = True
         self._finalize_missing_telemetry_resets(telemetry_generation)
         return has_sensor_data, filters_updated

@@ -94,6 +94,10 @@ async def test_binary_sensor_async_setup_entry(
     assert isinstance(added_entities[0], KarofiConnectivityBinarySensor)
     assert isinstance(added_entities[1], KarofiProblemBinarySensor)
 
+    # Core binary sensors are registered up front and must not be duplicated.
+    mock_coordinator.async_update_listeners()
+    assert len(added_entities) == 2
+
 
 async def test_connectivity_binary_sensor(
     hass: HomeAssistant,

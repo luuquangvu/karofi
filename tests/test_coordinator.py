@@ -1,6 +1,7 @@
 """Tests for Karofi data coordinator."""
 
 import asyncio
+import json
 import logging
 import time
 from datetime import UTC, datetime, timedelta
@@ -41,6 +42,7 @@ from custom_components.karofi.const import (
     GattProperty,
     KarofiCharacteristic,
     KarofiShortUUID,
+    WaterMode,
     WaterQuality,
     build_reset_filter_command,
 )
@@ -4200,3 +4202,255 @@ def test_coordinator_filter_staleness_ignores_static_ratings_per_filter(
     assert coordinator.data.filters["filter_2"].last_seen is None
     assert coordinator.is_filter_data_stale("filter_1") is False
     assert coordinator.is_filter_data_stale("filter_2") is True
+
+
+def test_coordinator_processes_hydrogen_and_water_mode(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Parse dissolved hydrogen and the pure/alkaline water mode.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"pc":"hydrogenPpb","d":1300}')
+    assert coordinator.data.hydrogen_ppb == 1300
+    assert coordinator.data.hydrogen == 1300
+
+    coordinator._process_tds_payload(b'{"pc":"iro_alk","d":0}')
+    assert coordinator.data.alkaline_level == 0
+    assert coordinator.data.water_mode is WaterMode.PURE
+
+    coordinator._process_tds_payload(b'{"iro_alk":2}')
+    assert coordinator.data.alkaline_level == 2
+    assert coordinator.data.water_mode is WaterMode.ALKALINE
+
+    coordinator._process_tds_payload(b'{"hydrogenPpb":[1450]}')
+    assert coordinator.data.hydrogen_ppb == 1450
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "expected_mode", "expected_level"),
+    [
+        ("pure", WaterMode.PURE, 0),
+        (" Pure Water ", WaterMode.PURE, 0),
+        ("pure_water", WaterMode.PURE, 0),
+        ("ALKALINE", WaterMode.ALKALINE, None),
+        (" alkaline water ", WaterMode.ALKALINE, None),
+        ("alkaline-water", WaterMode.ALKALINE, None),
+        ("hydrogen", WaterMode.HYDROGEN, None),
+        ("alkaline_hydro-ion", WaterMode.HYDROGEN, None),
+        ("alkaline-hyDRO-ions695", WaterMode.HYDROGEN, None),
+        (" skin care ", WaterMode.SKIN_CARE, None),
+        ("skin_lotion", WaterMode.SKIN_CARE, None),
+        ("HOT WATER", WaterMode.HOT, None),
+        ("cool_water", WaterMode.COLD, None),
+        ("cold_water", WaterMode.AMBIENT, None),
+        ("soda_water", WaterMode.SODA, None),
+    ],
+)
+def test_coordinator_parses_water_mode_text_aliases(
+    coordinator: KarofiDataCoordinator,
+    raw_text: str,
+    expected_mode: WaterMode,
+    expected_level: int | None,
+) -> None:
+    """Parse every textual water mode after case and whitespace normalization.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        raw_text: Textual mode value to parse.
+        expected_mode: Expected parsed water mode.
+        expected_level: Expected alkaline level.
+    """
+    payload = json.dumps({"pc": "iro_mode", "d": raw_text}).encode()
+    coordinator._process_tds_payload(payload)
+    assert coordinator.data.water_mode is expected_mode
+    assert coordinator.data.alkaline_level == expected_level
+    assert expected_mode in coordinator.data.supported_water_modes
+
+
+@pytest.mark.parametrize(
+    ("level", "expected_mode"),
+    [
+        (0, WaterMode.PURE),
+        (5, WaterMode.ALKALINE),
+        (6, WaterMode.OTHER),
+        (11, WaterMode.OTHER),
+    ],
+)
+def test_coordinator_accepts_extended_numeric_water_modes(
+    coordinator: KarofiDataCoordinator,
+    level: int,
+    expected_mode: WaterMode,
+) -> None:
+    """Accept the wider numeric range used by premium water purifier models.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        level: Numeric water option reported by the device.
+        expected_mode: Expected parsed water mode.
+    """
+    coordinator._process_tds_payload(json.dumps({"pc": "iro_alk", "d": level}).encode())
+    assert coordinator.data.alkaline_level == level
+    assert coordinator.data.water_mode is expected_mode
+    assert expected_mode in coordinator.data.supported_water_modes
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "iro_mode",
+        "iro_waterMode",
+        "water_mode",
+        "waterMode",
+    ],
+)
+def test_coordinator_accepts_water_mode_key_aliases(
+    coordinator: KarofiDataCoordinator,
+    key: str,
+) -> None:
+    """Accept every supported direct water-mode payload key.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        key: Direct payload key carrying the mode.
+    """
+    coordinator._process_tds_payload(json.dumps({key: "hydrogen"}).encode())
+    assert coordinator.data.water_mode is WaterMode.HYDROGEN
+
+
+def test_coordinator_invalid_water_mode_text_preserves_prior_state(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Ignore invalid textual modes without clearing the last known state.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"alkalineLevel":2,"water_mode":"hydrogen"}')
+    coordinator._process_tds_payload(b'{"pc":"iro_mode","d":"hybrid water"}')
+    assert coordinator.data.alkaline_level == 2
+    assert coordinator.data.water_mode is WaterMode.HYDROGEN
+
+
+def test_coordinator_processes_water_mode_aliases_and_rejects_invalid_values(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Accept known model aliases while ignoring out-of-range readings.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"pc":"iro_mode","d":"pure"}')
+    assert coordinator.data.water_mode is WaterMode.PURE
+    assert coordinator.data.alkaline_level == 0
+
+    coordinator._process_tds_payload(b'{"pc":"iro_h2","d":1300}')
+    assert coordinator.data.hydrogen_ppb == 1300
+
+    coordinator._process_tds_payload(b'{"pc":"unknownHydrogenPpb","d":999}')
+    assert coordinator.data.hydrogen_ppb == 1300
+
+    coordinator._process_tds_payload(b'{"pc":"iro_alk","d":99}')
+    assert coordinator.data.alkaline_level == 0
+    assert coordinator.data.water_mode is WaterMode.PURE
+
+    coordinator._process_tds_payload(b'{"pc":"hydrogenPpb","d":-1}')
+    assert coordinator.data.hydrogen_ppb == 1300
+
+
+def test_coordinator_reads_alkaline_level_and_water_mode_independently(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Keep the alkaline level when an explicit mode reports hydrogen.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"alkalineLevel":2,"water_mode":"hydrogen"}')
+    assert coordinator.data.alkaline_level == 2
+    assert coordinator.data.water_mode is WaterMode.HYDROGEN
+
+    coordinator._process_tds_payload(b'{"pc":"waterMode","d":"hydrogen","alkalineLevel":3}')
+    assert coordinator.data.alkaline_level == 3
+    assert coordinator.data.water_mode is WaterMode.HYDROGEN
+
+
+def test_coordinator_preserves_hydrogen_mode_across_separate_alkaline_frame(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Keep hydrogen active when a later frame reports only an alkaline level.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"pc":"iro_mode","d":"hydrogen"}')
+    assert coordinator.data.alkaline_level is None
+    assert coordinator.data.water_mode is WaterMode.HYDROGEN
+
+    coordinator._process_tds_payload(b'{"pc":"iro_alk","d":2}')
+    assert coordinator.data.alkaline_level == 2
+    assert coordinator.data.water_mode is WaterMode.HYDROGEN
+
+    coordinator._process_tds_payload(b'{"pc":"iro_alk","d":0}')
+    assert coordinator.data.alkaline_level == 0
+    assert coordinator.data.water_mode is WaterMode.PURE
+
+
+@pytest.mark.parametrize(
+    ("mode_text", "expected_mode"),
+    [
+        ("skin_care", WaterMode.SKIN_CARE),
+        ("hot", WaterMode.HOT),
+        ("cold", WaterMode.COLD),
+        ("cold_water", WaterMode.AMBIENT),
+        ("soda_water", WaterMode.SODA),
+    ],
+)
+def test_coordinator_level_frame_preserves_explicit_water_modes(
+    coordinator: KarofiDataCoordinator,
+    mode_text: str,
+    expected_mode: WaterMode,
+) -> None:
+    """Keep explicit modes when a separate frame reports only a level.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        mode_text: Explicit water mode reported by the device.
+        expected_mode: Expected parsed water mode.
+    """
+    coordinator._process_tds_payload(json.dumps({"water_mode": mode_text}).encode())
+    assert coordinator.data.water_mode is expected_mode
+
+    coordinator._process_tds_payload(b'{"pc":"iro_alk","d":2}')
+    assert coordinator.data.alkaline_level == 2
+    assert coordinator.data.water_mode is expected_mode
+
+    coordinator._process_tds_payload(b'{"pc":"iro_alk","d":0}')
+    assert coordinator.data.alkaline_level == 0
+    assert coordinator.data.water_mode is WaterMode.PURE
+
+
+def test_coordinator_rejects_fractional_hydrogen_and_alkaline_readings(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Reject fractional readings instead of truncating them.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"hydrogenPpb":1300,"alkalineLevel":2}')
+
+    coordinator._process_tds_payload(b'{"hydrogenPpb":-0.5,"alkalineLevel":-0.5}')
+    assert coordinator.data.hydrogen_ppb == 1300
+    assert coordinator.data.alkaline_level == 2
+    assert coordinator.data.water_mode is WaterMode.ALKALINE
+
+    coordinator._process_tds_payload(b'{"pc":"waterMode","d":0.5}')
+    assert coordinator.data.alkaline_level == 2
+    assert coordinator.data.water_mode is WaterMode.ALKALINE
+
+    coordinator._process_tds_payload(b'{"hydrogenPpb":1400.0,"alkalineLevel":3.0}')
+    assert coordinator.data.hydrogen_ppb == 1400
+    assert coordinator.data.alkaline_level == 3
+    assert coordinator.data.water_mode is WaterMode.ALKALINE

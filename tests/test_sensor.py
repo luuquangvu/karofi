@@ -22,6 +22,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.karofi.const import (
     DOMAIN,
     KarofiFilter,
+    WaterMode,
     WaterQuality,
 )
 from custom_components.karofi.coordinator import KarofiDataCoordinator
@@ -31,9 +32,11 @@ from custom_components.karofi.sensor import (
     KarofiFilterDaysRemainingSensor,
     KarofiFilterPercentSensor,
     KarofiFilterUsageHoursRemainingSensor,
+    KarofiHydrogenSensor,
     KarofiQualitySensor,
     KarofiSignalStrengthSensor,
     KarofiTDSSensor,
+    KarofiWaterModeSensor,
     async_setup_entry,
 )
 
@@ -104,17 +107,151 @@ async def test_sensor_async_setup_entry(
         """
         added_entities.extend(new_entities)
 
-    # Initially without known filters: 3 sensors (TDS + Quality + Signal strength)
+    # Core sensors are registered before any telemetry arrives.
     await async_setup_entry(hass, mock_config_entry, mock_add_entities)
     assert len(added_entities) == 3
+    assert isinstance(added_entities[0], KarofiTDSSensor)
+    assert isinstance(added_entities[1], KarofiQualitySensor)
+    assert isinstance(added_entities[2], KarofiSignalStrengthSensor)
 
-    # Simulate discovery of 2 filters via coordinator data
+    # Simulate discovery of 2 filters via coordinator data.
     mock_coordinator.data.filter_reset_dates["filter_1"] = "2026-01-01T00:00:00"
     mock_coordinator.data.filter_reset_dates["filter_2"] = "2026-01-01T00:00:00"
     mock_coordinator.async_update_listeners()
 
-    # 3 base sensors + 6 filter sensors (3 per filter)
+    # 3 core sensors + 6 filter sensors (3 per filter).
     assert len(added_entities) == 9
+
+
+async def test_sensor_async_setup_entry_keeps_core_sensors_before_payload(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Register core TDS, quality, and signal sensors before telemetry arrives.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    added_entities: list[Entity] = []
+
+    def mock_add_entities(new_entities: Iterable[Entity], update_before_add: bool = False) -> None:
+        """Mock callback to collect added entities.
+
+        Args:
+            new_entities: Iterable of entities to add.
+            update_before_add: Whether to update entities before adding.
+        """
+        added_entities.extend(new_entities)
+
+    await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+    assert len(added_entities) == 3
+
+    tds_sensor = next(entity for entity in added_entities if isinstance(entity, KarofiTDSSensor))
+    quality_sensor = next(
+        entity for entity in added_entities if isinstance(entity, KarofiQualitySensor)
+    )
+    assert tds_sensor.native_value is None
+    assert tds_sensor.available is False
+    assert quality_sensor.native_value == WaterQuality.UNKNOWN.value
+    assert quality_sensor.available is False
+
+    mock_coordinator.data.tds = 42
+    mock_coordinator.data.quality = WaterQuality.GOOD
+    mock_coordinator.async_update_listeners()
+
+    # Payload updates must not duplicate core entities.
+    assert len(added_entities) == 3
+
+
+async def test_sensor_async_setup_entry_adds_hydrogen_and_water_mode(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Add hydrogen and water-mode entities only when the model reports them.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    added_entities: list[Entity] = []
+
+    def mock_add_entities(new_entities: Iterable[Entity], update_before_add: bool = False) -> None:
+        """Mock callback to collect added entities.
+
+        Args:
+            new_entities: Iterable of entities to add.
+            update_before_add: Whether to update entities before adding.
+        """
+        added_entities.extend(new_entities)
+
+    await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+    assert len(added_entities) == 3
+
+    mock_coordinator.data.connected = True
+    mock_coordinator.data.hydrogen_ppb = 1300
+    mock_coordinator.data.alkaline_level = 2
+    mock_coordinator.data.water_mode = WaterMode.ALKALINE
+    mock_coordinator.data.supported_water_modes = {
+        WaterMode.PURE,
+        WaterMode.ALKALINE,
+    }
+    mock_coordinator.async_update_listeners()
+
+    assert len(added_entities) == 5
+    hydrogen_sensor = next(
+        entity for entity in added_entities if isinstance(entity, KarofiHydrogenSensor)
+    )
+    water_mode_sensor = next(
+        entity for entity in added_entities if isinstance(entity, KarofiWaterModeSensor)
+    )
+    assert hydrogen_sensor.unique_id == "aa:bb:cc:11:22:33_hydrogen"
+    assert hydrogen_sensor.native_value == 1300
+    assert hydrogen_sensor.native_unit_of_measurement == "ppb"
+    assert hydrogen_sensor.available is True
+    assert water_mode_sensor.unique_id == "aa:bb:cc:11:22:33_water_mode"
+    assert water_mode_sensor.native_value == WaterMode.ALKALINE.value
+    assert water_mode_sensor.options == [WaterMode.PURE.value, WaterMode.ALKALINE.value]
+    assert water_mode_sensor.available is True
+    assert water_mode_sensor.extra_state_attributes == {
+        "alkaline_level": 2,
+        "hydrogen_ppb": 1300,
+    }
+
+    # A subsequent update changes values without creating duplicate entities.
+    _init_test_sensor(hydrogen_sensor, "sensor.karofi_hydrogen", hass)
+    _init_test_sensor(water_mode_sensor, "sensor.karofi_water_mode", hass)
+    mock_coordinator.data.hydrogen_ppb = 1450
+    mock_coordinator.data.alkaline_level = None
+    mock_coordinator.data.water_mode = WaterMode.HYDROGEN
+    mock_coordinator.data.supported_water_modes.add(WaterMode.HYDROGEN)
+    mock_coordinator.async_update_listeners()
+    hydrogen_sensor._handle_coordinator_update()
+    water_mode_sensor._handle_coordinator_update()
+    assert len(added_entities) == 5
+    assert hydrogen_sensor.native_value == 1450
+    assert water_mode_sensor.native_value == WaterMode.HYDROGEN.value
+    assert water_mode_sensor.options == [
+        WaterMode.PURE.value,
+        WaterMode.ALKALINE.value,
+        WaterMode.HYDROGEN.value,
+    ]
+    assert water_mode_sensor.extra_state_attributes == {
+        "alkaline_level": None,
+        "hydrogen_ppb": 1450,
+    }
+
+    # The unknown fallback is not exposed as an enum option.
+    mock_coordinator.data.water_mode = WaterMode.UNKNOWN
+    water_mode_sensor._handle_coordinator_update()
+    assert water_mode_sensor.native_value is None
+    assert water_mode_sensor.available is False
+    assert water_mode_sensor.options is not None
+    assert WaterMode.UNKNOWN.value not in water_mode_sensor.options
 
 
 async def test_sensor_async_setup_entry_with_known_filters(
@@ -144,6 +281,9 @@ async def test_sensor_async_setup_entry_with_known_filters(
     await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
     assert len(added_entities) == 6
+    assert isinstance(added_entities[0], KarofiTDSSensor)
+    assert isinstance(added_entities[1], KarofiQualitySensor)
+    assert isinstance(added_entities[2], KarofiSignalStrengthSensor)
     assert isinstance(added_entities[3], KarofiFilterPercentSensor)
     assert isinstance(added_entities[4], KarofiFilterDaysRemainingSensor)
     assert isinstance(added_entities[5], KarofiFilterUsageHoursRemainingSensor)
