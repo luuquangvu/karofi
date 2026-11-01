@@ -67,6 +67,24 @@
           "unknown": "Unknown"
         }
       },
+      "hydrogen": {
+        "name": "Hydrogen content"
+      },
+      "water_mode": {
+        "name": "Water mode",
+        "state": {
+          "pure": "Pure water",
+          "alkaline": "Alkaline hydrogen-ion water",
+          "hydrogen": "Hydrogen water",
+          "skin_care": "Skin care water",
+          "hot": "Hot water",
+          "cold": "Cold water",
+          "ambient": "Ambient water",
+          "soda": "Soda water",
+          "other": "Other water mode",
+          "unknown": "Unknown"
+        }
+      },
       "filter_1_percent": {
         "name": "Filter 1 life"
       },

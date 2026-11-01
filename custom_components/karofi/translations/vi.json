@@ -67,6 +67,24 @@
           "unknown": "Không xác định"
         }
       },
+      "hydrogen": {
+        "name": "Hàm lượng Hydrogen"
+      },
+      "water_mode": {
+        "name": "Chế độ nước",
+        "state": {
+          "pure": "Nước tinh khiết",
+          "alkaline": "Nước Hydrogen-ion kiềm",
+          "hydrogen": "Nước Hydrogen",
+          "skin_care": "Nước dưỡng da",
+          "hot": "Nước nóng",
+          "cold": "Nước lạnh",
+          "ambient": "Nước nguội",
+          "soda": "Nước Soda",
+          "other": "Chế độ nước khác",
+          "unknown": "Không xác định"
+        }
+      },
       "filter_1_percent": {
         "name": "Tuổi thọ lõi 1"
       },

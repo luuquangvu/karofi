@@ -26,6 +26,7 @@ async def async_setup_entry(
         async_add_entities: Callback to register entities.
     """
     coordinator: KarofiDataCoordinator = hass.data[DOMAIN][entry.entry_id]
+
     async_add_entities(
         [
             KarofiConnectivityBinarySensor(coordinator, entry),

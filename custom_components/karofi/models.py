@@ -5,7 +5,7 @@ from datetime import datetime
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
 
-from .const import WaterQuality
+from .const import WaterMode, WaterQuality
 
 
 @dataclass
@@ -73,3 +73,16 @@ class KarofiData:
     filters: dict[str, KarofiFilterData] = field(default_factory=dict)
     errors: list[int] = field(default_factory=list)
     signal_strength: int | None = None
+    hydrogen_ppb: int | None = None
+    alkaline_level: int | None = None
+    water_mode: WaterMode | str = WaterMode.UNKNOWN
+    supported_water_modes: set[WaterMode] = field(default_factory=set)
+
+    @property
+    def hydrogen(self) -> int | None:
+        """Return the dissolved hydrogen concentration in ppb.
+
+        Returns:
+            Latest hydrogen reading, or None when the model does not report it.
+        """
+        return self.hydrogen_ppb

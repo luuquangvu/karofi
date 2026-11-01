@@ -14,6 +14,7 @@ DEFAULT_MODEL: Final = "Karofi Water Purifier"
 
 # Measurement units
 UNIT_PPM: Final = UnitOfRatio.PARTS_PER_MILLION
+UNIT_PPB: Final = UnitOfRatio.PARTS_PER_BILLION
 
 
 # Makipos protocol payload keys
@@ -31,6 +32,17 @@ class MakiposPayloadKey(StrEnum):
     IRO_HSD = "iro_hsd"
     IRO_ERRS = "iro_errs"
     IRO_NAMES = "iro_names"
+    IRO_ALK = "iro_alk"
+    IRO_H2 = "iro_h2"
+    IRO_HYDROGEN = "iro_hydrogen"
+    IRO_H2PPB = "iro_h2Ppb"
+    IRO_MODE = "iro_mode"
+    IRO_WATER_MODE = "iro_waterMode"
+    HYDROGEN_PPB = "hydrogenPpb"
+    HYDROGEN = "hydrogen"
+    ALKALINE_LEVEL = "alkalineLevel"
+    WATER_MODE = "water_mode"
+    WATERMODE = "waterMode"
     FILTER_NAMES = "filter_names"
     NAMES = "names"
     TDS = "tds"
@@ -55,6 +67,17 @@ class MakiposPropertyCode(StrEnum):
     IRO_HSD = "iro_hsd"
     IRO_ERRS = "iro_errs"
     IRO_RSFT = "iro_rsft"
+    IRO_ALK = "iro_alk"
+    IRO_H2 = "iro_h2"
+    IRO_HYDROGEN = "iro_hydrogen"
+    IRO_H2PPB = "iro_h2Ppb"
+    IRO_MODE = "iro_mode"
+    IRO_WATER_MODE = "iro_waterMode"
+    HYDROGEN_PPB = "hydrogenPpb"
+    HYDROGEN = "hydrogen"
+    ALKALINE_LEVEL = "alkalineLevel"
+    WATER_MODE = "water_mode"
+    WATERMODE = "waterMode"
 
 
 # Only identifiers consumed by the coordinator belong in these sets. Recognized
@@ -72,6 +95,17 @@ SUPPORTED_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
         MakiposPayloadKey.IRO_HSD.value,
         MakiposPayloadKey.IRO_ERRS.value,
         MakiposPayloadKey.IRO_NAMES.value,
+        MakiposPayloadKey.IRO_ALK.value,
+        MakiposPayloadKey.IRO_H2.value,
+        MakiposPayloadKey.IRO_HYDROGEN.value,
+        MakiposPayloadKey.IRO_H2PPB.value,
+        MakiposPayloadKey.IRO_MODE.value,
+        MakiposPayloadKey.IRO_WATER_MODE.value,
+        MakiposPayloadKey.HYDROGEN_PPB.value,
+        MakiposPayloadKey.HYDROGEN.value,
+        MakiposPayloadKey.ALKALINE_LEVEL.value,
+        MakiposPayloadKey.WATER_MODE.value,
+        MakiposPayloadKey.WATERMODE.value,
         MakiposPayloadKey.FILTER_NAMES.value,
         MakiposPayloadKey.NAMES.value,
         MakiposPayloadKey.TDS.value,
@@ -93,6 +127,17 @@ SUPPORTED_PROPERTY_CODES: Final[frozenset[str]] = frozenset(
         MakiposPropertyCode.IRO_RTT.value,
         MakiposPropertyCode.IRO_HSD.value,
         MakiposPropertyCode.IRO_ERRS.value,
+        MakiposPropertyCode.IRO_ALK.value,
+        MakiposPropertyCode.IRO_H2.value,
+        MakiposPropertyCode.IRO_HYDROGEN.value,
+        MakiposPropertyCode.IRO_H2PPB.value,
+        MakiposPropertyCode.IRO_MODE.value,
+        MakiposPropertyCode.IRO_WATER_MODE.value,
+        MakiposPropertyCode.HYDROGEN_PPB.value,
+        MakiposPropertyCode.HYDROGEN.value,
+        MakiposPropertyCode.ALKALINE_LEVEL.value,
+        MakiposPropertyCode.WATER_MODE.value,
+        MakiposPropertyCode.WATERMODE.value,
     }
 )
 
@@ -113,8 +158,39 @@ TELEMETRY_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
     MakiposPayloadKey.IRO_HSD,
     MakiposPayloadKey.IRO_ERRS,
     MakiposPayloadKey.IRO_NAMES,
+    MakiposPayloadKey.IRO_ALK,
+    MakiposPayloadKey.IRO_H2,
+    MakiposPayloadKey.IRO_HYDROGEN,
+    MakiposPayloadKey.IRO_H2PPB,
+    MakiposPayloadKey.IRO_MODE,
+    MakiposPayloadKey.IRO_WATER_MODE,
+    MakiposPayloadKey.HYDROGEN_PPB,
+    MakiposPayloadKey.HYDROGEN,
+    MakiposPayloadKey.ALKALINE_LEVEL,
+    MakiposPayloadKey.WATER_MODE,
+    MakiposPayloadKey.WATERMODE,
     MakiposPayloadKey.FILTER_NAMES,
     MakiposPayloadKey.NAMES,
+)
+
+HYDROGEN_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
+    MakiposPayloadKey.HYDROGEN_PPB,
+    MakiposPayloadKey.IRO_H2,
+    MakiposPayloadKey.IRO_HYDROGEN,
+    MakiposPayloadKey.IRO_H2PPB,
+    MakiposPayloadKey.HYDROGEN,
+)
+
+ALKALINE_LEVEL_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
+    MakiposPayloadKey.IRO_ALK,
+    MakiposPayloadKey.ALKALINE_LEVEL,
+)
+
+WATER_MODE_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
+    MakiposPayloadKey.IRO_MODE,
+    MakiposPayloadKey.IRO_WATER_MODE,
+    MakiposPayloadKey.WATER_MODE,
+    MakiposPayloadKey.WATERMODE,
 )
 
 # Polling and command payloads (Makipos / Karofi protocol)
@@ -203,6 +279,8 @@ class KarofiIcon(StrEnum):
     CLOCK = "mdi:clock-outline"
     RESTORE = "mdi:restore"
     SIGNAL = "mdi:signal"
+    HYDROGEN = "mdi:atom"
+    WATER_MODE = "mdi:water"
 
 
 class KarofiDevicePrefix(StrEnum):
@@ -230,6 +308,32 @@ class WaterQuality(StrEnum):
     FAIR = "fair"
     POOR = "poor"
     UNKNOWN = "unknown"
+
+
+class WaterMode(StrEnum):
+    """Water output mode on hydrogen / alkaline purifier models."""
+
+    PURE = "pure"
+    ALKALINE = "alkaline"
+    HYDROGEN = "hydrogen"
+    SKIN_CARE = "skin_care"
+    HOT = "hot"
+    COLD = "cold"
+    AMBIENT = "ambient"
+    SODA = "soda"
+    # Fallback for extended numeric water options whose exact mode is not
+    # distinguishable from the current BLE payload.
+    OTHER = "other"
+    UNKNOWN = "unknown"
+
+
+# Hydrogen sensors report parts-per-billion. The cap rejects malformed values
+# while still allowing the highest concentrations advertised by these models.
+MAX_VALID_HYDROGEN_PPB: Final = 100_000
+# Premium SA9/DA9-class models advertise 11 selectable water options. The BLE
+# field is still named as an alkaline level, so keep the numeric range broad
+# enough for newer firmware instead of assuming only five pH levels exist.
+MAX_ALKALINE_LEVEL: Final = 11
 
 
 # English fallback messages from the Karofi 365 app's water-purifier mapping.
