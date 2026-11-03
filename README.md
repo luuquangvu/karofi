@@ -1,8 +1,17 @@
 # Karofi Water Purifier for Home Assistant
 
+[![Release](https://img.shields.io/github/v/release/luuquangvu/karofi?style=flat&logo=github&label=Release&color=purple)](https://github.com/luuquangvu/karofi/releases)
+[![HACS](https://img.shields.io/badge/HACS-Default-orange.svg?style=flat&logo=homeassistantcommunitystore&label=HACS)](https://github.com/hacs/integration)
+[![Home Assistant](https://img.shields.io/badge/homeassistant-%3E%3D%202026.10.0-03a9f4?style=flat&logo=homeassistant&label=Home+Assistant)](https://www.home-assistant.io)
+
+[![CI](https://img.shields.io/github/actions/workflow/status/luuquangvu/karofi/ci.yaml?style=flat&logo=github&label=CI)](https://github.com/luuquangvu/karofi/actions/workflows/ci.yaml)
+[![Validation](https://img.shields.io/github/actions/workflow/status/luuquangvu/karofi/validation.yaml?style=flat&logo=github&label=Validation)](https://github.com/luuquangvu/karofi/actions/workflows/validation.yaml)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/luuquangvu/karofi/github-code-scanning/codeql?style=flat&logo=github&label=CodeQL)](https://github.com/luuquangvu/karofi/actions/workflows/github-code-scanning/codeql)
+[![Prettier](https://img.shields.io/github/actions/workflow/status/luuquangvu/karofi/prettier.yaml?style=flat&logo=prettier&label=Prettier)](https://github.com/luuquangvu/karofi/actions/workflows/prettier.yaml)
+
 **🇺🇸 English | [🇻🇳 Tiếng Việt](README.vi.md)**
 
-**Karofi Water Purifier** provides local Bluetooth Low Energy (BLE) integration for Karofi smart water purifiers in Home Assistant. Monitor purified water Total Dissolved Solids (TDS), track drinking water quality ratings, and monitor multi-stage filter lifespans (5 to 12+ stages) using calendar life and runtime usage reported by the device, with zero cloud dependence.
+**Karofi** integration provides local Bluetooth Low Energy (BLE) integration for Karofi smart water purifiers in Home Assistant. Monitor purified water Total Dissolved Solids (TDS), track drinking water quality ratings, and monitor multi-stage filter lifespans (5 to 12+ stages) using calendar life and runtime usage reported by the device, with zero cloud dependence.
 
 ---
 
@@ -98,13 +107,14 @@ When everything is working normally, the sensor stays off. If the purifier goes 
 
 ### Option 1: Using HACS (Recommended)
 
+> [!IMPORTANT]
+> Since the Home Assistant 2026.11.0 release, HACS has been renamed Marketplace. You can access it under **Settings** > **Marketplace**.
+
 [![Add Karofi to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=luuquangvu&repository=karofi&category=integration)
 
-1. Open **HACS** in Home Assistant.
-2. Click the top-right menu icon and select **Custom repositories**.
-3. Add repository URL: `https://github.com/luuquangvu/karofi` with category **Integration**.
-4. Search for **Karofi Water Purifier** and click **Download**.
-5. Restart Home Assistant.
+1. Open **HACS** in Home Assistant (or **Marketplace** for Home Assistant version 2026.11.0 and later).
+2. Search for **Karofi** and click **Download**.
+3. Restart Home Assistant (not required for version 2026.11.0 or later).
 
 ### Option 2: Manual Installation
 
