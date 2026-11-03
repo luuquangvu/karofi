@@ -1,8 +1,17 @@
 # Karofi Water Purifier cho Home Assistant
 
+[![Release](https://img.shields.io/github/v/release/luuquangvu/karofi?style=flat&logo=github&label=Release&color=purple)](https://github.com/luuquangvu/karofi/releases)
+[![HACS](https://img.shields.io/badge/HACS-Default-orange.svg?style=flat&logo=homeassistantcommunitystore&label=HACS)](https://github.com/hacs/integration)
+[![Home Assistant](https://img.shields.io/badge/homeassistant-%3E%3D%202026.10.0-03a9f4?style=flat&logo=homeassistant&label=Home+Assistant)](https://www.home-assistant.io)
+
+[![CI](https://img.shields.io/github/actions/workflow/status/luuquangvu/karofi/ci.yaml?style=flat&logo=github&label=CI)](https://github.com/luuquangvu/karofi/actions/workflows/ci.yaml)
+[![Validation](https://img.shields.io/github/actions/workflow/status/luuquangvu/karofi/validation.yaml?style=flat&logo=github&label=Validation)](https://github.com/luuquangvu/karofi/actions/workflows/validation.yaml)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/luuquangvu/karofi/github-code-scanning/codeql?style=flat&logo=github&label=CodeQL)](https://github.com/luuquangvu/karofi/actions/workflows/github-code-scanning/codeql)
+[![Prettier](https://img.shields.io/github/actions/workflow/status/luuquangvu/karofi/prettier.yaml?style=flat&logo=prettier&label=Prettier)](https://github.com/luuquangvu/karofi/actions/workflows/prettier.yaml)
+
 **[🇺🇸 English](README.md) | 🇻🇳 Tiếng Việt**
 
-**Karofi Water Purifier** là tiện ích tích hợp cục bộ qua Bluetooth Low Energy (BLE) dành cho các dòng máy lọc nước thông minh Karofi trong Home Assistant. Tiện ích cho phép theo dõi chỉ số chất rắn hòa tan (TDS) trong nước tinh khiết theo thời gian thực, đánh giá chất lượng nước uống, theo dõi hạn sử dụng của hệ thống đa lõi lọc (5 đến 12+ lõi) theo tỷ lệ phần trăm, số ngày còn lại theo lịch và số giờ sử dụng thực tế còn lại, đồng thời cho phép đặt lại hoặc điều chỉnh chu kỳ thay lõi trực tiếp trên giao diện Home Assistant mà không cần kết nối đám mây hay máy chủ bên ngoài.
+**Karofi** là tiện ích tích hợp cục bộ qua Bluetooth Low Energy (BLE) dành cho các dòng máy lọc nước thông minh Karofi trong Home Assistant. Tiện ích cho phép theo dõi chỉ số chất rắn hòa tan (TDS) trong nước tinh khiết theo thời gian thực, đánh giá chất lượng nước uống, theo dõi hạn sử dụng của hệ thống đa lõi lọc (5 đến 12+ lõi) theo tỷ lệ phần trăm, số ngày còn lại theo lịch và số giờ sử dụng thực tế còn lại, đồng thời cho phép đặt lại hoặc điều chỉnh chu kỳ thay lõi trực tiếp trên giao diện Home Assistant mà không cần kết nối đám mây hay máy chủ bên ngoài.
 
 ---
 
@@ -13,7 +22,7 @@
 - [Danh sách thực thể (Entities)](#danh-sách-thực-thể-entities)
 - [Mã lỗi thiết bị](#mã-lỗi-thiết-bị)
 - [Cài đặt](#cài-đặt)
-  - [Cách 1: Cài đặt qua HACS (Khuyến nghị)](#cách-1-cài-đặt-qua-hacs-khuyến-nghị)
+  - [Cách 1: Sử dụng HACS (Khuyến nghị)](#cách-1-sử-dụng-hacs-khuyến-nghị)
   - [Cách 2: Cài đặt thủ công](#cách-2-cài-đặt-thủ-công)
 - [Thiết lập và Cấu hình](#thiết-lập-và-cấu-hình)
 - [Quản lý vòng đời lõi lọc](#quản-lý-vòng-đời-lõi-lọc)
@@ -96,15 +105,16 @@ Khi mọi thứ hoạt động bình thường, cảm biến sẽ tắt. Nếu m
 
 ## Cài đặt
 
-### Cách 1: Cài đặt qua HACS (Khuyến nghị)
+### Cách 1: Sử dụng HACS (Khuyến nghị)
 
-[![Thêm Karofi vào HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=luuquangvu&repository=karofi&category=integration)
+> [!IMPORTANT]
+> Từ phiên bản Home Assistant 2026.11.0 trở đi, HACS đã được đổi tên thành Marketplace. Bạn có thể truy cập Marketplace trong **Cài đặt** > **Marketplace**.
 
-1. Mở **HACS** trên Home Assistant.
-2. Bấm vào biểu tượng ba chấm ở góc trên bên phải và chọn **Custom repositories**.
-3. Thêm URL kho lưu trữ: `https://github.com/luuquangvu/karofi` với danh mục (Category) là **Integration**.
-4. Tìm kiếm **Karofi Water Purifier** và bấm **Download**.
-5. Khởi động lại Home Assistant.
+[![Add Karofi to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=luuquangvu&repository=karofi&category=integration)
+
+1. Mở **HACS** trong Home Assistant (hoặc **Marketplace** đối với Home Assistant phiên bản 2026.11.0 trở lên).
+2. Tìm kiếm **Karofi** và nhấp vào **Tải xuống (Download)**.
+3. Khởi động lại Home Assistant (không cần thiết đối với phiên bản 2026.11.0 trở lên).
 
 ### Cách 2: Cài đặt thủ công
 
