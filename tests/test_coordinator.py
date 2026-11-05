@@ -24,7 +24,6 @@ from homeassistant.components.bluetooth import (
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi.const import (
     DEFAULT_FILTER_LIFETIME_DAYS,
@@ -58,6 +57,7 @@ from custom_components.karofi.models import (
     PendingFilterReset,
     ResolvedGattTargets,
 )
+from tests.ha_test_harness import MockConfigEntry
 
 
 @pytest.fixture

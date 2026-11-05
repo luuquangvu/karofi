@@ -17,7 +17,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import dt as dt_util
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi.const import (
     DOMAIN,
@@ -39,6 +38,7 @@ from custom_components.karofi.sensor import (
     KarofiWaterModeSensor,
     async_setup_entry,
 )
+from tests.ha_test_harness import MockConfigEntry
 
 
 @pytest.fixture

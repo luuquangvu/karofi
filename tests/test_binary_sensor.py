@@ -10,7 +10,6 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.translation import async_get_translations
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi.binary_sensor import (
     KarofiConnectivityBinarySensor,
@@ -19,6 +18,7 @@ from custom_components.karofi.binary_sensor import (
 )
 from custom_components.karofi.const import DOMAIN
 from custom_components.karofi.coordinator import KarofiDataCoordinator
+from tests.ha_test_harness import MockConfigEntry
 
 
 @pytest.fixture

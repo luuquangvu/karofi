@@ -5,9 +5,9 @@ from unittest.mock import MagicMock
 import pytest
 from bleak.backends.device import BLEDevice
 from homeassistant.const import CONF_MAC, CONF_NAME
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi.const import DOMAIN
+from tests.ha_test_harness import MockConfigEntry
 
 
 @pytest.fixture(autouse=True)
