@@ -1,1 +1,1 @@
-"""Tests for the Karofi integration."""
+"""Tests package for the Karofi integration."""

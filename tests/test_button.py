@@ -6,12 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import Entity
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi.button import KarofiResetFilterButton, async_setup_entry
 from custom_components.karofi.const import DOMAIN, KarofiFilter
 from custom_components.karofi.coordinator import KarofiDataCoordinator
 from custom_components.karofi.models import KarofiFilterData
+from tests.ha_test_harness import MockConfigEntry
 
 
 def _init_test_button(button: KarofiResetFilterButton, entity_id: str, hass: HomeAssistant) -> None:

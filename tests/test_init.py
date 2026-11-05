@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.core import HomeAssistant
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi import async_remove_entry
 from custom_components.karofi.const import (
@@ -18,6 +17,7 @@ from custom_components.karofi.const import (
     WaterQuality,
 )
 from custom_components.karofi.models import KarofiData
+from tests.ha_test_harness import MockConfigEntry
 
 
 async def test_setup_and_unload_entry(

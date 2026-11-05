@@ -8,9 +8,9 @@ from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
 from homeassistant.const import CONF_MAC, CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.karofi.const import DOMAIN, KarofiCharacteristic
+from tests.ha_test_harness import MockConfigEntry
 
 
 def _create_service_info(
