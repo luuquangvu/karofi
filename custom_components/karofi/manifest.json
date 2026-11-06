@@ -1,6 +1,6 @@
 {
   "domain": "karofi",
-  "name": "Karofi Water Purifier",
+  "name": "Karofi",
   "bluetooth": [
     {
       "service_uuid": "000012ac-0000-1000-8000-00805f9b34fb"

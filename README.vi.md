@@ -1,4 +1,4 @@
-# Karofi Water Purifier cho Home Assistant
+# Karofi integration cho Home Assistant
 
 [![Release](https://img.shields.io/github/v/release/luuquangvu/karofi?style=flat&logo=github&label=Release&color=purple)](https://github.com/luuquangvu/karofi/releases)
 [![HACS](https://img.shields.io/badge/HACS-Default-orange.svg?style=flat&logo=homeassistantcommunitystore&label=HACS)](https://github.com/hacs/integration)

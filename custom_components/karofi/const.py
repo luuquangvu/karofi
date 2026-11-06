@@ -8,9 +8,9 @@ from homeassistant.const import UnitOfRatio
 DOMAIN: Final = "karofi"
 
 # Device identification defaults
-DEFAULT_NAME: Final = "Karofi Water Purifier"
+DEFAULT_NAME: Final = "Karofi"
 DEFAULT_MANUFACTURER: Final = "Karofi / Makipos"
-DEFAULT_MODEL: Final = "Karofi Water Purifier"
+DEFAULT_MODEL: Final = "Karofi"
 
 # Measurement units
 UNIT_PPM: Final = UnitOfRatio.PARTS_PER_MILLION

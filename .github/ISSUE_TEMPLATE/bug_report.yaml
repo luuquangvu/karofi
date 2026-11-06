@@ -52,7 +52,7 @@ body:
     attributes:
       label: Device Model & Bluetooth Setup
       description: Karofi purifier model and Bluetooth adapter or proxy used (e.g. ESPHome Bluetooth Proxy, onboard Bluetooth).
-      placeholder: e.g. Karofi KAQ-U99, ESPHome Bluetooth Proxy
+      placeholder: e.g. Karofi KAE-S86, ESPHome Bluetooth Proxy
   - type: textarea
     id: steps_to_reproduce
     attributes:
