@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import TypeGuard
+from typing import TypedDict, TypeGuard
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
@@ -39,6 +39,7 @@ from .const import (
     ALKALINE_LEVEL_PAYLOAD_KEYS,
     BLE_COMMAND_CHUNK_SIZE,
     BLE_CONNECT_ATTEMPTS,
+    BLE_DISCONNECT_TIMEOUT_SECONDS,
     BLE_TIMEOUT_SECONDS,
     DEFAULT_FILTER_LIFETIME_DAYS,
     DEFAULT_SCAN_INTERVAL,
@@ -47,6 +48,8 @@ from .const import (
     FULL_TELEMETRY_SCAN_INTERVAL,
     HYDROGEN_PAYLOAD_KEYS,
     MAX_ALKALINE_LEVEL,
+    MAX_FILTER_DAYS,
+    MAX_FILTER_HOURS,
     MAX_FILTER_STAGES,
     MAX_TELEMETRY_CACHE_ENTRIES,
     MAX_VALID_HYDROGEN_PPB,
@@ -100,6 +103,13 @@ _LOGGER = logging.getLogger(__name__)
 RESET_CONFIRMATION_POLLS = 3
 RESET_COMMAND_SETTLE_SECONDS = 1.0
 MAX_TRACKED_UNKNOWN_PAYLOAD_FIELDS = 256
+
+
+class _StoredPendingReset(TypedDict):
+    """Persisted pending-reset record including its authoritative reset date."""
+
+    lifetime_hours: int | None
+    reset_date: str | None
 
 
 @dataclass
@@ -185,7 +195,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         self._pending_unknown_payload_fields: dict[str, str] = {}
         self._unknown_payload_flush_handle: asyncio.TimerHandle | None = None
         self._telemetry_generation = 0
-        self._pending_reset_store: Store[dict[str, int | None]] = Store(
+        self._pending_reset_store: Store[dict[str, _StoredPendingReset]] = Store(
             hass,
             STORAGE_VERSION,
             f"{STORAGE_KEY_PREFIX}_{entry.entry_id}_{PENDING_RESET_STORAGE_SUFFIX}",
@@ -463,40 +473,50 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 )
 
         stored_pending_resets = await self._pending_reset_store.async_load()
-        valid_pending_resets: dict[str, int | None] = {}
+        valid_pending_resets: dict[str, _StoredPendingReset] = {}
         if isinstance(stored_pending_resets, dict):
-            for key, lifetime_hours in stored_pending_resets.items():
-                if (
-                    not isinstance(key, str)
-                    or not is_valid_filter_key(key)
-                    or (
-                        lifetime_hours is not None
-                        and (
-                            not isinstance(lifetime_hours, int)
-                            or isinstance(lifetime_hours, bool)
-                            or lifetime_hours <= 0
-                        )
-                    )
-                ):
+            for key, stored_value in stored_pending_resets.items():
+                if not isinstance(key, str) or not is_valid_filter_key(key):
                     continue
+                parsed_entry = self._parse_pending_reset_storage_entry(stored_value)
+                if parsed_entry is None:
+                    continue
+                lifetime_hours, stored_reset_date = parsed_entry
 
-                if key not in resolved_dates:
+                reset_date = (
+                    dt_util.parse_datetime(stored_reset_date)
+                    if stored_reset_date is not None
+                    else None
+                )
+                if reset_date is not None:
+                    # The pending record is written first and carries the exact
+                    # reset date, so it wins over a stale date in the cache.
+                    normalized_date = dt_util.as_utc(reset_date).isoformat()
+                    if resolved_dates.get(key) != normalized_date:
+                        resolved_dates[key] = normalized_date
+                        needs_save = True
+                elif key in resolved_dates:
+                    reset_date = dt_util.parse_datetime(resolved_dates[key])
+                else:
                     reset_date = dt_util.utcnow()
                     resolved_dates[key] = reset_date.isoformat()
-                    self.data.filter_reset_dates[key] = resolved_dates[key]
-                    self.data.filters[key] = KarofiFilterData(
-                        lifetime_days=self.get_filter_lifetime_days(key),
-                    )
                     needs_save = True
-                else:
-                    reset_date = dt_util.parse_datetime(resolved_dates[key])
+
                 if reset_date is None:
                     continue
 
+                self.data.filter_reset_dates[key] = resolved_dates[key]
+                if key not in self.data.filters:
+                    self.data.filters[key] = KarofiFilterData(
+                        lifetime_days=self.get_filter_lifetime_days(key),
+                    )
                 fdata = self.data.filters[key]
                 if lifetime_hours is not None:
                     fdata.lifetime_hours = lifetime_hours
-                    fdata.lifetime_days = max(1, round(lifetime_hours / 24.0))
+                    fdata.lifetime_days = min(
+                        MAX_FILTER_DAYS,
+                        max(1, round(lifetime_hours / 24.0)),
+                    )
                 self._apply_filter_installation_date(key, reset_date)
                 if lifetime_hours is not None:
                     fdata.remaining_hours = lifetime_hours
@@ -506,7 +526,10 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     generation=self._telemetry_generation,
                     lifetime_hours=lifetime_hours,
                 )
-                valid_pending_resets[key] = lifetime_hours
+                valid_pending_resets[key] = {
+                    "lifetime_hours": lifetime_hours,
+                    "reset_date": resolved_dates[key],
+                }
 
         if stored_pending_resets is not None and valid_pending_resets != stored_pending_resets:
             await self._pending_reset_store.async_save(valid_pending_resets)
@@ -539,10 +562,54 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 supported_keys.add(key)
         return sorted(supported_keys, key=_sort_key)
 
-    def _get_pending_reset_storage(self) -> dict[str, int | None]:
-        """Return pending reset metadata for persistent storage."""
+    @staticmethod
+    def _parse_pending_reset_storage_entry(
+        stored_value: object,
+    ) -> tuple[int | None, str | None] | None:
+        """Validate a stored pending reset entry.
+
+        Supports both the legacy lifetime-only value and the current record that
+        also carries the authoritative reset date.
+
+        Args:
+            stored_value: Raw value loaded from pending-reset storage.
+
+        Returns:
+            Tuple of (lifetime_hours, reset_date), or None when the entry is
+            invalid.
+        """
+        if stored_value is None:
+            return None, None
+        if isinstance(stored_value, bool):
+            return None
+        if isinstance(stored_value, int):
+            if 0 < stored_value <= MAX_FILTER_HOURS:
+                return stored_value, None
+            return None
+        if not isinstance(stored_value, dict):
+            return None
+
+        lifetime_hours = stored_value.get("lifetime_hours")
+        if lifetime_hours is not None and (
+            not isinstance(lifetime_hours, int)
+            or isinstance(lifetime_hours, bool)
+            or lifetime_hours <= 0
+            or lifetime_hours > MAX_FILTER_HOURS
+        ):
+            return None
+
+        reset_date = stored_value.get("reset_date")
+        if reset_date is not None and not isinstance(reset_date, str):
+            reset_date = None
+        return lifetime_hours, reset_date
+
+    def _get_pending_reset_storage(self) -> dict[str, _StoredPendingReset]:
+        """Return recoverable pending reset state for persistent storage."""
         return {
-            key: pending_reset.lifetime_hours
+            key: {
+                "lifetime_hours": pending_reset.lifetime_hours,
+                "reset_date": self.data.filter_reset_dates.get(key),
+            }
             for key, pending_reset in self._pending_filter_resets.items()
         }
 
@@ -575,7 +642,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         if key in self.data.filters and self.data.filters[key].lifetime_days is not None:
             lifetime = self.data.filters[key].lifetime_days
             if lifetime is not None and lifetime > 0:
-                return lifetime
+                return min(MAX_FILTER_DAYS, lifetime)
         return DEFAULT_FILTER_LIFETIME_DAYS.get(key, 365)
 
     def _remaining_days_from_reset_date(self, key: str, lifetime: int) -> int | None:
@@ -744,6 +811,40 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         fdata = self.data.filters.get(key)
         return fdata.runtime_total_hours if fdata is not None else None
 
+    async def _async_disconnect_client(
+        self,
+        client: BleakClientWithServiceCache,
+        *,
+        operation: str,
+    ) -> None:
+        """Disconnect a BLE client without masking the completed operation.
+
+        Teardown failures, including a timeout, are treated as a separate
+        best-effort failure. External cancellation is not caught and therefore
+        propagates unchanged.
+
+        Args:
+            client: Connected BLE client to close.
+            operation: Operation name used in diagnostics.
+        """
+        try:
+            async with asyncio.timeout(BLE_DISCONNECT_TIMEOUT_SECONDS):
+                await client.disconnect()
+        except TimeoutError as err:
+            _LOGGER.debug(
+                "Timed out disconnecting from %s after %s: %s",
+                self.masked_mac,
+                operation,
+                err,
+            )
+        except (BleakError, OSError) as err:
+            _LOGGER.debug(
+                "Failed to disconnect from %s after %s: %s",
+                self.masked_mac,
+                operation,
+                err,
+            )
+
     async def _async_send_reset_command(self, filter_index: int) -> bool:
         """Send the BLE hardware reset command to the device.
 
@@ -777,6 +878,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             return False
 
         cmd = build_reset_filter_command(filter_index)
+        client: BleakClientWithServiceCache | None = None
         try:
             async with asyncio.timeout(BLE_TIMEOUT_SECONDS):
                 client = await establish_connection(
@@ -785,83 +887,80 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     self.name,
                     max_attempts=BLE_CONNECT_ATTEMPTS,
                 )
-                try:
-                    targets = self._resolve_io_targets(client)
-                    notify_target = targets.notify_target
-                    cmd_target = targets.command_target
-                    # The vendor application writes commands to its notify/write
-                    # characteristic (ac02), not the separate WiFi command
-                    # characteristic (ab02).
-                    reset_target = (
-                        notify_target
-                        if isinstance(notify_target, BleakGATTCharacteristic)
-                        and (
-                            GattProperty.WRITE in notify_target.properties
-                            or GattProperty.WRITE_WITHOUT_RESPONSE in notify_target.properties
+                targets = self._resolve_io_targets(client)
+                notify_target = targets.notify_target
+                cmd_target = targets.command_target
+                # The vendor application writes commands to its notify/write
+                # characteristic (ac02), not the separate WiFi command
+                # characteristic (ab02).
+                reset_target = (
+                    notify_target
+                    if isinstance(notify_target, BleakGATTCharacteristic)
+                    and (
+                        GattProperty.WRITE in notify_target.properties
+                        or GattProperty.WRITE_WITHOUT_RESPONSE in notify_target.properties
+                    )
+                    else cmd_target or notify_target
+                )
+                reset_notify_target = (
+                    reset_target
+                    if isinstance(reset_target, BleakGATTCharacteristic)
+                    and GattProperty.NOTIFY in reset_target.properties
+                    else notify_target
+                )
+                if (
+                    isinstance(reset_notify_target, BleakGATTCharacteristic)
+                    and GattProperty.NOTIFY in reset_notify_target.properties
+                ):
+                    try:
+                        await client.start_notify(
+                            reset_notify_target,
+                            self._log_reset_notification,
                         )
-                        else cmd_target or notify_target
-                    )
-                    reset_notify_target = (
-                        reset_target
-                        if isinstance(reset_target, BleakGATTCharacteristic)
-                        and GattProperty.NOTIFY in reset_target.properties
-                        else notify_target
-                    )
-                    if (
-                        isinstance(reset_notify_target, BleakGATTCharacteristic)
-                        and GattProperty.NOTIFY in reset_notify_target.properties
-                    ):
-                        try:
-                            await client.start_notify(
-                                reset_notify_target,
-                                self._log_reset_notification,
-                            )
-                        except (BleakError, OSError) as err:
-                            _LOGGER.debug(
-                                "Could not enable reset notifications on %s for %s: %s",
-                                reset_notify_target.uuid,
-                                self.masked_mac,
-                                err,
-                            )
-                        else:
-                            _LOGGER.debug(
-                                "Enabled reset notifications on %s for %s",
-                                reset_notify_target.uuid,
-                                self.masked_mac,
-                            )
+                    except (BleakError, OSError) as err:
+                        _LOGGER.debug(
+                            "Could not enable reset notifications on %s for %s: %s",
+                            reset_notify_target.uuid,
+                            self.masked_mac,
+                            err,
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "Enabled reset notifications on %s for %s",
+                            reset_notify_target.uuid,
+                            self.masked_mac,
+                        )
 
-                    # The vendor app subscribes to the notification characteristic
-                    # and waits briefly before issuing reset commands.
+                # The vendor app subscribes to the notification characteristic
+                # and waits briefly before issuing reset commands.
+                await asyncio.sleep(RESET_COMMAND_SETTLE_SECONDS)
+                _LOGGER.debug(
+                    "Sending reset command for filter_%d to %s via %s (hex=%s): %s",
+                    filter_index + 1,
+                    self.masked_mac,
+                    getattr(reset_target, "uuid", reset_target),
+                    cmd.hex(),
+                    cmd.decode("utf-8", errors="replace"),
+                )
+                write_succeeded = await self._write_command_with_fallback(
+                    client,
+                    reset_target,
+                    cmd,
+                    prefer_with_response=True,
+                    chunked=False,
+                )
+                if write_succeeded:
+                    # Keep the connection open briefly after the write so the
+                    # BLE stack can finish transmitting before disconnecting.
                     await asyncio.sleep(RESET_COMMAND_SETTLE_SECONDS)
-                    _LOGGER.debug(
-                        "Sending reset command for filter_%d to %s via %s (hex=%s): %s",
-                        filter_index + 1,
-                        self.masked_mac,
-                        getattr(reset_target, "uuid", reset_target),
-                        cmd.hex(),
-                        cmd.decode("utf-8", errors="replace"),
-                    )
-                    write_succeeded = await self._write_command_with_fallback(
-                        client,
-                        reset_target,
-                        cmd,
-                        prefer_with_response=True,
-                        chunked=False,
-                    )
-                    if write_succeeded:
-                        # Keep the connection open briefly after the write so the
-                        # BLE stack can finish transmitting before disconnecting.
-                        await asyncio.sleep(RESET_COMMAND_SETTLE_SECONDS)
-                    _LOGGER.debug(
-                        "Reset command write for filter_%d to %s via %s completed (success=%s)",
-                        filter_index + 1,
-                        self.masked_mac,
-                        getattr(reset_target, "uuid", reset_target),
-                        write_succeeded,
-                    )
-                    return write_succeeded
-                finally:
-                    await client.disconnect()
+                _LOGGER.debug(
+                    "Reset command write for filter_%d to %s via %s completed (success=%s)",
+                    filter_index + 1,
+                    self.masked_mac,
+                    getattr(reset_target, "uuid", reset_target),
+                    write_succeeded,
+                )
+                return write_succeeded
         except (BleakError, OSError) as err:
             _LOGGER.debug(
                 "Failed to send reset filter command to %s: %s",
@@ -869,6 +968,9 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                 err,
             )
             return False
+        finally:
+            if client is not None:
+                await self._async_disconnect_client(client, operation="reset command")
 
     def _log_reset_notification(
         self,
@@ -909,10 +1011,15 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             raise HomeAssistantError(f"Failed to send reset command for {filter_key}")
 
         fdata = self.data.filters.get(filter_key)
-        lifetime_hours = (
-            fdata.lifetime_hours
-            if fdata is not None and fdata.lifetime_hours is not None and fdata.lifetime_hours > 0
-            else self.get_filter_lifetime_days(filter_key) * 24
+        lifetime_hours = min(
+            MAX_FILTER_HOURS,
+            (
+                fdata.lifetime_hours
+                if fdata is not None
+                and fdata.lifetime_hours is not None
+                and fdata.lifetime_hours > 0
+                else self.get_filter_lifetime_days(filter_key) * 24
+            ),
         )
         existing_pending = self._pending_filter_resets.get(filter_key)
         if existing_pending is not None:
@@ -927,6 +1034,10 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             baseline_hours=baseline_hours,
             runtime_reset_applied=runtime_reset_applied,
         )
+        # Persist the pending marker and its authoritative reset date first as
+        # one recoverable record. If the process stops before the date cache is
+        # written, startup can still restore both values and keep the reset
+        # confirmation window while the device reports its old hours.
         await self._pending_reset_store.async_save(self._get_pending_reset_storage())
         await self._async_save_filter_tracking()
         self.async_set_updated_data(self.data)
@@ -2739,6 +2850,27 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         return items
 
     @staticmethod
+    def _sanitize_filter_hour_list(
+        values: list[int | None] | None,
+    ) -> list[int | None] | None:
+        """Reject implausible filter-hour values while preserving list positions.
+
+        Args:
+            values: Parsed filter-hour values, possibly containing None entries.
+
+        Returns:
+            Values within the supported range with invalid entries replaced by
+            None, or None when no usable value remains.
+        """
+        if values is None:
+            return None
+        sanitized = [
+            value if value is not None and abs(value) <= MAX_FILTER_HOURS else None
+            for value in values
+        ]
+        return sanitized if any(value is not None for value in sanitized) else None
+
+    @staticmethod
     def _has_filter_or_telemetry_field(payload: dict[str, object]) -> bool:
         """Check if payload dictionary contains filter telemetry or errors.
 
@@ -3193,12 +3325,12 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """Update rated lifetime from telemetry when the reset state allows it."""
         if (
             lifetime_hours is not None
-            and lifetime_hours > 0
+            and 0 < lifetime_hours <= MAX_FILTER_HOURS
             and not is_stale
             and allow_device_value
         ):
             fdata.lifetime_hours = lifetime_hours
-            fdata.lifetime_days = max(1, round(lifetime_hours / 24.0))
+            fdata.lifetime_days = min(MAX_FILTER_DAYS, max(1, round(lifetime_hours / 24.0)))
         elif fdata.lifetime_days is None:
             fdata.lifetime_days = self.get_filter_lifetime_days(key)
 
@@ -3206,7 +3338,10 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
     def _update_filter_remaining(fdata: KarofiFilterData, remaining_hours: int) -> None:
         """Apply device remaining hours to a filter stage."""
         fdata.remaining_hours = remaining_hours
-        fdata.remaining_days = max(0, round(remaining_hours / 24.0))
+        fdata.remaining_days = min(
+            MAX_FILTER_DAYS,
+            max(0, round(remaining_hours / 24.0)),
+        )
         fdata.telemetry_synced = True
 
     @staticmethod
@@ -3275,21 +3410,28 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         """Infer a missing reset date from remaining filter life."""
         if key in self.data.filter_reset_dates or fdata.remaining_days is None:
             return
-        lifetime_days = fdata.lifetime_days or DEFAULT_FILTER_LIFETIME_DAYS.get(key, 365)
-        used_days = max(0, lifetime_days - fdata.remaining_days)
+        lifetime_days = min(
+            MAX_FILTER_DAYS,
+            fdata.lifetime_days or DEFAULT_FILTER_LIFETIME_DAYS.get(key, 365),
+        )
+        used_days = min(MAX_FILTER_DAYS, max(0, lifetime_days - fdata.remaining_days))
         self.data.filter_reset_dates[key] = (
             dt_util.utcnow() - timedelta(days=used_days)
         ).isoformat()
 
     @staticmethod
-    def _extract_names_list(payload: dict[str, object]) -> list[str] | None:
-        """Extract list of filter names from payload dictionary if present.
+    def _extract_names_list(payload: dict[str, object]) -> list[str | None] | None:
+        """Extract validated filter names from payload dictionary if present.
+
+        Invalid entries retain their positions as None so names stay aligned
+        with the filter telemetry arrays.
 
         Args:
             payload: Parsed JSON payload dictionary.
 
         Returns:
-            List of string names or None.
+            List of non-empty string names (or None for invalid entries), or
+            None when the payload has no usable names.
         """
         for key in (
             MakiposPayloadKey.IRO_NAMES,
@@ -3298,7 +3440,10 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         ):
             val = payload.get(key)
             if isinstance(val, list):
-                return [str(item) for item in val]
+                names = [
+                    item.strip() if isinstance(item, str) and item.strip() else None for item in val
+                ]
+                return names if any(name is not None for name in names) else None
         return None
 
     @staticmethod
@@ -3330,29 +3475,37 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
         Returns:
             True if filter telemetry was found and processed, False otherwise.
         """
-        ltime_list = self._coerce_int_list(
-            self._get_payload_property_val(
-                payload, MakiposPropertyCode.IRO_LTIME, MakiposPayloadKey.IRO_LTIME
-            ),
-            preserve_none=True,
+        ltime_list = self._sanitize_filter_hour_list(
+            self._coerce_int_list(
+                self._get_payload_property_val(
+                    payload, MakiposPropertyCode.IRO_LTIME, MakiposPayloadKey.IRO_LTIME
+                ),
+                preserve_none=True,
+            )
         )
-        hsd_list = self._coerce_int_list(
-            self._get_payload_property_val(
-                payload, MakiposPropertyCode.IRO_HSD, MakiposPayloadKey.IRO_HSD
-            ),
-            preserve_none=True,
+        hsd_list = self._sanitize_filter_hour_list(
+            self._coerce_int_list(
+                self._get_payload_property_val(
+                    payload, MakiposPropertyCode.IRO_HSD, MakiposPayloadKey.IRO_HSD
+                ),
+                preserve_none=True,
+            )
         )
-        rtr_list = self._coerce_int_list(
-            self._get_payload_property_val(
-                payload, MakiposPropertyCode.IRO_RTR, MakiposPayloadKey.IRO_RTR
-            ),
-            preserve_none=True,
+        rtr_list = self._sanitize_filter_hour_list(
+            self._coerce_int_list(
+                self._get_payload_property_val(
+                    payload, MakiposPropertyCode.IRO_RTR, MakiposPayloadKey.IRO_RTR
+                ),
+                preserve_none=True,
+            )
         )
-        rtt_list = self._coerce_int_list(
-            self._get_payload_property_val(
-                payload, MakiposPropertyCode.IRO_RTT, MakiposPayloadKey.IRO_RTT
-            ),
-            preserve_none=True,
+        rtt_list = self._sanitize_filter_hour_list(
+            self._coerce_int_list(
+                self._get_payload_property_val(
+                    payload, MakiposPropertyCode.IRO_RTT, MakiposPayloadKey.IRO_RTT
+                ),
+                preserve_none=True,
+            )
         )
         names_list = self._extract_names_list(payload)
 
@@ -3414,7 +3567,15 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             self.data.errors = []
             return True
         if (errs_list := self._coerce_int_list(errs_val)) is not None:
-            self.data.errors = [e for e in errs_list if e is not None]
+            self.data.errors = [e for e in errs_list if e is not None and e > 0]
+            return True
+        if isinstance(errs_val, list):
+            return False
+        # Reject fractional scalar codes instead of truncating them. Integral
+        # zero and negative values keep their existing "no active errors"
+        # meaning.
+        if (code := self._coerce_integral_int(errs_val)) is not None:
+            self.data.errors = [code] if code > 0 else []
             return True
         return False
 
@@ -3825,6 +3986,7 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
             )
             return self.data
 
+        client: BleakClientWithServiceCache | None = None
         try:
             async with asyncio.timeout(BLE_TIMEOUT_SECONDS) as ble_timeout:
                 client = await establish_connection(
@@ -3833,13 +3995,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     self.name,
                     max_attempts=BLE_CONNECT_ATTEMPTS,
                 )
-                try:
-                    raw_bytes = await self._read_tds_characteristic(
-                        client, deadline=ble_timeout.when()
-                    )
-                    self._process_tds_payload(raw_bytes, telemetry_generation)
-                finally:
-                    await client.disconnect()
+                raw_bytes = await self._read_tds_characteristic(client, deadline=ble_timeout.when())
+                self._process_tds_payload(raw_bytes, telemetry_generation)
         except TimeoutError:
             _LOGGER.warning(
                 "Timed out after %ss connecting or reading Karofi device %s",
@@ -3861,5 +4018,8 @@ class KarofiDataCoordinator(DataUpdateCoordinator[KarofiData]):
                     err,
                 )
             self.data.connected = False
+        finally:
+            if client is not None:
+                await self._async_disconnect_client(client, operation="polling")
 
         return self.data

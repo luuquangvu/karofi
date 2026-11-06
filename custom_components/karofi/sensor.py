@@ -10,6 +10,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from propcache.api import cached_property
 
 from .const import (
     DOMAIN,
@@ -368,6 +369,19 @@ class KarofiSignalStrengthSensor(KarofiBaseEntity, SensorEntity):
         self._attr_native_value = coordinator.data.signal_strength
         self._attr_available = coordinator.data.signal_strength is not None
 
+    @cached_property
+    def available(self) -> bool:
+        """Return whether an advertisement RSSI is available.
+
+        RSSI comes from advertisements and remains valid even when a GATT poll
+        fails, so this diagnostic sensor intentionally ignores the coordinator
+        update result.
+
+        Returns:
+            True when an RSSI reading is present.
+        """
+        return self._attr_available
+
     @callback
     def _handle_coordinator_update(self) -> None:
         """Publish RSSI in dBm, marking the sensor unavailable when RSSI is None."""
@@ -377,12 +391,12 @@ class KarofiSignalStrengthSensor(KarofiBaseEntity, SensorEntity):
         super()._handle_coordinator_update()
 
 
-class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
-    """Sensor showing remaining filter lifespan percentage."""
+class _KarofiFilterSensor(KarofiBaseEntity, SensorEntity):
+    """Base class for dynamically generated per-filter sensors."""
 
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = PERCENTAGE
-    _attr_icon = KarofiIcon.FILTER
+    _filter_name_suffix: str = ""
+    _filter_translation_suffix: str = ""
+    _filter_unique_suffix: str = ""
 
     def __init__(
         self,
@@ -391,7 +405,7 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
         filter_stage: KarofiFilter | str,
         max_days: int,
     ) -> None:
-        """Initialize the filter percentage sensor.
+        """Initialize a filter sensor.
 
         Args:
             coordinator: Coordinator providing data.
@@ -404,17 +418,69 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
             filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
         )
         self.max_days = max_days
+        self._refresh_filter_identity()
+        self._attr_unique_id = f"{self._mac}_{self.filter_key}_{self._filter_unique_suffix}"
+        self._attr_available = _is_filter_data_available(coordinator, self.filter_key)
+        self._attr_native_value = self._calculate_value()
+        self._attr_extra_state_attributes = self._calculate_attributes()
+
+    def _refresh_filter_identity(self) -> None:
+        """Refresh the display name and translation key for the filter stage."""
         if custom_name := self.coordinator.get_filter_name(self.filter_key):
-            self._attr_name = f"{custom_name} life"
+            self._attr_name = f"{custom_name} {self._filter_name_suffix}"
+            self._attr_translation_key = None
         elif self.filter_key in TRANSLATED_FILTER_STAGE_KEYS:
-            self._attr_translation_key = f"{self.filter_key}_percent"
+            self._attr_name = None
+            self._attr_translation_key = f"{self.filter_key}_{self._filter_translation_suffix}"
         else:
             idx = filter_key_to_index(self.filter_key)
-            self._attr_name = f"Filter {idx + 1} life"
-        self._attr_unique_id = f"{self._mac}_{self.filter_key}_pct"
-        self._attr_available = _is_filter_data_available(coordinator, self.filter_key)
-        self._attr_native_value = self._calculate_percent()
+            self._attr_name = f"Filter {idx + 1} {self._filter_name_suffix}"
+            self._attr_translation_key = None
+
+    def _calculate_value(self) -> int | None:
+        """Return the sensor's current value.
+
+        Raises:
+            NotImplementedError: Always, unless overridden by a subclass.
+        """
+        raise NotImplementedError
+
+    def _calculate_attributes(self) -> dict[str, object]:
+        """Return extra state attributes for the sensor.
+
+        Raises:
+            NotImplementedError: Always, unless overridden by a subclass.
+        """
+        raise NotImplementedError
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._refresh_filter_identity()
+        self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
+        self._attr_available = _is_filter_data_available(self.coordinator, self.filter_key)
+        self._attr_native_value = self._calculate_value()
         self._attr_extra_state_attributes = self._calculate_attributes()
+        super()._handle_coordinator_update()
+
+
+class KarofiFilterPercentSensor(_KarofiFilterSensor):
+    """Sensor showing remaining filter lifespan percentage."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_icon = KarofiIcon.FILTER
+    _filter_name_suffix = "life"
+    _filter_translation_suffix = "percent"
+    _filter_unique_suffix = "pct"
+
+    def _calculate_value(self) -> int:
+        """Calculate filter remaining percentage.
+
+        Returns:
+            Remaining life percentage (0-100).
+        """
+        return self.coordinator.get_filter_percent(self.filter_key, self.max_days)
 
     def _calculate_attributes(self) -> dict[str, object]:
         """Return the calendar/runtime components and capacities behind the state.
@@ -432,65 +498,24 @@ class KarofiFilterPercentSensor(KarofiBaseEntity, SensorEntity):
             **_staleness_attributes(self.coordinator, self.filter_key),
         }
 
-    def _calculate_percent(self) -> int:
-        """Calculate filter remaining percentage.
 
-        Returns:
-            Remaining life percentage (0-100).
-        """
-        return self.coordinator.get_filter_percent(self.filter_key, self.max_days)
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        if custom_name := self.coordinator.get_filter_name(self.filter_key):
-            self._attr_name = f"{custom_name} life"
-            self._attr_translation_key = None
-        self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
-        self._attr_available = _is_filter_data_available(self.coordinator, self.filter_key)
-        self._attr_native_value = self._calculate_percent()
-        self._attr_extra_state_attributes = self._calculate_attributes()
-        super()._handle_coordinator_update()
-
-
-class KarofiFilterDaysRemainingSensor(KarofiBaseEntity, SensorEntity):
+class KarofiFilterDaysRemainingSensor(_KarofiFilterSensor):
     """Sensor showing remaining days of filter lifespan."""
 
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTime.DAYS
     _attr_icon = KarofiIcon.CALENDAR
+    _filter_name_suffix = "days remaining"
+    _filter_translation_suffix = "days"
+    _filter_unique_suffix = "days"
 
-    def __init__(
-        self,
-        coordinator: KarofiDataCoordinator,
-        entry: ConfigEntry,
-        filter_stage: KarofiFilter | str,
-        max_days: int,
-    ) -> None:
-        """Initialize the filter days remaining sensor.
+    def _calculate_value(self) -> int:
+        """Calculate remaining days before replacement.
 
-        Args:
-            coordinator: Coordinator providing data.
-            entry: Configuration entry.
-            filter_stage: Filter stage identifier or enum.
-            max_days: Rated lifespan in days.
+        Returns:
+            Number of days remaining.
         """
-        super().__init__(coordinator, entry)
-        self.filter_key: str = (
-            filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
-        )
-        self.max_days = max_days
-        if custom_name := self.coordinator.get_filter_name(self.filter_key):
-            self._attr_name = f"{custom_name} days remaining"
-        elif self.filter_key in TRANSLATED_FILTER_STAGE_KEYS:
-            self._attr_translation_key = f"{self.filter_key}_days"
-        else:
-            idx = filter_key_to_index(self.filter_key)
-            self._attr_name = f"Filter {idx + 1} days remaining"
-        self._attr_unique_id = f"{self._mac}_{self.filter_key}_days"
-        self._attr_available = _is_filter_data_available(coordinator, self.filter_key)
-        self._attr_native_value = self._calculate_days()
-        self._attr_extra_state_attributes = self._calculate_attributes()
+        return self.coordinator.get_filter_remaining_days(self.filter_key, self.max_days)
 
     def _calculate_attributes(self) -> dict[str, object]:
         """Return the rated calendar lifespan behind the remaining days.
@@ -503,65 +528,24 @@ class KarofiFilterDaysRemainingSensor(KarofiBaseEntity, SensorEntity):
             **_staleness_attributes(self.coordinator, self.filter_key),
         }
 
-    def _calculate_days(self) -> int:
-        """Calculate remaining days before replacement.
 
-        Returns:
-            Number of days remaining.
-        """
-        return self.coordinator.get_filter_remaining_days(self.filter_key, self.max_days)
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        if custom_name := self.coordinator.get_filter_name(self.filter_key):
-            self._attr_name = f"{custom_name} days remaining"
-            self._attr_translation_key = None
-        self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
-        self._attr_available = _is_filter_data_available(self.coordinator, self.filter_key)
-        self._attr_native_value = self._calculate_days()
-        self._attr_extra_state_attributes = self._calculate_attributes()
-        super()._handle_coordinator_update()
-
-
-class KarofiFilterUsageHoursRemainingSensor(KarofiBaseEntity, SensorEntity):
+class KarofiFilterUsageHoursRemainingSensor(_KarofiFilterSensor):
     """Sensor showing remaining runtime usage hours of filter lifespan."""
 
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTime.HOURS
     _attr_icon = KarofiIcon.CLOCK
+    _filter_name_suffix = "usage hours remaining"
+    _filter_translation_suffix = "hours"
+    _filter_unique_suffix = "hours"
 
-    def __init__(
-        self,
-        coordinator: KarofiDataCoordinator,
-        entry: ConfigEntry,
-        filter_stage: KarofiFilter | str,
-        max_days: int,
-    ) -> None:
-        """Initialize the filter usage hours remaining sensor.
+    def _calculate_value(self) -> int | None:
+        """Return the remaining runtime hours reported by the device.
 
-        Args:
-            coordinator: Coordinator providing data.
-            entry: Configuration entry.
-            filter_stage: Filter stage identifier or enum.
-            max_days: Rated calendar lifespan in days.
+        Returns:
+            Remaining runtime hours, or None when runtime telemetry is unavailable.
         """
-        super().__init__(coordinator, entry)
-        self.filter_key: str = (
-            filter_stage.value if isinstance(filter_stage, KarofiFilter) else str(filter_stage)
-        )
-        self.max_days = max_days
-        if custom_name := self.coordinator.get_filter_name(self.filter_key):
-            self._attr_name = f"{custom_name} usage hours remaining"
-        elif self.filter_key in TRANSLATED_FILTER_STAGE_KEYS:
-            self._attr_translation_key = f"{self.filter_key}_hours"
-        else:
-            idx = filter_key_to_index(self.filter_key)
-            self._attr_name = f"Filter {idx + 1} usage hours remaining"
-        self._attr_unique_id = f"{self._mac}_{self.filter_key}_hours"
-        self._attr_available = _is_filter_data_available(coordinator, self.filter_key)
-        self._attr_native_value = self._calculate_hours()
-        self._attr_extra_state_attributes = self._calculate_attributes()
+        return self.coordinator.get_filter_runtime_remaining_hours(self.filter_key)
 
     def _calculate_attributes(self) -> dict[str, object]:
         """Return the rated runtime capacity behind the remaining hours.
@@ -573,23 +557,3 @@ class KarofiFilterUsageHoursRemainingSensor(KarofiBaseEntity, SensorEntity):
             "capacity_hours": self.coordinator.get_filter_runtime_total_hours(self.filter_key),
             **_staleness_attributes(self.coordinator, self.filter_key),
         }
-
-    def _calculate_hours(self) -> int | None:
-        """Return the remaining runtime hours reported by the device.
-
-        Returns:
-            Remaining runtime hours, or None when runtime telemetry is unavailable.
-        """
-        return self.coordinator.get_filter_runtime_remaining_hours(self.filter_key)
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        if custom_name := self.coordinator.get_filter_name(self.filter_key):
-            self._attr_name = f"{custom_name} usage hours remaining"
-            self._attr_translation_key = None
-        self.max_days = self.coordinator.get_filter_lifetime_days(self.filter_key)
-        self._attr_available = _is_filter_data_available(self.coordinator, self.filter_key)
-        self._attr_native_value = self._calculate_hours()
-        self._attr_extra_state_attributes = self._calculate_attributes()
-        super()._handle_coordinator_update()

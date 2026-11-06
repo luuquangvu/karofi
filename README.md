@@ -221,7 +221,8 @@ automation:
     alias: "Karofi: High TDS Alert"
     trigger:
       - platform: numeric_state
-        entity_id: sensor.karofi_water_purifier_pure_water_tds
+        # Replace with the actual entity ID of your TDS sensor.
+        entity_id: sensor.karofi_pure_water_tds
         above: 150
         for:
           minutes: 2

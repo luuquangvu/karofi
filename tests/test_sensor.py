@@ -408,6 +408,60 @@ async def test_signal_strength_sensor(
     assert sensor.available is True
 
 
+async def test_polled_sensor_unavailable_when_coordinator_update_fails(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Polled sensors follow the coordinator's update success state.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing mock coordinator.
+    """
+    mock_coordinator.data.connected = True
+    mock_coordinator.data.tds = 42
+    sensor = KarofiTDSSensor(mock_coordinator, mock_config_entry)
+    _init_test_sensor(sensor, "sensor.karofi_tds", hass)
+
+    assert sensor.available is True
+
+    mock_coordinator.last_update_success = False
+    sensor._handle_coordinator_update()
+    assert sensor.available is False
+
+    mock_coordinator.last_update_success = True
+    sensor._handle_coordinator_update()
+    assert sensor.available is True
+
+
+async def test_entity_availability_recovers_after_initial_poll_failure(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Entity-specific availability starts enabled and recovers after polling.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing mock coordinator.
+    """
+    mock_coordinator.data.connected = True
+    mock_coordinator.data.tds = 42
+    mock_coordinator.last_update_success = False
+    sensor = KarofiTDSSensor(mock_coordinator, mock_config_entry)
+    _init_test_sensor(sensor, "sensor.karofi_tds", hass)
+
+    assert sensor._attr_available is True
+    assert sensor.available is False
+
+    mock_coordinator.last_update_success = True
+    sensor._handle_coordinator_update()
+    assert sensor.available is True
+
+
 async def test_filter_percent_sensor_calculations(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,

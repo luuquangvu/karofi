@@ -362,6 +362,7 @@ def describe_device_error(code: int) -> str:
 DEFAULT_SCAN_INTERVAL: Final = 60
 BLE_CONNECT_ATTEMPTS: Final = 2
 BLE_TIMEOUT_SECONDS: Final = 25
+BLE_DISCONNECT_TIMEOUT_SECONDS: Final = 5
 BLE_COMMAND_CHUNK_SIZE: Final = 19
 SUPPLEMENTAL_TELEMETRY_TIMEOUT_SECONDS: Final = 10
 DIRECT_TDS_RETURN_RESERVE_SECONDS: Final = 2
@@ -380,6 +381,12 @@ MANUAL_MAC_LABEL: Final = "Enter MAC address manually..."
 # Filter stage prefix and identifiers
 FILTER_PREFIX: Final = "filter_"
 MAX_FILTER_STAGES: Final = 16
+
+# Filter time values are reported in hours. Real cartridges are rated in months
+# or a few years, so reject implausible values (for example 32-bit sentinels)
+# before they can overflow date arithmetic in the coordinator.
+MAX_FILTER_HOURS: Final = 24 * 365 * 50
+MAX_FILTER_DAYS: Final = MAX_FILTER_HOURS // 24
 
 
 class KarofiFilter(StrEnum):
