@@ -8,7 +8,7 @@ body:
       value: |
         > [!NOTE]
         > **Thank you for suggesting a new feature.**
-        > We value your input and ideas on how to improve the Karofi Water Purifier integration.
+        > We value your input and ideas on how to improve the Karofi integration.
   - type: checkboxes
     id: checks
     attributes:

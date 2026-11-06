@@ -132,7 +132,7 @@ def test_is_karofi_local_name() -> None:
     """Test is_karofi_local_name against supported Karofi prefix."""
     assert is_karofi_local_name("TCM-41A00000068")
     assert is_karofi_local_name("tcm-41a00000068")
-    assert not is_karofi_local_name("Karofi Water Purifier")
+    assert not is_karofi_local_name("Karofi")
     assert not is_karofi_local_name("karofi-smart")
 
     assert not is_karofi_local_name("SmartPurifier")
