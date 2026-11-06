@@ -2,8 +2,10 @@
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_MAC, CONF_NAME
+from homeassistant.core import callback
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
 from homeassistant.helpers.update_coordinator import BaseCoordinatorEntity
+from propcache.api import cached_property
 
 from .const import DEFAULT_MANUFACTURER, DEFAULT_MODEL, DEFAULT_NAME, DOMAIN
 from .coordinator import KarofiDataCoordinator
@@ -36,7 +38,26 @@ class KarofiBaseEntity(BaseCoordinatorEntity[KarofiDataCoordinator]):
             model=DEFAULT_MODEL,
             connections={(CONNECTION_BLUETOOTH, self._bluetooth_address)},
         )
-        self._attr_available = coordinator.last_update_success
+        self._attr_available = True
+
+    @cached_property
+    def available(self) -> bool:
+        """Return whether the coordinator and entity-specific state are available.
+
+        Returns:
+            True only when the coordinator's latest update succeeded and the
+            entity's own availability rules allow it.
+        """
+        return self.coordinator.last_update_success and self._attr_available
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Invalidate cached availability before publishing coordinator state."""
+        # Availability depends on both the manual _attr_available flag and the
+        # coordinator's last update result, so the cached value must be rebuilt
+        # on every coordinator notification.
+        vars(self).pop("available", None)
+        super()._handle_coordinator_update()
 
     async def async_update(self) -> None:
         """Update the entity via the data coordinator.

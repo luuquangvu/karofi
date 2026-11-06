@@ -221,7 +221,8 @@ automation:
     alias: "Karofi: Cảnh báo TDS nước cao"
     trigger:
       - platform: numeric_state
-        entity_id: sensor.karofi_water_purifier_pure_water_tds
+        # Thay bằng ID thực tế của cảm biến TDS.
+        entity_id: sensor.karofi_pure_water_tds
         above: 150
         for:
           minutes: 2

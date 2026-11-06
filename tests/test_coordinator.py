@@ -30,6 +30,8 @@ from custom_components.karofi.const import (
     DEFAULT_NAME,
     DEFAULT_SCAN_INTERVAL,
     FULL_TELEMETRY_SCAN_INTERVAL,
+    MAX_FILTER_DAYS,
+    MAX_FILTER_HOURS,
     MAX_FILTER_STAGES,
     NOTIFICATION_TELEMETRY_GRACE_SECONDS,
     NOTIFICATION_WAIT_SECONDS,
@@ -126,6 +128,11 @@ def _resolved_gatt_targets(
         ),
         can_read=can_read,
     )
+
+
+async def _pending_disconnect() -> None:
+    """Keep a mocked BLE disconnect pending until a timeout cancels it."""
+    await asyncio.Event().wait()
 
 
 async def test_coordinator_setup_loads_stored_dates(
@@ -261,8 +268,47 @@ async def test_coordinator_setup_restores_pending_reset(
         assert coordinator.get_filter_remaining_days("filter_1") == 180
 
 
+async def test_coordinator_setup_recovers_pending_reset_date_from_pending_store(
+    coordinator: KarofiDataCoordinator,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Recover the reset date and pending marker from one interrupted write.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        hass_storage: Fixture providing mock storage from test harness.
+    """
+    entry_id = coordinator.entry.entry_id
+    reset_date = "2026-10-22T00:00:00+00:00"
+    hass_storage[f"{STORAGE_KEY_PREFIX}_{entry_id}"] = {
+        "version": STORAGE_VERSION,
+        "data": {"filter_1": "2020-01-01T00:00:00+00:00"},
+    }
+    hass_storage[f"{STORAGE_KEY_PREFIX}_{entry_id}_{PENDING_RESET_STORAGE_SUFFIX}"] = {
+        "version": STORAGE_VERSION,
+        "data": {
+            "filter_1": {
+                "lifetime_hours": 4320,
+                "reset_date": reset_date,
+            }
+        },
+    }
+
+    frozen_now = datetime(2026, 10, 22, tzinfo=UTC)
+    with patch("homeassistant.util.dt.utcnow", return_value=frozen_now):
+        await coordinator.async_setup()
+        assert coordinator.data.filter_reset_dates["filter_1"] == reset_date
+        assert coordinator._pending_filter_resets["filter_1"] == PendingFilterReset(
+            generation=0,
+            lifetime_hours=4320,
+        )
+        assert coordinator.get_filter_remaining_days("filter_1") == 180
+
+    assert hass_storage[f"{STORAGE_KEY_PREFIX}_{entry_id}"]["data"]["filter_1"] == reset_date
+
+
 @pytest.mark.parametrize(
-    ("stored_pending_resets", "expected_pending_resets"),
+    ("stored_pending_resets", "valid_lifetimes"),
     [
         (
             {
@@ -281,7 +327,7 @@ async def test_coordinator_setup_discards_invalid_pending_resets(
     coordinator: KarofiDataCoordinator,
     hass_storage: dict[str, Any],
     stored_pending_resets: object,
-    expected_pending_resets: dict[str, int | None],
+    valid_lifetimes: dict[str, int | None],
 ) -> None:
     """Discard malformed pending reset values and rewrite storage with valid entries only.
 
@@ -289,7 +335,7 @@ async def test_coordinator_setup_discards_invalid_pending_resets(
         coordinator: Fixture providing KarofiDataCoordinator.
         hass_storage: Fixture providing mock storage from test harness.
         stored_pending_resets: Malformed pending reset payload to load.
-        expected_pending_resets: Valid pending reset data expected after setup.
+        valid_lifetimes: Valid lifetime values expected after setup.
     """
     pending_key = (
         f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}_{PENDING_RESET_STORAGE_SUFFIX}"
@@ -298,11 +344,60 @@ async def test_coordinator_setup_discards_invalid_pending_resets(
         "version": STORAGE_VERSION,
         "data": stored_pending_resets,
     }
+    frozen_now = datetime(2026, 11, 6, tzinfo=UTC)
 
-    await coordinator.async_setup()
+    with patch("homeassistant.util.dt.utcnow", return_value=frozen_now):
+        await coordinator.async_setup()
 
+    expected_pending_resets = {
+        key: {
+            "lifetime_hours": lifetime_hours,
+            "reset_date": frozen_now.isoformat(),
+        }
+        for key, lifetime_hours in valid_lifetimes.items()
+    }
     assert coordinator._get_pending_reset_storage() == expected_pending_resets
     assert hass_storage[pending_key]["data"] == expected_pending_resets
+
+
+async def test_coordinator_reset_persists_pending_state_before_dates(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Save the recoverable pending record before the date cache.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    write_order: list[str] = []
+
+    def _record_dates(_: object) -> None:
+        """Record a filter-date write."""
+        write_order.append("dates")
+
+    def _record_pending(_: object) -> None:
+        """Record a pending-reset write."""
+        write_order.append("pending")
+
+    with (
+        patch.object(
+            coordinator,
+            "_async_send_reset_command",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(
+            coordinator._store,
+            "async_save",
+            AsyncMock(side_effect=_record_dates),
+        ),
+        patch.object(
+            coordinator._pending_reset_store,
+            "async_save",
+            AsyncMock(side_effect=_record_pending),
+        ),
+    ):
+        await coordinator.async_reset_filter("filter_1")
+
+    assert write_order == ["pending", "dates"]
 
 
 async def test_coordinator_reset_filter(
@@ -331,7 +426,12 @@ async def test_coordinator_reset_filter(
         pending_key = (
             f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}_{PENDING_RESET_STORAGE_SUFFIX}"
         )
-        assert hass_storage[pending_key]["data"] == {"filter_1": 4320}
+        assert hass_storage[pending_key]["data"] == {
+            "filter_1": {
+                "lifetime_hours": 4320,
+                "reset_date": frozen_now.isoformat(),
+            }
+        }
 
         for generation in (1, 2):
             coordinator._process_tds_payload(
@@ -440,6 +540,133 @@ async def test_coordinator_update_data_success_water_levels(
         assert data.tds == 250
         assert data.quality == WaterQuality.POOR
         mock_client.disconnect.assert_awaited_once()
+
+
+async def test_coordinator_disconnect_failure_keeps_successful_read(
+    coordinator: KarofiDataCoordinator,
+    mock_ble_device: BLEDevice,
+) -> None:
+    """A failed disconnect must not discard a successful TDS read.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        mock_ble_device: Fixture providing mock BLEDevice.
+    """
+    mock_client = AsyncMock()
+    mock_client.read_gatt_char.return_value = b'{"pc":"iro_tds","d":42}'
+    mock_client.disconnect.side_effect = BleakError("disconnect failed")
+
+    with (
+        patch(
+            "custom_components.karofi.coordinator.async_ble_device_from_address",
+            return_value=mock_ble_device,
+        ),
+        patch(
+            "custom_components.karofi.coordinator.establish_connection",
+            AsyncMock(return_value=mock_client),
+        ),
+    ):
+        data = await coordinator._async_update_data()
+
+    assert data.tds == 42
+    assert data.quality == WaterQuality.GOOD
+    assert data.connected is True
+
+
+@pytest.mark.parametrize(
+    "disconnect_error",
+    [
+        BleakError("disconnect failed"),
+        None,
+    ],
+    ids=["bleak-error", "timeout"],
+)
+async def test_coordinator_reset_survives_disconnect_error(
+    coordinator: KarofiDataCoordinator,
+    mock_ble_device: BLEDevice,
+    disconnect_error: Exception | None,
+) -> None:
+    """A failed disconnect must not turn a successful reset write into a failure.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        mock_ble_device: Fixture providing mock BLEDevice.
+        disconnect_error: Error raised while disconnecting, or None to exhaust the timeout.
+    """
+    mock_client = AsyncMock()
+    mock_client.disconnect.side_effect = (
+        disconnect_error if disconnect_error is not None else _pending_disconnect
+    )
+
+    write_char = _mock_characteristic(
+        KarofiCharacteristic.NOTIFY,
+        properties=[GattProperty.WRITE, GattProperty.NOTIFY],
+    )
+
+    with (
+        patch(
+            "custom_components.karofi.coordinator.async_ble_device_from_address",
+            return_value=mock_ble_device,
+        ),
+        patch(
+            "custom_components.karofi.coordinator.establish_connection",
+            AsyncMock(return_value=mock_client),
+        ),
+        patch(
+            "custom_components.karofi.coordinator.BLE_DISCONNECT_TIMEOUT_SECONDS",
+            0.01,
+        ),
+        patch.object(
+            coordinator,
+            "_resolve_io_targets",
+            return_value=ResolvedGattTargets(
+                read_target=write_char,
+                notify_target=write_char,
+                command_target=write_char,
+                read_characteristic=None,
+                can_read=False,
+            ),
+        ),
+    ):
+        result = await coordinator._async_send_reset_command(0)
+
+    assert result is True
+    mock_client.write_gatt_char.assert_awaited_once()
+
+
+async def test_coordinator_disconnect_timeout_keeps_successful_read(
+    coordinator: KarofiDataCoordinator,
+    mock_ble_device: BLEDevice,
+) -> None:
+    """A disconnect timeout must not discard a successful TDS read.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        mock_ble_device: Fixture providing mock BLEDevice.
+    """
+    mock_client = AsyncMock()
+    mock_client.read_gatt_char.return_value = b'{"pc":"iro_tds","d":42}'
+    mock_client.disconnect.side_effect = _pending_disconnect
+
+    with (
+        patch(
+            "custom_components.karofi.coordinator.async_ble_device_from_address",
+            return_value=mock_ble_device,
+        ),
+        patch(
+            "custom_components.karofi.coordinator.establish_connection",
+            AsyncMock(return_value=mock_client),
+        ),
+        patch(
+            "custom_components.karofi.coordinator.BLE_DISCONNECT_TIMEOUT_SECONDS",
+            0.01,
+        ),
+    ):
+        data = await coordinator._async_update_data()
+
+    assert data.tds == 42
+    assert data.quality == WaterQuality.GOOD
+    assert data.connected is True
 
 
 async def test_coordinator_update_data_sentinel_error(
@@ -2897,6 +3124,91 @@ def test_coordinator_process_errors_empty_list_clears_errors(
     assert not coordinator.data.errors
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_errors"),
+    [
+        ({"iro_errs": [0]}, []),
+        ({"iro_errs": 0}, []),
+        ({"iro_errs": -3}, []),
+        ({"iro_errs": [1, 0, 4]}, [1, 4]),
+        ({"iro_errs": 5}, [5]),
+        ({"iro_errs": 2.0}, [2]),
+        ({"iro_errs": "1,0,4"}, [1, 4]),
+    ],
+    ids=[
+        "zero-list",
+        "zero-scalar",
+        "negative-scalar",
+        "mixed-list",
+        "positive-scalar",
+        "integral-float",
+        "comma-string",
+    ],
+)
+def test_coordinator_process_errors_filters_invalid_codes(
+    coordinator: KarofiDataCoordinator,
+    payload: dict[str, object],
+    expected_errors: list[int],
+) -> None:
+    """Ignore non-positive error sentinels and accept scalar error codes.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        payload: Error payload to process.
+        expected_errors: Expected active error codes.
+    """
+    coordinator.data.errors = [9]
+
+    assert coordinator._process_errors_from_payload(payload) is True
+    assert coordinator.data.errors == expected_errors
+
+
+@pytest.mark.parametrize("value", [1.5, "1.5", -0.5])
+def test_coordinator_process_errors_rejects_fractional_scalars(
+    coordinator: KarofiDataCoordinator,
+    value: object,
+) -> None:
+    """Ignore fractional scalar error codes without changing stored errors.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        value: Fractional scalar error value to reject.
+    """
+    coordinator.data.errors = [9]
+
+    assert coordinator._process_errors_from_payload({"iro_errs": value}) is False
+    assert coordinator.data.errors == [9]
+
+
+def test_coordinator_filter_names_ignore_invalid_values(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Ignore null, numeric, and blank filter names without breaking alignment.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"iro_names":[null,"Carbon",42,"   "]}')
+
+    assert coordinator.data.filters["filter_1"].name is None
+    assert coordinator.data.filters["filter_2"].name == "Carbon"
+    assert coordinator.data.filters["filter_3"].name is None
+    assert coordinator.data.filters["filter_4"].name is None
+
+
+def test_coordinator_filter_names_reject_all_invalid_list(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Do not create filter stages from a name list with no usable names.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"iro_names":[null,42,"   "]}')
+
+    assert not coordinator.data.filters
+
+
 def test_coordinator_is_handshake_payload_excludes_telemetry(
     coordinator: KarofiDataCoordinator,
 ) -> None:
@@ -2984,6 +3296,123 @@ def test_coordinator_filter_days_follow_remaining_and_rated_hours(
     assert coordinator.data.filters["filter_4"].runtime_percent == 100
     assert coordinator.get_filter_remaining_days("filter_4") == 1079
     assert coordinator.get_filter_lifetime_days("filter_4") == 1080
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_lifetime_hours", "expected_remaining_hours"),
+    [
+        (
+            b'{"iro_hsd":[2147483647],"iro_lTime":[4320]}',
+            None,
+            4320,
+        ),
+        (
+            b'{"iro_hsd":[4320],"iro_lTime":[2147483647]}',
+            4320,
+            None,
+        ),
+        (
+            b'{"iro_hsd":[2147483647],"iro_lTime":[2147483647]}',
+            None,
+            None,
+        ),
+        (
+            b'{"iro_hsd":[438001],"iro_lTime":[4320]}',
+            None,
+            4320,
+        ),
+    ],
+    ids=[
+        "implausible-lifetime",
+        "implausible-remaining",
+        "implausible-both",
+        "above-supported-maximum",
+    ],
+)
+def test_coordinator_rejects_implausible_filter_hours(
+    coordinator: KarofiDataCoordinator,
+    payload: bytes,
+    expected_lifetime_hours: int | None,
+    expected_remaining_hours: int | None,
+) -> None:
+    """Reject implausible filter-hour values instead of overflowing date math.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        payload: Filter payload containing implausible hour values.
+        expected_lifetime_hours: Expected stored rated lifetime.
+        expected_remaining_hours: Expected stored remaining lifetime.
+    """
+    coordinator._process_tds_payload(payload)
+
+    if expected_lifetime_hours is None and expected_remaining_hours is None:
+        assert not coordinator.data.filters
+        return
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.lifetime_hours == expected_lifetime_hours
+    assert fdata.remaining_hours == expected_remaining_hours
+    assert fdata.lifetime_days is not None
+    assert 0 < fdata.lifetime_days <= MAX_FILTER_DAYS
+    if expected_remaining_hours is None:
+        assert fdata.remaining_days is None
+    else:
+        assert fdata.remaining_days is not None
+        assert 0 <= fdata.remaining_days <= MAX_FILTER_DAYS
+
+
+def test_coordinator_rejects_implausible_filter_hours_without_shifting(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Keep valid later filter hours in place after an invalid earlier value.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"iro_lTime":[2147483647,4320],"iro_hsd":[4320,4320]}')
+
+    assert coordinator.data.filters["filter_1"].remaining_hours is None
+    assert coordinator.data.filters["filter_2"].remaining_hours == 4320
+
+
+def test_coordinator_ignores_implausible_runtime_hours(
+    coordinator: KarofiDataCoordinator,
+) -> None:
+    """Reject implausible runtime values while retaining valid companion fields.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    coordinator._process_tds_payload(b'{"iro_rtr":[2147483647],"iro_rtt":[1200]}')
+
+    fdata = coordinator.data.filters["filter_1"]
+    assert fdata.runtime_remaining_hours is None
+    assert fdata.runtime_total_hours == 1200
+    assert fdata.runtime_percent is None
+
+
+async def test_coordinator_setup_discards_implausible_pending_lifetime(
+    coordinator: KarofiDataCoordinator,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Discard a stored pending reset whose lifetime exceeds the safe range.
+
+    Args:
+        coordinator: Fixture providing KarofiDataCoordinator.
+        hass_storage: Fixture providing mock storage.
+    """
+    pending_key = (
+        f"{STORAGE_KEY_PREFIX}_{coordinator.entry.entry_id}_{PENDING_RESET_STORAGE_SUFFIX}"
+    )
+    hass_storage[pending_key] = {
+        "version": STORAGE_VERSION,
+        "data": {"filter_1": MAX_FILTER_HOURS + 1},
+    }
+
+    await coordinator.async_setup()
+
+    assert coordinator._get_pending_reset_storage() == {}
+    assert hass_storage[pending_key]["data"] == {}
 
 
 def test_coordinator_runtime_parsing_from_direct_keys(
