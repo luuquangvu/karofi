@@ -430,7 +430,12 @@ class _KarofiFilterSensor(KarofiBaseEntity, SensorEntity):
             self._attr_name = f"{custom_name} {self._filter_name_suffix}"
             self._attr_translation_key = None
         elif self.filter_key in TRANSLATED_FILTER_STAGE_KEYS:
-            self._attr_name = None
+            # Home Assistant prefers ``_attr_name`` over the translation key
+            # whenever the attribute exists, even when its value is None.
+            # Delete it so translated filters resolve their name from the
+            # ``filter_<n>_<suffix>`` translation entry.
+            if hasattr(self, "_attr_name"):
+                del self._attr_name
             self._attr_translation_key = f"{self.filter_key}_{self._filter_translation_suffix}"
         else:
             idx = filter_key_to_index(self.filter_key)
