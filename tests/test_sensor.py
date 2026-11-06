@@ -752,6 +752,67 @@ async def test_filter_sensors_dynamic_name(
     assert h2.translation_key is None
 
 
+async def test_filter_sensors_use_translated_names(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_coordinator: KarofiDataCoordinator,
+) -> None:
+    """Resolve filter sensor names from translations when no custom name exists.
+
+    Home Assistant ignores ``translation_key`` whenever ``_attr_name`` is
+    present, even if its value is None. Filter sensors must therefore not set
+    ``_attr_name`` for translated stages.
+
+    Args:
+        hass: HomeAssistant test instance.
+        mock_config_entry: Fixture providing mock config entry.
+        mock_coordinator: Fixture providing KarofiDataCoordinator.
+    """
+    sensor_specs = (
+        (
+            KarofiFilterPercentSensor,
+            "Filter 1 life",
+            "Nano Silver life",
+            "filter_1_percent",
+        ),
+        (
+            KarofiFilterDaysRemainingSensor,
+            "Filter 1 days remaining",
+            "Nano Silver days remaining",
+            "filter_1_days",
+        ),
+        (
+            KarofiFilterUsageHoursRemainingSensor,
+            "Filter 1 usage hours remaining",
+            "Nano Silver usage hours remaining",
+            "filter_1_hours",
+        ),
+    )
+
+    for sensor_class, expected_name, custom_name, translation_key in sensor_specs:
+        sensor = sensor_class(mock_coordinator, mock_config_entry, KarofiFilter.FILTER_1, 180)
+        _init_test_sensor(sensor, f"sensor.karofi_{translation_key}", hass)
+        assert sensor.translation_key == translation_key
+        assert not hasattr(sensor, "_attr_name")
+        sensor.platform_data.platform_name = DOMAIN
+        sensor.platform_data.domain = "sensor"
+        sensor.platform_data.platform_translations = {
+            f"component.{DOMAIN}.entity.sensor.{translation_key}.name": expected_name
+        }
+        assert sensor.name == expected_name
+
+        # A custom name arriving from telemetry takes precedence.
+        mock_coordinator.data.filters["filter_1"] = KarofiFilterData(name="Nano Silver")
+        sensor._handle_coordinator_update()
+        assert sensor.name == custom_name
+
+        # Losing the custom name must fall back to the translated name again.
+        mock_coordinator.data.filters["filter_1"].name = None
+        sensor._handle_coordinator_update()
+        assert sensor.name == expected_name
+        assert not hasattr(sensor, "_attr_name")
+
+
 async def test_base_entity_async_update(
     mock_config_entry: MockConfigEntry,
     mock_coordinator: KarofiDataCoordinator,
