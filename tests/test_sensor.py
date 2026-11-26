@@ -2,7 +2,6 @@
 
 from collections.abc import Iterable
 from datetime import timedelta
-from typing import cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
@@ -38,7 +37,7 @@ from custom_components.karofi.sensor import (
     KarofiWaterModeSensor,
     async_setup_entry,
 )
-from tests.ha_test_harness import MockConfigEntry
+from tests.ha_test_harness import MockConfigEntry, get_device_info_field
 
 
 @pytest.fixture
@@ -306,8 +305,9 @@ async def test_tds_sensor(
     assert sensor.translation_key == "tds"
     assert sensor.unique_id == "aa:bb:cc:11:22:33_tds"
     assert sensor.device_info is not None
-    device_info = cast(dict[str, object], sensor.device_info)
-    assert device_info["connections"] == {(CONNECTION_BLUETOOTH, "AA:BB:CC:11:22:33")}
+    assert get_device_info_field(sensor.device_info, "connections") == {
+        (CONNECTION_BLUETOOTH, "AA:BB:CC:11:22:33")
+    }
     assert sensor.state_class == SensorStateClass.MEASUREMENT
     assert sensor.native_unit_of_measurement == "ppm"
     assert sensor.native_value is None

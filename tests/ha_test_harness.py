@@ -1,9 +1,12 @@
-"""Compatibility access to the installed Home Assistant pytest harness.
+"""Compatibility access to the installed Home Assistant test environment.
 
 Home Assistant 2026.11 replaced ``pytest-homeassistant-custom-component`` with
 ``pytest-homeassistant``. Both harnesses expose the helpers used by this test
 suite under the same names, so tests import them from this module instead of
 depending on one distribution directly.
+
+This module also isolates tests from Home Assistant API changes that differ
+between supported releases, such as ``DeviceInfo`` becoming a dataclass.
 """
 
 import importlib
@@ -37,6 +40,29 @@ def _load_harness_module() -> ModuleType:
 
 
 HARNESS_MODULE = _load_harness_module()
+
+
+def get_device_info_field(device_info: object, field_name: str) -> object:
+    """Read one device info field across Home Assistant releases.
+
+    Home Assistant 2026.12 replaced the ``DeviceInfo`` typed dictionary with a
+    dataclass. Older releases expose fields through mapping access, while newer
+    releases expose attributes and ``as_dict()``. Reading a field through only one
+    representation would break the other supported releases.
+
+    Args:
+        device_info: Entity device information from any supported release.
+        field_name: Device info field to read.
+
+    Returns:
+        The field value, or None when the field is not set.
+    """
+    if isinstance(device_info, Mapping):
+        return device_info.get(field_name)
+    if (as_dict := getattr(device_info, "as_dict", None)) is not None:
+        return as_dict().get(field_name)
+    return getattr(device_info, field_name, None)
+
 
 if TYPE_CHECKING:
 
