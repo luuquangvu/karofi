@@ -22,8 +22,9 @@
 - [Danh sách thực thể (Entities)](#danh-sách-thực-thể-entities)
 - [Mã lỗi thiết bị](#mã-lỗi-thiết-bị)
 - [Cài đặt](#cài-đặt)
-  - [Cách 1: Sử dụng HACS (Khuyến nghị)](#cách-1-sử-dụng-hacs-khuyến-nghị)
-  - [Cách 2: Cài đặt thủ công](#cách-2-cài-đặt-thủ-công)
+  - [Cách 1: Sử dụng Marketplace (Khuyến nghị)](#cách-1-sử-dụng-marketplace-khuyến-nghị)
+  - [Cách 2: Sử dụng HACS (Phiên bản cũ)](#cách-2-sử-dụng-hacs-phiên-bản-cũ)
+  - [Cách 3: Cài đặt thủ công](#cách-3-cài-đặt-thủ-công)
 - [Thiết lập và Cấu hình](#thiết-lập-và-cấu-hình)
 - [Quản lý vòng đời lõi lọc](#quản-lý-vòng-đời-lõi-lọc)
 - [Ví dụ Tự động hóa (Automations)](#ví-dụ-tự-động-hóa-automations)
@@ -105,18 +106,31 @@ Khi mọi thứ hoạt động bình thường, cảm biến sẽ tắt. Nếu m
 
 ## Cài đặt
 
-### Cách 1: Sử dụng HACS (Khuyến nghị)
+### Cách 1: Sử dụng Marketplace (Khuyến nghị)
 
-> [!IMPORTANT]
-> Từ phiên bản Home Assistant 2026.11.0 trở đi, HACS đã được đổi tên thành Marketplace. Bạn có thể truy cập Marketplace trong **Cài đặt** > **Marketplace**.
+> [!NOTE]
+> Marketplace được tích hợp sẵn trong Home Assistant 2026.11.0 trở lên. Không cần cài đặt HACS riêng.
 
-[![Add Karofi to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=luuquangvu&repository=karofi&category=integration)
+[![Mở Karofi trong Marketplace](https://my.home-assistant.io/badges/marketplace_repository.svg)](https://my.home-assistant.io/redirect/marketplace_repository/?owner=luuquangvu&repository=karofi&category=integration)
 
-1. Mở **HACS** trong Home Assistant (hoặc **Marketplace** đối với Home Assistant phiên bản 2026.11.0 trở lên).
-2. Tìm kiếm **Karofi** và nhấp vào **Tải xuống (Download)**.
-3. Khởi động lại Home Assistant (không cần thiết đối với phiên bản 2026.11.0 trở lên).
+1. Trong Home Assistant, vào **Cài đặt** > **Marketplace**.
+2. Tìm kiếm **Karofi** và chọn tiện ích.
+3. Nhấp **Cài đặt (Install)** và xác nhận cài đặt.
+4. Tiện ích được kích hoạt ngay; không cần khởi động lại Home Assistant trên phiên bản 2026.11.0 trở lên.
 
-### Cách 2: Cài đặt thủ công
+### Cách 2: Sử dụng HACS (Phiên bản cũ)
+
+> [!NOTE]
+> Chỉ sử dụng cách này nếu bạn vẫn đang dùng Home Assistant 2026.10.x trở về trước. Từ phiên bản 2026.11.0, HACS đã được thay thế bằng Marketplace tích hợp sẵn; trên các phiên bản này, liên kết bên dưới sẽ mở Marketplace.
+
+[![Thêm Karofi vào HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=luuquangvu&repository=karofi&category=integration)
+
+1. Đảm bảo [HACS](https://hacs.xyz/) đã được cài đặt.
+2. Mở **HACS** trong Home Assistant.
+3. Tìm kiếm **Karofi** và nhấp **Tải xuống (Download)**.
+4. Khởi động lại Home Assistant.
+
+### Cách 3: Cài đặt thủ công
 
 1. Tải bản phát hành mới nhất từ mục [Releases](https://github.com/luuquangvu/karofi/releases).
 2. Giải nén tệp tin và sao chép thư mục `custom_components/karofi` vào thư mục `<config_dir>/custom_components/` của Home Assistant.
